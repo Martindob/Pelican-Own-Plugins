@@ -2,7 +2,7 @@
     "id": "paper-velocity-updater",
     "name": "Paper & Velocity Updater",
     "author": "Martindob",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Automatically downloads the newest Paper/Velocity build for a server before it (re)starts, based on its own startup variables (MINECRAFT_VERSION/VELOCITY_VERSION + BUILD_NUMBER).",
     "category": "plugin",
     "url": null,

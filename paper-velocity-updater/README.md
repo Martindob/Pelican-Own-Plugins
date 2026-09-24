@@ -4,6 +4,8 @@ Automatically keeps Paper and Velocity servers up to date: every time a server i
 restarted, the plugin checks [PaperMC's downloads service](https://docs.papermc.io/misc/downloads-service/)
 for a newer build, downloads it and replaces the server jar *before* the server actually starts.
 
+> Original work by Martindob, first created September 2026. Licensed under GPLv3 (see [LICENSE](LICENSE)), same as the other plugins in this repository.
+
 ## Setup
 
 No configuration needed. The plugin recognizes a server as Paper or Velocity from its own

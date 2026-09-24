@@ -8,4 +8,10 @@ A personal collection of [Pelican Panel](https://pelican.dev) plugins, forked fr
 - [Minecraft Modrinth](/minecraft-modrinth) - Download, update and automatically keep up to date Minecraft mods & plugins from Modrinth
 - [Paper & Velocity Updater](/paper-velocity-updater) - Automatically downloads the newest Paper/Velocity build for a server before it (re)starts
 
-Player Counter and Minecraft Modrinth are based on the original work of **Boy132** (and **H1ghSyst3m** for Minecraft Modrinth) from the upstream [pelican/plugins](https://github.com/pelican/plugins) repository, licensed under GPLv3 (see [LICENSE](LICENSE)). Paper & Velocity Updater is original work. This fork is maintained independently and is not affiliated with or endorsed by the original project.
+## License
+
+Every plugin in this repository, including Paper & Velocity Updater, is licensed under the GNU General Public License v3.0 (see [LICENSE](LICENSE)) — the same license applies to the whole repository, regardless of which plugin originated where.
+
+Player Counter and Minecraft Modrinth are based on the original work of **Boy132** (and **H1ghSyst3m** for Minecraft Modrinth) from the upstream [pelican/plugins](https://github.com/pelican/plugins) repository; both remain credited as original authors in each plugin's own `plugin.json` and README, with Martindob's modifications noted separately (see each plugin's README for what changed and since when). Paper & Velocity Updater is original work created by Martindob and is licensed the same way.
+
+This fork is maintained independently and is not affiliated with or endorsed by the original project.

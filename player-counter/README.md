@@ -2,6 +2,8 @@
 
 Show the amount of connected players to game servers with real-time querying capabilities.
 
+> Originally created by [Boy132](https://github.com/Boy132) as part of [pelican-dev/plugins](https://github.com/pelican-dev/plugins), licensed under GPLv3 (see [LICENSE](LICENSE)). Modified by Martindob since September 2026 (Velocity/BungeeCord/Waterfall proxy query support, Czech translation, and various fixes — see the commit history for full details).
+
 ## Setup
 
 Make sure your server has an allocation with a public ip. Alternatively, if you use local ips you can put the public ip in the allocation alias and enable "Use allocation alias?" in the plugin settings. Using a domain as allocation alias or `0.0.0.0`/`::` as allocation ip will not work!

@@ -1,0 +1,145 @@
+<?php
+
+namespace Boy132\PlayerCounter\Filament\Admin\Resources\GameQueries;
+
+use Boy132\PlayerCounter\Extensions\Query\QueryTypeService;
+use Boy132\PlayerCounter\Filament\Admin\Resources\GameQueries\Pages\ManageGameQueries;
+use Boy132\PlayerCounter\Models\GameQuery;
+use Filament\Actions\CreateAction;
+use Filament\Actions\DeleteAction;
+use Filament\Actions\EditAction;
+use Filament\Actions\ViewAction;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\TextInput;
+use Filament\Infolists\Components\TextEntry;
+use Filament\Resources\Resource;
+use Filament\Schemas\Schema;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+
+class GameQueryResource extends Resource
+{
+    protected static ?string $model = GameQuery::class;
+
+    protected static string|\BackedEnum|null $navigationIcon = 'tabler-device-desktop-search';
+
+    public static function getNavigationLabel(): string
+    {
+        return trans_choice('player-counter::query.query', 2);
+    }
+
+    public static function getModelLabel(): string
+    {
+        return trans_choice('player-counter::query.query', 1);
+    }
+
+    public static function getPluralModelLabel(): string
+    {
+        return trans_choice('player-counter::query.query', 2);
+    }
+
+    public static function getNavigationBadge(): ?string
+    {
+        return (string) static::getEloquentQuery()->count() ?: null;
+    }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                TextColumn::make('query_type')
+                    ->label(trans('player-counter::query.type'))
+                    ->badge()
+                    ->formatStateUsing(fn ($state, QueryTypeService $service) => $service->getMappings()[$state] ?? $state),
+                TextColumn::make('query_port_offset')
+                    ->label(trans('player-counter::query.port_offset'))
+                    ->placeholder(trans('player-counter::query.no_offset')),
+                TextColumn::make('query_port_variable')
+                    ->label(trans('player-counter::query.port_variable'))
+                    ->placeholder(trans('player-counter::query.no_variable'))
+                    ->badge(),
+                TextColumn::make('eggs.name')
+                    ->label(trans('player-counter::query.eggs'))
+                    ->placeholder(trans('player-counter::query.no_eggs'))
+                    ->icon('tabler-eggs')
+                    ->badge(),
+            ])
+            ->recordActions([
+                ViewAction::make()
+                    ->hidden(fn ($record) => static::getEditAuthorizationResponse($record)->allowed()),
+                EditAction::make(),
+                DeleteAction::make(),
+            ])
+            ->toolbarActions([
+                CreateAction::make()
+                    ->createAnother(false),
+            ])
+            ->emptyStateIcon('tabler-device-desktop-search')
+            ->emptyStateDescription('')
+            ->emptyStateHeading(trans('player-counter::query.no_queries'));
+    }
+
+    public static function form(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                Select::make('query_type')
+                    ->label(trans('player-counter::query.type'))
+                    ->required()
+                    ->options(fn (QueryTypeService $service) => $service->getMappings())
+                    ->selectablePlaceholder(false)
+                    ->preload()
+                    ->searchable()
+                    ->columnSpanFull(),
+                TextInput::make('query_port_offset')
+                    ->label(trans('player-counter::query.port_offset'))
+                    ->placeholder(trans('player-counter::query.no_offset'))
+                    ->numeric()
+                    ->nullable()
+                    ->minValue(1)
+                    ->maxValue(65535 - 1024)
+                    ->hintIcon('tabler-question-mark')
+                    ->hintIconTooltip(trans('player-counter::query.port_offset_hint')),
+                TextInput::make('query_port_variable')
+                    ->label(trans('player-counter::query.port_variable'))
+                    ->placeholder(trans('player-counter::query.no_variable'))
+                    ->nullable()
+                    ->hintIcon('tabler-question-mark')
+                    ->hintIconTooltip(trans('player-counter::query.port_variable_hint')),
+                Select::make('eggs')
+                    ->label(trans('admin/mount.eggs'))
+                    // Selecting only non-json fields to prevent Postgres from choking on DISTINCT JSON columns
+                    ->relationship('eggs', 'name', fn (Builder $query) => $query->select(['eggs.id', 'eggs.name']))
+                    ->multiple()
+                    ->preload()
+                    ->searchable()
+                    ->columnSpanFull(),
+            ]);
+    }
+
+    public static function infolist(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                TextEntry::make('query_type')
+                    ->label(trans('player-counter::query.type')),
+                TextEntry::make('query_port_offset')
+                    ->label(trans('player-counter::query.port_offset'))
+                    ->placeholder(trans('player-counter::query.no_offset'))
+                    ->numeric(),
+                TextEntry::make('eggs.name')
+                    ->label(trans('admin/mount.eggs'))
+                    ->placeholder(trans('player-counter::query.no_eggs'))
+                    ->badge()
+                    ->columnSpanFull(),
+            ]);
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => ManageGameQueries::route('/'),
+        ];
+    }
+}

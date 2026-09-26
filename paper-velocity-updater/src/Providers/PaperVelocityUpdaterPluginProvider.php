@@ -3,7 +3,9 @@
 namespace Martindob\PaperVelocityUpdater\Providers;
 
 use App\Repositories\Daemon\DaemonServerRepository;
+use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\ServiceProvider;
+use Martindob\PaperVelocityUpdater\Console\Commands\CheckForUpdatesCommand;
 use Martindob\PaperVelocityUpdater\Repositories\UpdateCheckingDaemonServerRepository;
 
 class PaperVelocityUpdaterPluginProvider extends ServiceProvider
@@ -32,5 +34,16 @@ class PaperVelocityUpdaterPluginProvider extends ServiceProvider
         );
     }
 
-    public function boot(): void {}
+    public function boot(): void
+    {
+        // Hourly comfortably covers a once-a-day restart with hours to spare
+        // even if a check happens to fail (PaperMC hiccup, node briefly
+        // unreachable, ...) - the next one an hour later just retries. This
+        // is deliberately not tied to any particular server's own restart
+        // schedule: staging ahead of time only requires "at some point
+        // before the next restart", not a precisely timed check.
+        Schedule::command(CheckForUpdatesCommand::class)
+            ->hourly()
+            ->withoutOverlapping();
+    }
 }

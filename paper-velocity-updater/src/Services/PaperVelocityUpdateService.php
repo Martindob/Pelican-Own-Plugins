@@ -2,7 +2,6 @@
 
 namespace Martindob\PaperVelocityUpdater\Services;
 
-use App\Enums\ContainerStatus;
 use App\Models\Server;
 use App\Repositories\Daemon\DaemonFileRepository;
 use Exception;
@@ -16,6 +15,8 @@ class PaperVelocityUpdateService
 {
     private const STATE_FILE = '.paper-velocity-updater.json';
 
+    private const PENDING_SUFFIX = '.pending';
+
     private const FILL_BASE_URL = 'https://fill.papermc.io/v3';
 
     /** How many versions resolveLatestStable() will check before giving up. */
@@ -28,317 +29,341 @@ class PaperVelocityUpdateService
     ];
 
     /**
-     * Checks whether a newer Paper/Velocity build is available for the server and,
-     * if so, downloads it and replaces the server jar before it (re)starts.
-     *
-     * A failed *check* (PaperMC unreachable, daemon read error, ...) never prevents
-     * the server from starting - it just boots on whatever jar is already there.
-     * A failed *download* is different: once the daemon has been asked to pull a
-     * file, it may still be mid-write on the exact jar the server is about to run
-     * even if our request to it times out (the daemon keeps writing in the
-     * background regardless of whether the panel is still waiting on it). So unlike
-     * the check itself, that failure is deliberately allowed to propagate out of
-     * this method and out of power() - the whole power action fails instead of
-     * risking a start against a half-written jar.
-     *
-     * @throws Exception
+     * Called on a schedule (see PaperVelocityUpdaterPluginProvider), never from
+     * a power action: for every Paper/Velocity server, downloads a newer build
+     * - if one is available and not already installed or staged - into a
+     * `<jarfile>.pending` file, without ever touching the live jar. This is
+     * deliberately the only place that talks to PaperMC or does the
+     * potentially slow (~50-60MB) download, so a start/restart never has to
+     * wait on either - see applyPendingUpdate(), which just renames this
+     * staged file into place, right before the power signal reaches Wings.
      */
-    public function maybeUpdate(Server $server): void
+    public function checkForUpdates(): void
     {
         if (!config('paper-velocity-updater.enabled', true)) {
             return;
         }
 
-        // Cheap, in-memory check done *before* touching the cache/lock at all.
-        // Most restarts on a panel are not for a Paper/Velocity server, and
-        // those must not pay for a distributed lock acquisition (and the
-        // variables eager-load) on every single restart of every server on the
-        // whole panel just to find out this plugin has nothing to do.
+        Server::query()->chunk(50, function ($servers) {
+            foreach ($servers as $server) {
+                $this->stage($server);
+            }
+        });
+    }
+
+    /**
+     * Applies whatever update checkForUpdates() already staged for this
+     * server, if any. Meant to be called synchronously from the start/restart
+     * power action hook (UpdateCheckingDaemonServerRepository), right before
+     * the signal reaches Wings - which is exactly why this only ever does a
+     * couple of fast, local-ish rename calls on the daemon, never a network
+     * round-trip to PaperMC or a multi-megabyte download: that already
+     * happened ahead of time in checkForUpdates(), on its own schedule, with
+     * its own timeout budget.
+     *
+     * Safe to call even while the server is still running - which is the
+     * normal case for a scheduled restart, since this hook fires *before*
+     * Wings stops anything. That's different from overwriting the live jar
+     * in place, which the old, download-at-restart-time design of this
+     * plugin had to avoid for Velocity: Wings' file-pull writes a new file's
+     * bytes into an *existing* filename by truncating that same inode, and
+     * truncating a jar a running JVM already has open corrupts whatever that
+     * JVM still reads from it (Velocity's classloader keeps its jar's
+     * ZipFile/JarFile handle open for the life of the process and can lazily
+     * load a class from it at any time). A *rename*, which is all this
+     * method ever does to the live jar, has no such effect: it only changes
+     * which path points at which inode. A process that already has the old
+     * jar open keeps reading from that same, untouched inode regardless of
+     * what the live filename now points to - it never re-opens the jar by
+     * path while running. So there's no analogue of the truncate-while-open
+     * risk here, and Velocity no longer needs its update gated on the server
+     * being confirmed stopped.
+     *
+     * Never throws: a failed swap (the daemon being briefly unreachable, the
+     * staged file having been removed manually, ...) must never block the
+     * actual start/restart the admin or a schedule asked for. Worst case,
+     * the server just starts on its current jar and this is retried on the
+     * next restart, since the pending marker is only cleared once the swap
+     * actually succeeds.
+     */
+    public function applyPendingUpdate(Server $server): void
+    {
+        if (!config('paper-velocity-updater.enabled', true)) {
+            return;
+        }
+
         $server->loadMissing('variables');
         if ($this->detectProject($server) === null) {
             return;
         }
 
-        // Two "start"/"restart" clicks fired in quick succession (a double click, or
-        // restart followed immediately by start) must never let the second one race
-        // ahead of the first's download: skipping the check outright when the lock
-        // is already held would let it proceed straight to its own power signal
-        // while the first request might still be mid-write on the very jar the
-        // server is about to run. So this *waits* for any in-flight check/download
-        // for this server to finish - rather than skipping past it - before this
-        // action is allowed to continue to its own power signal. A LockTimeoutException
-        // here is deliberately not caught, for the same reason a download failure
-        // isn't: proceeding without knowing whether the other write finished is
-        // exactly the risk this is meant to avoid.
-        Cache::lock("paper-velocity-updater:server:{$server->id}", $this->lockTtlSeconds())
-            ->block($this->lockWaitSeconds(), function () use ($server) {
-                $plan = $this->plan($server);
-                if ($plan !== null) {
-                    $this->applyPlan($server, $plan);
-                }
-            });
+        try {
+            // Short TTL/wait on purpose: this only ever does a couple of
+            // rename calls, nothing like the multi-minute download the
+            // staging lock below has to cover. If another start/restart on
+            // the same server is already mid-swap, waiting 5 seconds for it
+            // to finish is more than enough; if it isn't, this swap is
+            // simply skipped for now rather than risking a noticeable delay
+            // on the power action - the next restart retries it.
+            Cache::lock("paper-velocity-updater:swap:{$server->id}", 30)
+                ->block(5, function () use ($server) {
+                    $this->swap($server);
+                });
+        } catch (Exception $exception) {
+            $this->reportOncePerWindow("server:{$server->id}:swap", $exception);
+        }
     }
 
     /**
-     * How long a legitimate lock holder may run for. This has to cover the
-     * *entire* critical section, not just the download: the two PaperMC lookups
-     * and the two daemon reads (state file, directory listing) in plan() each
-     * have their own independent timeout and run before the download even
-     * starts, and writeState() is another daemon call after it. The fixed 180s
-     * margin comfortably covers all of that on top of the configurable download
-     * timeout, regardless of how low the latter is set.
+     * Resolves the target build for one server and, if it isn't already
+     * installed or already staged, downloads it into a `<jarfile>.pending`
+     * file. Every failure here is safe to swallow: nothing on the live jar
+     * is ever touched by this method, so the worst outcome is that this is
+     * simply retried on the next scheduled check.
      */
-    private function lockTtlSeconds(): int
-    {
-        return $this->downloadTimeoutSeconds() + 180;
-    }
-
-    /**
-     * How long a *waiter* blocks before giving up - deliberately much shorter
-     * than lockTtlSeconds(), and not tied to the download timeout at all. This
-     * runs synchronously inside the request handling the power action, so
-     * waiting anywhere near as long as a full download could take would hit
-     * the web server's/reverse proxy's own request timeout (commonly 30-60s)
-     * long before our own timeout would - turning what's meant to be a
-     * graceful wait-then-proceed into a raw, unhandled gateway timeout for the
-     * user instead of the clean, retryable error a LockTimeoutException here
-     * becomes (see power(), which converts it to a ConnectionException the
-     * panel already shows a proper notification for).
-     */
-    private function lockWaitSeconds(): int
-    {
-        return 10;
-    }
-
-    /**
-     * Works out whether an update is needed and, if so, what to download. Every
-     * failure here (PaperMC or the daemon being unreachable, a bad response, ...)
-     * is safe to swallow: nothing has been written yet, so the server can just
-     * start on whatever jar is already on disk.
-     *
-     * @return array{fileRepository: DaemonFileRepository, project: string, version: string, build: int, jar: string, url: string, sha256: ?string, confirmedKey: string}|null
-     */
-    private function plan(Server $server): ?array
+    private function stage(Server $server): void
     {
         try {
             $server->loadMissing('variables');
 
-            $project = $this->detectProject($server);
-            if ($project === null) {
-                return null;
+            if ($this->detectProject($server) === null) {
+                return;
             }
 
-            // Respect an explicitly pinned build number; only "latest" (the default
-            // shown in the startup variables) triggers an automatic update.
-            $buildVariable = $this->getVariable($server, 'BUILD_NUMBER');
-            if ($buildVariable !== null && !$this->isLatest($buildVariable)) {
-                return null;
-            }
+            // Guards against two overlapping scheduled runs (e.g. a manual
+            // `artisan p:paper-velocity-updater:check` overlapping the
+            // scheduled one) double-downloading for the same server.
+            Cache::lock("paper-velocity-updater:stage:{$server->id}", $this->downloadTimeoutSeconds() + 60)
+                ->block(5, function () use ($server) {
+                    $target = $this->resolveTarget($server);
+                    if ($target === null) {
+                        return;
+                    }
 
-            // DL_PATH (present on both official eggs) tells the egg's own install
-            // script to download from a custom URL instead of resolving anything
-            // through PaperMC - used for mirrors, patched/forked builds, or a
-            // private build server. If an admin has set it, this server has
-            // opted out of PaperMC-based resolution entirely, and this plugin has
-            // no way to know what that custom URL should resolve to - overwriting
-            // it with a stock PaperMC jar would silently undo that choice on
-            // every restart.
-            if ($this->getVariable($server, 'DL_PATH') !== null) {
-                return null;
-            }
+                    $fileRepository = app(DaemonFileRepository::class)->setServer($server);
+                    $state = $this->readState($fileRepository, $server->id);
 
-            // Wings writes a replacement jar in place (truncate + overwrite the
-            // same inode, not a write-then-atomic-rename - confirmed directly
-            // against its source: Filesystem.Write() opens the existing file
-            // with O_TRUNC). That's harmless for Paper: Paperclip only reads
-            // server.jar for a few seconds at boot to patch/cache the real
-            // server jar under cache/, then runs entirely from that cache for
-            // the rest of the process's life, so truncating server.jar underneath
-            // an already-running Paper process doesn't touch anything it still
-            // reads. Velocity has no such split - it's launched directly as
-            // `java -jar velocity.jar`, so the JVM's own classloader keeps
-            // velocity.jar open and can still lazily read a class from it at any
-            // point for as long as the process runs. Overwriting it while that
-            // process is still up risks a corrupt read (a class load failing
-            // mid-truncate) crashing an otherwise healthy, currently-running
-            // proxy - which is strictly worse than just leaving it on its
-            // current build for one more restart. So for Velocity specifically,
-            // only swap the jar in place when the server is confirmed to
-            // already be stopped; a Velocity restart of a still-running proxy
-            // simply skips the update this cycle and picks it up on a later
-            // check instead. Paper is unaffected and keeps updating on every
-            // restart regardless of whether it's currently running.
-            if ($project === 'velocity' && $this->isRunning($server)) {
-                return null;
-            }
+                    if ($this->matchesTarget($state['installed'] ?? null, $target)
+                        || $this->matchesTarget($state['pending'] ?? null, $target)) {
+                        return;
+                    }
 
-            $jarFile = $this->getVariable($server, 'SERVER_JARFILE') ?? ($project === 'velocity' ? 'velocity.jar' : 'server.jar');
+                    $stagedAs = $target['jar'] . self::PENDING_SUFFIX;
 
-            // SERVER_JARFILE is an admin-editable startup variable, not a
-            // trusted constant. Wings itself rejects a rename/pull target
-            // that escapes the server's directory, but that shouldn't be the
-            // only thing standing between an unexpected value here and a
-            // file operation - reject anything that isn't a plain filename
-            // ending in .jar before it's used for anything.
-            if ($jarFile !== basename($jarFile) || !str_ends_with(strtolower($jarFile), '.jar')) {
-                return null;
-            }
+                    $fileRepository->getHttpClient()
+                        ->timeout(max((int) config('panel.guzzle.timeout'), $this->downloadTimeoutSeconds()))
+                        ->post("/api/servers/{$server->uuid}/files/pull", [
+                            'url' => $target['url'],
+                            'root' => '/',
+                            'file_name' => $stagedAs,
+                            'foreground' => true,
+                        ])
+                        ->throw();
 
-            $requestedVersion = null;
-            foreach (self::PROJECT_VERSION_VARIABLES[$project] as $variableName) {
-                $requestedVersion = $this->getVariable($server, $variableName);
-                if ($requestedVersion !== null) {
-                    break;
-                }
-            }
+                    $state['pending'] = [
+                        'project' => $target['project'],
+                        'version' => $target['version'],
+                        'build' => $target['build'],
+                        'jar' => $target['jar'],
+                        'staged_jar' => $stagedAs,
+                        'sha256' => $target['sha256'],
+                        'staged_at' => now()->toIso8601String(),
+                    ];
 
-            // A pinned version is a hard lock: if it can't be positively
-            // verified against PaperMC's own version list - genuinely invalid,
-            // or the API/cache being temporarily unavailable - this skips the
-            // update rather than silently falling back to "latest". Falling
-            // back on an inconclusive check would mean a single transient
-            // PaperMC hiccup could bump a pinned server onto a version its
-            // admin never asked for, which defeats the entire point of
-            // pinning one.
-            if ($this->isLatest($requestedVersion)) {
-                $resolved = $this->resolveLatestStable($project);
-                if ($resolved === null) {
-                    return null;
-                }
-
-                $version = $resolved['version'];
-                $build = $resolved['build'];
-            } else {
-                $version = trim((string) $requestedVersion);
-
-                if (!$this->versionExists($project, $version)) {
-                    return null;
-                }
-
-                $build = $this->resolveBuildForPinnedVersion($project, $version);
-                if ($build === null) {
-                    return null;
-                }
-            }
-
-            $download = $build['downloads']['server:default'] ?? null;
-            if (!is_array($download) || !isset($download['url'])) {
-                return null;
-            }
-
-            // The download URL comes straight from the Fill API response and
-            // is otherwise trusted as-is - if that response were ever spoofed
-            // (a compromised DNS/CDN/MITM) it could point Wings at an
-            // attacker-controlled file. Fill only ever serves its own
-            // downloads, so pinning to its own host closes that path off
-            // without narrowing anything Fill would legitimately return.
-            $downloadHost = strtolower((string) parse_url((string) $download['url'], PHP_URL_HOST));
-            $downloadScheme = strtolower((string) parse_url((string) $download['url'], PHP_URL_SCHEME));
-            if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'api.papermc.io'], true)) {
-                return null;
-            }
-
-            $confirmedKey = $this->confirmedCacheKey($server->id, $project, $version, $build['id'], $jarFile);
-
-            // Once a restart has actually confirmed this exact build is already
-            // installed and present on disk, later restarts within the same
-            // version/build cache window skip the daemon round-trips entirely
-            // instead of re-reading the marker file and re-listing the server
-            // directory every single time - restarting an already up to date
-            // server repeatedly (e.g. while configuring it) then costs zero
-            // daemon calls instead of two.
-            if (Cache::has($confirmedKey)) {
-                return null;
-            }
-
-            $fileRepository = app(DaemonFileRepository::class)->setServer($server);
-
-            $state = $this->readState($fileRepository, $server->id);
-            $upToDate = $state !== null
-                && ($state['project'] ?? null) === $project
-                && ($state['version'] ?? null) === $version
-                && ($state['build'] ?? null) === $build['id']
-                && ($state['jar'] ?? null) === $jarFile
-                && $this->jarExists($fileRepository, $jarFile);
-
-            if ($upToDate) {
-                Cache::put($confirmedKey, true, now()->addMinutes($this->cacheMinutes()));
-
-                return null;
-            }
-
-            return [
-                'fileRepository' => $fileRepository,
-                'project' => $project,
-                'version' => $version,
-                'build' => $build['id'],
-                'jar' => $jarFile,
-                'url' => $download['url'],
-                'sha256' => $download['checksums']['sha256'] ?? null,
-                'confirmedKey' => $confirmedKey,
-            ];
+                    $this->writeState($fileRepository, $state);
+                });
         } catch (Exception $exception) {
-            // Someone restarting a server repeatedly (e.g. while still configuring
-            // it) would otherwise log the same daemon/network failure on every
-            // single restart. One log entry per server/error per window is enough
-            // to notice a real, persistent problem without spamming the log.
+            // A server that's failing this check every hour (e.g. PaperMC
+            // being unreachable, or a pinned version that can't be verified)
+            // shouldn't get one log entry per check - one per throttle
+            // window is enough to notice a real, persistent problem.
             $this->reportOncePerWindow("server:{$server->id}:" . $exception::class, $exception);
-
-            return null;
         }
     }
 
     /**
-     * Downloads the resolved build straight into the server directory, replacing
-     * the existing jar, and records what was installed.
+     * Actually applies a staged update: renames the current jar to
+     * `<jarfile>.old` (best-effort backup) and the staged
+     * `<jarfile>.pending` into the live jar's name, then records it as
+     * installed and clears the pending marker.
      *
-     * Uses a much longer timeout than the daemon client's 15 second default
-     * (config('panel.guzzle.timeout')): that default is fine for small API calls
-     * but a ~50-60MB Paper/Velocity jar can easily take longer than that,
-     * especially on a slower node.
-     *
-     * @param  array{fileRepository: DaemonFileRepository, project: string, version: string, build: int, jar: string, url: string, sha256: ?string, confirmedKey: string}  $plan
-     *
-     * @throws Exception
+     * A no-op if nothing is staged, or if what's staged no longer matches
+     * this server's current configuration (e.g. an admin changed
+     * SERVER_JARFILE or the project's version variable after the last
+     * check, or switched DL_PATH on) - swapping it in anyway would replace
+     * the current jar with a build resolved for a configuration that no
+     * longer applies. The next scheduled check re-stages the right thing
+     * (or nothing, if the server opted out via DL_PATH) once it notices.
      */
-    private function applyPlan(Server $server, array $plan): void
+    private function swap(Server $server): void
     {
-        // Mirrors what the official Paper/Velocity install scripts themselves
-        // do before downloading a new jar ("mv $SERVER_JARFILE $SERVER_JARFILE.old"),
-        // giving an easy manual recovery path if a downloaded jar ever turns
-        // out to be bad. Best-effort and never allowed to block the actual
-        // update: a first-ever install (no existing jar to rename) or any
-        // other rename failure is swallowed and the update proceeds exactly
-        // as it would without a backup.
-        $this->backupExistingJar($server, $plan['fileRepository'], $plan['jar']);
+        $fileRepository = app(DaemonFileRepository::class)->setServer($server);
+        $state = $this->readState($fileRepository, $server->id);
 
-        $plan['fileRepository']->getHttpClient()
-            ->timeout(max((int) config('panel.guzzle.timeout'), $this->downloadTimeoutSeconds()))
-            ->post("/api/servers/{$server->uuid}/files/pull", [
-                'url' => $plan['url'],
-                'root' => '/',
-                'file_name' => $plan['jar'],
-                'foreground' => true,
-            ])
-            ->throw();
-
-        Cache::put($plan['confirmedKey'], true, now()->addMinutes($this->cacheMinutes()));
-
-        try {
-            $this->writeState($plan['fileRepository'], [
-                'project' => $plan['project'],
-                'version' => $plan['version'],
-                'build' => $plan['build'],
-                'jar' => $plan['jar'],
-                'sha256' => $plan['sha256'],
-                'updated_at' => now()->toIso8601String(),
-            ]);
-        } catch (Exception $exception) {
-            // The jar itself already downloaded fine at this point; losing the
-            // marker only means the next restart re-verifies (and, worst case,
-            // re-downloads) unnecessarily - not worth failing the power action over.
-            $this->reportOncePerWindow("server:{$server->id}:write-state", $exception);
+        $pending = $state['pending'] ?? null;
+        if (!is_array($pending) || !isset($pending['staged_jar'], $pending['jar'], $pending['project'])) {
+            return;
         }
+
+        $project = $this->detectProject($server);
+        $currentJarFile = $this->getVariable($server, 'SERVER_JARFILE') ?? ($project === 'velocity' ? 'velocity.jar' : 'server.jar');
+        if ($project !== $pending['project'] || $currentJarFile !== $pending['jar'] || $this->getVariable($server, 'DL_PATH') !== null) {
+            return;
+        }
+
+        if (!$this->fileExists($fileRepository, $pending['staged_jar'])) {
+            // Staged file is gone (manually deleted, or never actually
+            // finished downloading) - drop the stale marker instead of
+            // retrying this forever, and let the next scheduled check
+            // re-stage it properly.
+            unset($state['pending']);
+            $this->writeState($fileRepository, $state);
+
+            return;
+        }
+
+        $this->backupExistingJar($server, $fileRepository, $pending['jar']);
+
+        $fileRepository->renameFiles('/', [
+            ['from' => $pending['staged_jar'], 'to' => $pending['jar']],
+        ]);
+
+        $state['installed'] = [
+            'project' => $pending['project'],
+            'version' => $pending['version'] ?? null,
+            'build' => $pending['build'] ?? null,
+            'jar' => $pending['jar'],
+            'sha256' => $pending['sha256'] ?? null,
+            'updated_at' => now()->toIso8601String(),
+        ];
+        unset($state['pending']);
+
+        $this->writeState($fileRepository, $state);
+    }
+
+    /**
+     * Resolves what SHOULD be installed for a server, if anything - the
+     * target project/jar/version/build/download URL - without checking that
+     * against what's currently installed or staged (see stage(), which does
+     * that comparison). Every failure here returns null: PaperMC or the
+     * daemon being briefly unreachable just means this is retried on the
+     * next scheduled check, same as no update being available.
+     *
+     * @return array{project: string, jar: string, version: string, build: int, url: string, sha256: ?string}|null
+     */
+    private function resolveTarget(Server $server): ?array
+    {
+        $project = $this->detectProject($server);
+        if ($project === null) {
+            return null;
+        }
+
+        // Respect an explicitly pinned build number; only "latest" (the default
+        // shown in the startup variables) triggers an automatic update.
+        $buildVariable = $this->getVariable($server, 'BUILD_NUMBER');
+        if ($buildVariable !== null && !$this->isLatest($buildVariable)) {
+            return null;
+        }
+
+        // DL_PATH (present on both official eggs) tells the egg's own install
+        // script to download from a custom URL instead of resolving anything
+        // through PaperMC - used for mirrors, patched/forked builds, or a
+        // private build server. If an admin has set it, this server has
+        // opted out of PaperMC-based resolution entirely, and this plugin has
+        // no way to know what that custom URL should resolve to - staging a
+        // stock PaperMC jar would silently undo that choice on the next
+        // restart.
+        if ($this->getVariable($server, 'DL_PATH') !== null) {
+            return null;
+        }
+
+        $jarFile = $this->getVariable($server, 'SERVER_JARFILE') ?? ($project === 'velocity' ? 'velocity.jar' : 'server.jar');
+
+        // SERVER_JARFILE is an admin-editable startup variable, not a
+        // trusted constant. Wings itself rejects a rename/pull target
+        // that escapes the server's directory, but that shouldn't be the
+        // only thing standing between an unexpected value here and a
+        // file operation - reject anything that isn't a plain filename
+        // ending in .jar before it's used for anything.
+        if ($jarFile !== basename($jarFile) || !str_ends_with(strtolower($jarFile), '.jar')) {
+            return null;
+        }
+
+        $requestedVersion = null;
+        foreach (self::PROJECT_VERSION_VARIABLES[$project] as $variableName) {
+            $requestedVersion = $this->getVariable($server, $variableName);
+            if ($requestedVersion !== null) {
+                break;
+            }
+        }
+
+        // A pinned version is a hard lock: if it can't be positively
+        // verified against PaperMC's own version list - genuinely invalid,
+        // or the API/cache being temporarily unavailable - this skips the
+        // update rather than silently falling back to "latest". Falling
+        // back on an inconclusive check would mean a single transient
+        // PaperMC hiccup could bump a pinned server onto a version its
+        // admin never asked for, which defeats the entire point of
+        // pinning one.
+        if ($this->isLatest($requestedVersion)) {
+            $resolved = $this->resolveLatestStable($project);
+            if ($resolved === null) {
+                return null;
+            }
+
+            $version = $resolved['version'];
+            $build = $resolved['build'];
+        } else {
+            $version = trim((string) $requestedVersion);
+
+            if (!$this->versionExists($project, $version)) {
+                return null;
+            }
+
+            $build = $this->resolveBuildForPinnedVersion($project, $version);
+            if ($build === null) {
+                return null;
+            }
+        }
+
+        $download = $build['downloads']['server:default'] ?? null;
+        if (!is_array($download) || !isset($download['url'])) {
+            return null;
+        }
+
+        // The download URL comes straight from the Fill API response and
+        // is otherwise trusted as-is - if that response were ever spoofed
+        // (a compromised DNS/CDN/MITM) it could point Wings at an
+        // attacker-controlled file. Fill only ever serves its own
+        // downloads, so pinning to its own host closes that path off
+        // without narrowing anything Fill would legitimately return.
+        $downloadHost = strtolower((string) parse_url((string) $download['url'], PHP_URL_HOST));
+        $downloadScheme = strtolower((string) parse_url((string) $download['url'], PHP_URL_SCHEME));
+        if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'api.papermc.io'], true)) {
+            return null;
+        }
+
+        return [
+            'project' => $project,
+            'jar' => $jarFile,
+            'version' => $version,
+            'build' => $build['id'],
+            'url' => $download['url'],
+            'sha256' => $download['checksums']['sha256'] ?? null,
+        ];
+    }
+
+    /**
+     * @param  array{project?: string, version?: string, build?: int, jar?: string}|null  $recorded
+     * @param  array{project: string, jar: string, version: string, build: int}  $target
+     */
+    private function matchesTarget(?array $recorded, array $target): bool
+    {
+        return $recorded !== null
+            && ($recorded['project'] ?? null) === $target['project']
+            && ($recorded['version'] ?? null) === $target['version']
+            && ($recorded['build'] ?? null) === $target['build']
+            && ($recorded['jar'] ?? null) === $target['jar'];
     }
 
     /**
@@ -371,11 +396,6 @@ class PaperVelocityUpdateService
         // value edited directly in .env could otherwise bypass that and bring
         // back the daemon client's own too-short 15 second default.
         return max(60, (int) config('paper-velocity-updater.download_timeout_seconds', 300));
-    }
-
-    private function confirmedCacheKey(int $serverId, string $project, string $version, int $build, string $jarFile): string
-    {
-        return "paper-velocity-updater:confirmed:$serverId:$project:$version:$build:$jarFile";
     }
 
     /**
@@ -428,24 +448,6 @@ class PaperVelocityUpdateService
     private function isLatest(?string $value): bool
     {
         return $value === null || strtolower(trim($value)) === 'latest';
-    }
-
-    /**
-     * Whether the server's container is (or might still be) running, checked
-     * conservatively: anything other than one of a few definitively-stopped
-     * states counts as "running" here, including an inconclusive/ambiguous
-     * result (e.g. the daemon call timing out) - reusing the same panel-wide
-     * 15 second status cache Server::retrieveStatus() already maintains, so
-     * this is effectively free on top of a normal restart.
-     */
-    private function isRunning(Server $server): bool
-    {
-        return !in_array($server->retrieveStatus(), [
-            ContainerStatus::Offline,
-            ContainerStatus::Exited,
-            ContainerStatus::Dead,
-            ContainerStatus::Created,
-        ], true);
     }
 
     /** @return array<string, array<int, string>> */
@@ -573,7 +575,7 @@ class PaperVelocityUpdateService
      * the "nothing/failed" sentinel (not null/false): cache()->remember()
      * can't distinguish a cached null from a cache miss, but an empty array
      * is unambiguous, so a failure still actually gets cached instead of
-     * re-hitting PaperMC's API on every single restart during an outage.
+     * re-hitting PaperMC's API on every single check during an outage.
      *
      * @return array<int, mixed>
      */
@@ -606,7 +608,7 @@ class PaperVelocityUpdateService
     /**
      * Reports an exception at most once per $key within the configured throttle
      * window, so a persistent problem (daemon unreachable, bad credentials, ...)
-     * isn't logged again on every single restart of the affected server.
+     * isn't logged again on every single scheduled check.
      */
     private function reportOncePerWindow(string $key, Exception $exception): void
     {
@@ -626,39 +628,51 @@ class PaperVelocityUpdateService
             ->throw();
     }
 
-    /** @return array{project?: string, version?: string, build?: int, jar?: string, sha256?: ?string}|null */
-    private function readState(DaemonFileRepository $fileRepository, int $serverId): ?array
+    /**
+     * @return array{installed?: array{project?: string, version?: string, build?: int, jar?: string, sha256?: ?string, updated_at?: string}, pending?: array{project?: string, version?: string, build?: int, jar?: string, staged_jar?: string, sha256?: ?string, staged_at?: string}}
+     */
+    private function readState(DaemonFileRepository $fileRepository, int $serverId): array
     {
         try {
             $content = $fileRepository->getContent(self::STATE_FILE);
         } catch (FileNotFoundException) {
             // No marker yet - first check for this server.
-            return null;
+            return [];
         } catch (Exception $exception) {
             $this->reportOncePerWindow("server:$serverId:read-state", $exception);
 
-            return null;
+            return [];
         }
 
-        $state = json_decode($content, true);
+        $decoded = json_decode($content, true);
+        if (!is_array($decoded)) {
+            return [];
+        }
 
-        return is_array($state) ? $state : null;
+        // Back-compat with the flat, pre-1.2.0 state file format (no
+        // installed/pending wrapper) - treat it as the "installed" side so
+        // upgrading to this version doesn't cause a spurious re-download.
+        if (!isset($decoded['installed']) && !isset($decoded['pending']) && isset($decoded['project'])) {
+            return ['installed' => $decoded];
+        }
+
+        return $decoded;
     }
 
     /**
-     * @param  array{project: string, version: string, build: int, jar: string, sha256: ?string, updated_at: string}  $state
+     * @param  array{installed?: array, pending?: array}  $state
      *
      * sha256 is recorded for manual comparison only (Wings itself has no way
      * to verify it during the pull) - if a jar ever looks suspicious, this
      * gives you the hash Fill reported for the build it says was installed
-     * to check against.
+     * or staged, to check against.
      */
     private function writeState(DaemonFileRepository $fileRepository, array $state): void
     {
         $fileRepository->putContent(self::STATE_FILE, json_encode($state, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT));
     }
 
-    private function jarExists(DaemonFileRepository $fileRepository, string $jarFile): bool
+    private function fileExists(DaemonFileRepository $fileRepository, string $fileName): bool
     {
         try {
             $files = $fileRepository->getDirectory('/');
@@ -671,7 +685,7 @@ class PaperVelocityUpdateService
         }
 
         foreach ($files as $file) {
-            if (is_array($file) && ($file['name'] ?? null) === $jarFile) {
+            if (is_array($file) && ($file['name'] ?? null) === $fileName) {
                 return true;
             }
         }

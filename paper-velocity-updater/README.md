@@ -1,8 +1,9 @@
 # Paper & Velocity Updater (by Martindob)
 
-Automatically keeps Paper and Velocity servers up to date: every time a server is started or
-restarted, the plugin checks [PaperMC's downloads service](https://docs.papermc.io/misc/downloads-service/)
-for a newer build, downloads it and replaces the server jar *before* the server actually starts.
+Automatically keeps Paper and Velocity servers up to date. A scheduled background check downloads
+newer builds from [PaperMC's downloads service](https://docs.papermc.io/misc/downloads-service/)
+ahead of time, and the next `start`/`restart` swaps the already-downloaded jar into place - a fast,
+local rename, not a fresh multi-megabyte download - right before the power signal reaches Wings.
 
 > Original work by Martindob, first created September 2026. Licensed under GPLv3 (see [LICENSE](LICENSE)), same as the other plugins in this repository.
 
@@ -35,8 +36,14 @@ every restart would silently undo that choice.
 
 ## How it works
 
-1. When a `start` or `restart` power action is sent to a server (from the console, the client
-   API, or a scheduled task), the plugin intercepts it before it reaches Wings.
+This runs in two independent phases, on purpose: a restart should never have to wait on a
+multi-megabyte download, and a once-a-day restart should never miss a build just because it
+happened to fire before a slow download finished.
+
+**Phase 1 - staging (background, hourly):**
+
+1. For every server whose egg defines both a version variable and `BUILD_NUMBER` (see Setup
+   above), a scheduled command checks whether a newer build is available.
 2. If `BUILD_NUMBER` is pinned to a specific number (not `latest`), the server is left alone -
    the admin explicitly chose that build.
 3. Otherwise, the plugin resolves the target Minecraft/Velocity version and asks PaperMC for the
@@ -58,16 +65,32 @@ every restart would silently undo that choice.
    current download. So `latest` walks versions newest-first and picks the first one that actually
    has a `STABLE` build, checking up to 10 versions before giving up - matching what PaperMC's own
    downloads pages show for both projects, not a naming guess.
-4. If that build differs from the one last installed (tracked in a small `.paper-velocity-updater.json`
-   marker file in the server's root), the existing jar is renamed to `<jarfile>.old` (best-effort,
-   mirroring what the official install scripts themselves do before downloading a new jar - an easy
-   manual recovery path if a downloaded jar ever turns out to be bad) and the new one is downloaded
-   straight into the server directory (via the daemon's file-pull API, with a generous timeout - see
-   below). Only a single rolling `.old` backup is ever kept - any previous one is deleted first, so
-   this never accumulates extra files or grows disk usage over time. The marker is updated last -
-   all before the power signal is forwarded, so the server always boots on the version it just
-   downloaded. **Exception:** for Velocity, this jar swap is skipped for that cycle if the proxy is
-   currently confirmed running - see the note on this below.
+4. If that build isn't already installed (tracked in a small `.paper-velocity-updater.json` marker
+   file in the server's root) or already staged, it's downloaded straight into the server directory
+   as `<jarfile>.pending` - a *new* file, next to but never overwriting the live jar - via the
+   daemon's file-pull API, with a generous timeout (see below). This is completely safe to do while
+   the server is running, for both Paper and Velocity: the live jar isn't touched at all in this
+   phase.
+
+**Phase 2 - swapping (on the next `start`/`restart`):**
+
+5. When a `start` or `restart` power action is sent to a server (from the console, the client API,
+   or a scheduled task), the plugin intercepts it before it reaches Wings and checks whether
+   anything is staged for it.
+6. If so, the existing jar is renamed to `<jarfile>.old` (best-effort, mirroring what the official
+   install scripts themselves do before installing a new jar - an easy manual recovery path if a
+   downloaded jar ever turns out to be bad; only a single rolling `.old` backup is ever kept, so
+   this never grows disk usage over time) and the staged `<jarfile>.pending` is renamed into the
+   live jar's place. Both are fast, local renames on the daemon - no network call to PaperMC and no
+   multi-megabyte transfer happens here, so this adds no meaningful delay to the power action. The
+   marker file is updated last, all before the power signal is forwarded, so the server always
+   boots on the build that was just swapped in.
+
+This two-phase split is also why Velocity no longer needs its jar swap gated on the server being
+confirmed stopped, unlike some other Paper/Velocity auto-updaters. Only a *rename* ever touches the
+live jar - never an in-place overwrite - and a rename doesn't affect a process that already has the
+old file open (see the note on this in the Limitations section below), so it's safe to do even while
+the proxy is still running, right up to the moment the restart actually happens.
 
 ## Configuration
 
@@ -93,69 +116,59 @@ you prefer - the settings page just writes to the same place.
 
 ## Performance
 
-This plugin only ever does work for `start`/`restart` power actions on servers whose egg defines
-both a version variable and `BUILD_NUMBER` (see Setup above) - every other server, and every
-`stop`/`kill` action, is untouched with effectively zero overhead (a single cheap in-memory check
-against the server's already-loaded variables, nothing more).
+The hourly background check only ever does work for servers whose egg defines both a version
+variable and `BUILD_NUMBER` (see Setup above) - every other server is skipped with effectively zero
+overhead (a single cheap in-memory check against the server's already-loaded variables, nothing
+more). For a Paper/Velocity server itself, the steady state (server already on the target build,
+nothing newer available) costs nothing beyond re-checking PaperMC once per **Version/build cache
+(minutes)** window (default `15`) - only an actual available update touches the daemon's file API
+at all, to write the `.pending` file.
 
-For a Paper/Velocity server itself, the steady state (server already on the target build) costs
-nothing beyond the very first check: PaperMC's "latest version"/"latest build" lookups are cached
-for **Version/build cache (minutes)**, and once a restart has actually confirmed the installed
-build matches, that confirmation is *also* cached for the same window - so a server that's
-already up to date can be restarted repeatedly (e.g. while configuring it) without hitting
-PaperMC's API or the daemon's file API again until that window expires and it re-verifies once.
-Only an actual pending update (or that periodic re-verification) touches the daemon at all.
+The `start`/`restart` hook itself never touches PaperMC or the network: it only reads the small
+marker file and, if something is staged, does two renames on the daemon. This adds no meaningful
+delay to a power action regardless of how large the jar is or how slow the connection to PaperMC's
+CDN is, since that download already happened, on its own schedule, before the restart ever occurred.
 
 ## Limitations
 
-- Restarting a server frequently is safe: repeated restarts within the version/build cache window
-  reuse the already-resolved version/build instead of re-querying PaperMC, and a restart is skipped
-  entirely once the marker file shows the currently installed build is already the target one -
-  so it never re-downloads the same jar over and over.
 - Firing power actions in quick succession (double-clicking restart, hitting start right after a
-  restart, force-stopping and immediately starting again, ...) is safe too. `start`/`restart` share
-  a per-server lock: a second `start`/`restart` that arrives while the first is still checking or
-  downloading *waits* (up to 10 seconds - kept short on purpose so it can't itself cause a web
-  server/reverse proxy gateway timeout) for it to finish rather than racing ahead, so it can never
-  send its own power signal while the daemon might still be mid-write on the jar the server is
-  about to run. If that short wait isn't enough, the action fails the same clean, retryable way
-  described below rather than hanging. `stop`/`kill` are untouched by this plugin entirely (it
-  only hooks `start`/`restart`), so they're always sent immediately and never wait on anything -
-  they don't touch the jar file either way.
-- This only runs for power actions sent through the panel (console, client API, scheduled
-  tasks). If Wings itself restarts a crashed server without asking the panel, this hook is not
-  triggered.
+  restart, ...) is safe: a second `start`/`restart` that arrives while the first is still applying
+  its swap waits briefly (up to 5 seconds) for it to finish rather than racing ahead, so the two
+  renames (backup, then swap) can't interleave with another swap on the same server. If that short
+  wait isn't enough, this restart's swap is simply skipped (the pending update stays staged and is
+  retried on the *next* restart) - it never delays or fails the actual power action over this.
+  `stop`/`kill` are untouched by this plugin entirely (it only hooks `start`/`restart`).
+- This only runs for power actions sent through the panel (console, client API, scheduled tasks).
+  If Wings itself restarts a crashed server without asking the panel, no swap happens for that
+  particular restart - the update stays staged and is applied on the next one that does go through
+  the panel.
 - Only `STABLE` channel builds are used for automatic updates. If a pinned version only has
   `BETA`/`ALPHA` builds, the newest available build is used instead.
 - A failed *check* (e.g. PaperMC being unreachable, or a pinned version that can't be verified)
-  never blocks the server from starting and never logs anything beyond the usual throttled failure
-  entry (see above) - it just starts on the previously installed jar. A pinned version that can't
-  be confirmed is treated exactly the same way: the update is silently skipped for that cycle,
-  never substituted with a different version.
-- A failed *download*, or waiting too long for another in-flight check/download on the same server
-  to finish, deliberately fails the whole power action instead of proceeding: the daemon may still
-  be mid-write on that exact jar file, so proceeding anyway could mean running a half-written jar.
-  Whatever actually failed is surfaced as the same `ConnectionException` the panel already shows a
-  proper error notification for elsewhere, so this shows up as a normal "couldn't reach the node"
-  error instead of a broken page - the server keeps its previous state either way, just retry.
+  never blocks anything and never logs anything beyond the usual throttled failure entry (see
+  above) - the next hourly check just tries again. A pinned version that can't be confirmed is
+  treated exactly the same way: staging is silently skipped for that cycle, never substituted with
+  a different version.
+- A failed *swap* (the daemon being briefly unreachable, the staged file having been deleted
+  manually, ...) never blocks or delays the actual start/restart either - the server just starts on
+  its current jar, and the update stays staged for the next restart to retry.
+- If you change `SERVER_JARFILE` or the project's version variable (or switch on `DL_PATH`) between
+  a check staging an update and the next restart, that stale staged update is discarded rather than
+  swapped in - the next hourly check stages the right thing for the new configuration instead (or
+  nothing, if you opted out via `DL_PATH`).
 - This plugin only hooks `start`/`restart` power actions - a reinstall runs the egg's own install
   script as usual, unaffected by this plugin.
-- **Velocity only updates while stopped.** Wings writes the replacement jar in place - it truncates
-  and overwrites the existing file's contents directly rather than writing a new file and atomically
-  renaming it over the old one (checked directly against Wings' own `Filesystem.Write()`). For Paper
-  this is harmless even while the old process is still running: Paperclip (`server.jar`) only reads
-  itself for a few seconds at boot to patch and cache the real server jar under `cache/`, then runs
-  entirely from that cache for the rest of the process's life, so it never touches `server.jar` again
-  until its *next* launch. Velocity has no such split - it's launched directly as `java -jar
-  velocity.jar`, so the JVM keeps that exact file open for as long as the process runs and can still
-  lazily load a class from it at any point. Overwriting it while an already-running proxy might still
-  read from it risks a corrupt read crashing an otherwise healthy proxy - clearly worse than just
-  leaving it on its current build for one more restart. So a `restart` sent to a Velocity proxy that's
-  still running when the check happens (the common case for a scheduled restart) skips the update for
-  that cycle and simply restarts on the current build; the update is picked up automatically on a
-  later check once the proxy is confirmed stopped (a manual `start` after a `stop`, or a `restart`
-  that happens to catch it already offline/crashed). Paper is not affected by this and keeps updating
-  on every restart regardless of whether it's currently running.
+- **Only a rename ever touches the live jar - never an in-place overwrite - which is what makes it
+  safe to swap in a build for a still-running server, Velocity included.** Wings' file-pull API
+  writes a new file's bytes by truncating and overwriting an *existing* filename's same inode
+  (checked directly against Wings' own `Filesystem.Write()`), which is why the staged download in
+  phase 1 always goes to a new `<jarfile>.pending` name rather than the live jar directly - so it
+  can never corrupt whatever the currently-running process still has open. The phase 2 swap itself
+  is a plain rename, which only changes which path points at which inode; it has no effect on a
+  process that already has the old jar open by file descriptor (Velocity's classloader keeps its
+  jar's `ZipFile`/`JarFile` handle open for the process's whole lifetime and can lazily load a class
+  from it at any time, but it never re-opens the jar by path while running) - so there's nothing for
+  the rename to corrupt, unlike overwriting the same inode in place would risk.
 - On `latest`, this plugin can resolve to a different version than a manual **Reinstall** would at
   the same moment. Checked directly against the official install scripts: they resolve "latest
   version" as simply the first entry PaperMC's API returns, with no channel check at all, so if the

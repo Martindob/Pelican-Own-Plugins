@@ -21,9 +21,11 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
 
     public function register(Panel $panel): void
     {
-        // No other Filament UI is needed: the update check itself is wired up in
-        // PaperVelocityUpdaterPluginProvider so it also runs for the client API
-        // (used by power actions and scheduled tasks), not just panel requests.
+        // No other Filament UI is needed: the hourly background check and the
+        // start/restart swap hook are both wired up in
+        // PaperVelocityUpdaterPluginProvider so they run regardless of which
+        // request context triggers them (scheduler, client API power actions,
+        // scheduled tasks), not just panel requests.
     }
 
     public function boot(Panel $panel): void {}
@@ -38,7 +40,7 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
         return [
             Toggle::make('enabled')
                 ->label('Enabled')
-                ->helperText('Automatically check for and download the newest Paper/Velocity build before a server starts or restarts.')
+                ->helperText('Automatically stage and install the newest Paper/Velocity build. Checked hourly in the background; applied on the next server start/restart.')
                 ->inline(false)
                 ->default(fn () => config('paper-velocity-updater.enabled')),
             TextInput::make('cache_minutes')
@@ -50,14 +52,14 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
                 ->default(fn () => config('paper-velocity-updater.cache_minutes')),
             TextInput::make('download_timeout_seconds')
                 ->label('Download timeout (seconds)')
-                ->helperText('How long to wait for the daemon to download and write the jar file. Raise this if your nodes have a slow link to PaperMC\'s CDN. Kept well above the daemon client\'s own 15 second default on purpose - a ~50-60MB jar realistically needs more than that.')
+                ->helperText('How long the hourly background check waits for the daemon to download and stage a new jar. Raise this if your nodes have a slow link to PaperMC\'s CDN. Kept well above the daemon client\'s own 15 second default on purpose - a ~50-60MB jar realistically needs more than that. Never affects a server start/restart itself, which only ever swaps in what was already staged.')
                 ->numeric()
                 ->minValue(60)
                 ->required()
                 ->default(fn () => config('paper-velocity-updater.download_timeout_seconds')),
             TextInput::make('report_throttle_minutes')
                 ->label('Failure log throttle (minutes)')
-                ->helperText('The same failure for a given server is only logged once per this many minutes, no matter how many times it is restarted in the meantime. Set to 0 to log every occurrence.')
+                ->helperText('The same failure for a given server is only logged once per this many minutes, no matter how many times the hourly check hits it in the meantime. Set to 0 to log every occurrence.')
                 ->numeric()
                 ->minValue(0)
                 ->required()

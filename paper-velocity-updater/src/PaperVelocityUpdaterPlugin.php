@@ -4,11 +4,17 @@ namespace Martindob\PaperVelocityUpdater;
 
 use App\Contracts\Plugins\HasPluginSettings;
 use App\Traits\EnvironmentWriterTrait;
+use Filament\Actions\Action;
 use Filament\Contracts\Plugin;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
+use Filament\Infolists\Components\TextEntry;
 use Filament\Notifications\Notification;
 use Filament\Panel;
+use Filament\Schemas\Components\Actions;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\HtmlString;
+use Martindob\PaperVelocityUpdater\Services\PaperVelocityUpdateService;
 
 class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
 {
@@ -64,7 +70,71 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
                 ->minValue(0)
                 ->required()
                 ->default(fn () => config('paper-velocity-updater.report_throttle_minutes')),
+            Actions::make([
+                Action::make('check_now')
+                    ->label('Run check now')
+                    ->icon('tabler-refresh')
+                    ->color('gray')
+                    ->action(function () {
+                        app(PaperVelocityUpdateService::class)->checkForUpdates();
+
+                        Notification::make()
+                            ->title('Check complete')
+                            ->body('Close and reopen this settings dialog to see the result below.')
+                            ->success()
+                            ->send();
+                    }),
+            ]),
+            TextEntry::make('last_check_at')
+                ->label('Last check')
+                ->state(fn () => $this->formatLastCheckAt()),
+            TextEntry::make('recent_activity')
+                ->label('Recent activity')
+                ->state(fn () => new HtmlString($this->formatActivityLog()))
+                ->columnSpanFull(),
         ];
+    }
+
+    /**
+     * "Run check now" doesn't run on a fresh page - the settings form only
+     * gets rebuilt when this modal is (re)opened (see App\Models\Plugin::
+     * getSettingsForm(), which constructs a fresh plugin instance each time)
+     * - so its own Notification is the only immediate feedback; this and
+     * formatActivityLog() below only pick up what it did once the dialog is
+     * reopened.
+     */
+    private function formatLastCheckAt(): string
+    {
+        $lastCheckAt = app(PaperVelocityUpdateService::class)->getLastCheckAt();
+
+        if (!$lastCheckAt) {
+            return 'Never run yet. Use "Run check now" above, then reopen this dialog - if it still says this afterwards, the hourly scheduler likely isn\'t running (verify `php artisan schedule:run` is wired into cron on the panel host).';
+        }
+
+        $suffix = $lastCheckAt->lt(now()->subHours(2))
+            ? ' - this is more than 2 hours ago, which usually means the hourly scheduled check has stopped running (verify `php artisan schedule:run` is wired into cron on the panel host).'
+            : '';
+
+        return $lastCheckAt->diffForHumans() . $suffix;
+    }
+
+    private function formatActivityLog(): string
+    {
+        $entries = app(PaperVelocityUpdateService::class)->getActivityLog();
+
+        if (empty($entries)) {
+            return '<p>No activity recorded yet.</p>';
+        }
+
+        $rows = array_map(function (array $entry) {
+            $time = e(Carbon::parse($entry['at'])->diffForHumans());
+            $message = e($entry['message']);
+            $color = ($entry['level'] ?? 'info') === 'error' ? 'rgb(220 38 38)' : 'rgb(22 163 74)';
+
+            return "<div style=\"margin-bottom:0.25rem;\"><span style=\"color:{$color};font-weight:600;\">{$time}</span> — {$message}</div>";
+        }, $entries);
+
+        return implode('', $rows);
     }
 
     public function saveSettings(array $data): void

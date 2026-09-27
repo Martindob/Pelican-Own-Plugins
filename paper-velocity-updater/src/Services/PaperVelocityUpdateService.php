@@ -8,6 +8,7 @@ use Exception;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
@@ -21,6 +22,23 @@ class PaperVelocityUpdateService
 
     /** How many versions resolveLatestStable() will check before giving up. */
     private const MAX_LATEST_VERSION_CANDIDATES = 10;
+
+    /**
+     * Cache keys for the small activity feed shown on the settings page (see
+     * PaperVelocityUpdaterPlugin::getSettingsForm()) - this is a diagnostic aid
+     * for admins, entirely separate from the throttled report()/log entries
+     * elsewhere in this class, and from the .paper-velocity-updater.json state
+     * file kept per-server on each server's own daemon.
+     */
+    private const ACTIVITY_LOG_CACHE_KEY = 'paper-velocity-updater:activity_log';
+
+    private const LAST_CHECK_CACHE_KEY = 'paper-velocity-updater:last_check_at';
+
+    /** Oldest entry the activity feed keeps, regardless of how many there are. */
+    private const ACTIVITY_LOG_MAX_AGE_DAYS = 7;
+
+    /** Most entries the activity feed keeps, regardless of how recent they are. */
+    private const ACTIVITY_LOG_MAX_ENTRIES = 30;
 
     /** Egg variable name(s) that identify a project and hold its target version. */
     private const PROJECT_VERSION_VARIABLES = [
@@ -44,11 +62,85 @@ class PaperVelocityUpdateService
             return;
         }
 
+        // Written unconditionally, before anything else here can fail: this is
+        // the one signal on the settings page that proves the scheduler is
+        // actually invoking this method at all, independent of whether any
+        // individual server's check then succeeds or fails.
+        Cache::put(self::LAST_CHECK_CACHE_KEY, now()->toIso8601String(), now()->addHours(25));
+
         Server::query()->chunk(50, function ($servers) {
             foreach ($servers as $server) {
                 $this->stage($server);
             }
         });
+    }
+
+    /**
+     * When checkForUpdates() last ran, regardless of what it found - null if
+     * it has never run yet. Kept for a little over a day (see
+     * checkForUpdates()), so a stale/missing value here on the settings page
+     * itself signals that the hourly scheduled check has stopped running
+     * (most likely `php artisan schedule:run` isn't wired into the panel
+     * host's cron), not just that nothing needed updating.
+     */
+    public function getLastCheckAt(): ?Carbon
+    {
+        $value = Cache::get(self::LAST_CHECK_CACHE_KEY);
+
+        return $value ? Carbon::parse($value) : null;
+    }
+
+    /**
+     * The activity feed shown on the settings page, newest first. Entries
+     * older than ACTIVITY_LOG_MAX_AGE_DAYS are already dropped by
+     * logActivity() as new ones come in, so this needs no separate cleanup -
+     * an install that stops seeing any activity at all (e.g. disabled, or no
+     * Paper/Velocity servers) simply has its feed age out and empty on its
+     * own within that window.
+     *
+     * @return array<int, array{at: string, level: string, message: string}>
+     */
+    public function getActivityLog(): array
+    {
+        $entries = Cache::get(self::ACTIVITY_LOG_CACHE_KEY, []);
+
+        return is_array($entries) ? array_reverse($entries) : [];
+    }
+
+    /**
+     * Records one line in the small activity feed shown on the settings page,
+     * so an admin can confirm the plugin is actually doing something (or see
+     * exactly what's failing and for which server) without needing shell
+     * access to tail the panel's own log file. Deliberately separate from
+     * reportOncePerWindow(): that throttles the framework log so a persistent
+     * failure doesn't spam it, but throttling the same way here would hide
+     * exactly the repeated failures an admin most needs to see on this page -
+     * so every call here is recorded, and only count/age bound the feed.
+     */
+    private function logActivity(string $level, string $message): void
+    {
+        $entries = Cache::get(self::ACTIVITY_LOG_CACHE_KEY, []);
+        if (!is_array($entries)) {
+            $entries = [];
+        }
+
+        $entries[] = [
+            'at' => now()->toIso8601String(),
+            'level' => $level,
+            'message' => $message,
+        ];
+
+        $cutoff = now()->subDays(self::ACTIVITY_LOG_MAX_AGE_DAYS);
+        $entries = array_values(array_filter(
+            $entries,
+            fn ($entry) => is_array($entry) && isset($entry['at']) && Carbon::parse($entry['at'])->greaterThan($cutoff)
+        ));
+
+        if (count($entries) > self::ACTIVITY_LOG_MAX_ENTRIES) {
+            $entries = array_slice($entries, -self::ACTIVITY_LOG_MAX_ENTRIES);
+        }
+
+        Cache::put(self::ACTIVITY_LOG_CACHE_KEY, $entries, now()->addDays(self::ACTIVITY_LOG_MAX_AGE_DAYS));
     }
 
     /**
@@ -111,6 +203,8 @@ class PaperVelocityUpdateService
                 });
         } catch (Exception $exception) {
             $this->reportOncePerWindow("server:{$server->id}:swap", $exception);
+
+            $this->logActivity('error', "Swap failed for server #{$server->id} ({$server->name}): {$exception->getMessage()}");
         }
     }
 
@@ -171,6 +265,8 @@ class PaperVelocityUpdateService
                     ];
 
                     $this->writeState($fileRepository, $state);
+
+                    $this->logActivity('success', "Staged {$target['project']} build {$target['build']} ({$target['version']}) for server #{$server->id} ({$server->name}) - applied on its next start/restart.");
                 });
         } catch (Exception $exception) {
             // A server that's failing this check every hour (e.g. PaperMC
@@ -178,6 +274,8 @@ class PaperVelocityUpdateService
             // shouldn't get one log entry per check - one per throttle
             // window is enough to notice a real, persistent problem.
             $this->reportOncePerWindow("server:{$server->id}:" . $exception::class, $exception);
+
+            $this->logActivity('error', "Check failed for server #{$server->id} ({$server->name}): {$exception->getMessage()}");
         }
     }
 
@@ -239,6 +337,8 @@ class PaperVelocityUpdateService
         unset($state['pending']);
 
         $this->writeState($fileRepository, $state);
+
+        $this->logActivity('success', "Updated server #{$server->id} ({$server->name}) to {$pending['project']} build {$pending['build']} ({$pending['version']}).");
     }
 
     /**

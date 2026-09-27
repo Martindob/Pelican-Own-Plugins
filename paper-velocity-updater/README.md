@@ -114,6 +114,35 @@ These are stored as environment variables (`PAPER_VELOCITY_UPDATER_ENABLED`,
 `PAPER_VELOCITY_UPDATER_REPORT_THROTTLE_MINUTES`) and can be set directly in `.env` instead if
 you prefer - the settings page just writes to the same place.
 
+## Checking that it's actually working
+
+The same settings dialog also shows:
+
+- **Run check now** - runs the hourly background check immediately instead of waiting for the
+  scheduler, exactly as if the scheduled check had just fired. Useful right after installing the
+  plugin, or any time you want to confirm it's still working without waiting up to an hour. Its
+  result only shows up in the two fields below once you close and reopen this dialog - a
+  Notification confirms it ran, but the dialog itself isn't rebuilt in place.
+- **Last check** - when the background check last ran, regardless of what it found. If this says
+  "Never run yet" after using "Run check now" above, or it stays more than 2 hours old, the hourly
+  scheduler itself isn't running - almost always because `php artisan schedule:run` isn't wired
+  into cron on the panel's host (a single line, typically added once when the panel is first set
+  up: `* * * * * php /path/to/panel/artisan schedule:run >> /dev/null 2>&1`). This is a normal
+  Laravel requirement, not specific to this plugin - if it's missing, every other scheduled task on
+  the panel (including e.g. the sibling `minecraft-modrinth` plugin's own daily auto-update, if you
+  use it) isn't running either.
+- **Recent activity** - the last ~30 events (staged updates, applied swaps, and failures) from the
+  last 7 days, newest first, in plain language - e.g. "Staged paper build 130 (26.2) for server #4
+  (Survival) - applied on its next start/restart." or "Updated server #4 (Survival) to paper build
+  130 (26.2)." An empty feed after using "Run check now" means no Paper/Velocity servers were found
+  (double check the egg's startup variables - see Setup above), not that something is broken.
+
+This feed is a lightweight diagnostic aid (kept in cache, not written to any file on a server), not
+a replacement for the panel's own log if you need full exception detail - the same events are also
+reported there, just throttled per **Failure log throttle (minutes)** above so a persistent problem
+doesn't spam it. `php artisan p:paper-velocity-updater:check` on the panel host does exactly what
+"Run check now" does, if you'd rather trigger it from the command line.
+
 ## Performance
 
 The hourly background check only ever does work for servers whose egg defines both a version

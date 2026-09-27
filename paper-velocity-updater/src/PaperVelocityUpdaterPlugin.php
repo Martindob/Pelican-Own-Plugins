@@ -129,7 +129,11 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
         $rows = array_map(function (array $entry) {
             $time = e(Carbon::parse($entry['at'])->diffForHumans());
             $message = e($entry['message']);
-            $color = ($entry['level'] ?? 'info') === 'error' ? 'rgb(220 38 38)' : 'rgb(22 163 74)';
+            $color = match ($entry['level'] ?? 'info') {
+                'error' => 'rgb(220 38 38)',
+                'success' => 'rgb(22 163 74)',
+                default => 'rgb(100 116 139)',
+            };
 
             return "<div style=\"margin-bottom:0.25rem;\"><span style=\"color:{$color};font-weight:600;\">{$time}</span> — {$message}</div>";
         }, $entries);

@@ -144,6 +144,27 @@ class PaperVelocityUpdateService
     }
 
     /**
+     * Explains, once per server/reason per day, why a server that IS
+     * recognized as Paper/Velocity isn't getting an update staged - a pinned
+     * build, DL_PATH being set, an invalid SERVER_JARFILE, a PaperMC lookup
+     * that failed, or simply already being up to date. Without this, all of
+     * those look identical from the settings page: an empty activity feed
+     * that gives no way to tell "working correctly, nothing to do" apart
+     * from "silently not doing what you expect". Throttled to once a day
+     * (independent of reportOncePerWindow()'s own, shorter throttle for
+     * actual exceptions) since a permanent condition like a pinned build
+     * would otherwise repeat this every single hourly check forever.
+     */
+    private function logSkipOncePerDay(Server $server, string $reason): void
+    {
+        $key = 'paper-velocity-updater:skip-logged:'.$server->id.':'.md5($reason);
+
+        if (Cache::add($key, true, now()->addDay())) {
+            $this->logActivity('info', "Server #{$server->id} ({$server->name}): $reason");
+        }
+    }
+
+    /**
      * Applies whatever update checkForUpdates() already staged for this
      * server, if any. Meant to be called synchronously from the start/restart
      * power action hook (UpdateCheckingDaemonServerRepository), right before
@@ -237,8 +258,13 @@ class PaperVelocityUpdateService
                     $fileRepository = app(DaemonFileRepository::class)->setServer($server);
                     $state = $this->readState($fileRepository, $server->id);
 
-                    if ($this->matchesTarget($state['installed'] ?? null, $target)
-                        || $this->matchesTarget($state['pending'] ?? null, $target)) {
+                    if ($this->matchesTarget($state['pending'] ?? null, $target)) {
+                        return;
+                    }
+
+                    if ($this->matchesTarget($state['installed'] ?? null, $target)) {
+                        $this->logSkipOncePerDay($server, "Already up to date on {$target['project']} build {$target['build']} ({$target['version']}) - nothing to stage.");
+
                         return;
                     }
 
@@ -362,6 +388,8 @@ class PaperVelocityUpdateService
         // shown in the startup variables) triggers an automatic update.
         $buildVariable = $this->getVariable($server, 'BUILD_NUMBER');
         if ($buildVariable !== null && !$this->isLatest($buildVariable)) {
+            $this->logSkipOncePerDay($server, "BUILD_NUMBER is set to \"$buildVariable\", not \"latest\" - leave it at \"latest\" if you want this server to auto-update.");
+
             return null;
         }
 
@@ -374,6 +402,8 @@ class PaperVelocityUpdateService
         // stock PaperMC jar would silently undo that choice on the next
         // restart.
         if ($this->getVariable($server, 'DL_PATH') !== null) {
+            $this->logSkipOncePerDay($server, 'DL_PATH is set - this server has opted out of PaperMC-based updates.');
+
             return null;
         }
 
@@ -386,6 +416,8 @@ class PaperVelocityUpdateService
         // file operation - reject anything that isn't a plain filename
         // ending in .jar before it's used for anything.
         if ($jarFile !== basename($jarFile) || !str_ends_with(strtolower($jarFile), '.jar')) {
+            $this->logSkipOncePerDay($server, "SERVER_JARFILE (\"$jarFile\") isn't a plain .jar filename - refusing to touch it.");
+
             return null;
         }
 
@@ -408,6 +440,8 @@ class PaperVelocityUpdateService
         if ($this->isLatest($requestedVersion)) {
             $resolved = $this->resolveLatestStable($project);
             if ($resolved === null) {
+                $this->logSkipOncePerDay($server, 'Could not resolve a "latest" stable build right now (PaperMC unreachable, or no stable build found in the newest '.self::MAX_LATEST_VERSION_CANDIDATES.' versions) - will retry on the next check.');
+
                 return null;
             }
 
@@ -417,17 +451,23 @@ class PaperVelocityUpdateService
             $version = trim((string) $requestedVersion);
 
             if (!$this->versionExists($project, $version)) {
+                $this->logSkipOncePerDay($server, "Pinned version \"$version\" doesn't match any version PaperMC lists for $project - check for a typo.");
+
                 return null;
             }
 
             $build = $this->resolveBuildForPinnedVersion($project, $version);
             if ($build === null) {
+                $this->logSkipOncePerDay($server, "No build found for pinned version \"$version\".");
+
                 return null;
             }
         }
 
         $download = $build['downloads']['server:default'] ?? null;
         if (!is_array($download) || !isset($download['url'])) {
+            $this->logSkipOncePerDay($server, "PaperMC's build {$build['id']} for $project $version has no downloadable file.");
+
             return null;
         }
 
@@ -440,6 +480,8 @@ class PaperVelocityUpdateService
         $downloadHost = strtolower((string) parse_url((string) $download['url'], PHP_URL_HOST));
         $downloadScheme = strtolower((string) parse_url((string) $download['url'], PHP_URL_SCHEME));
         if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'api.papermc.io'], true)) {
+            $this->logSkipOncePerDay($server, 'The resolved download URL failed validation (unexpected host/scheme) - refusing it for safety.');
+
             return null;
         }
 

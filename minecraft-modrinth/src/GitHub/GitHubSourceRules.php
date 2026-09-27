@@ -14,8 +14,11 @@ final class GitHubSourceRules
     /** The only index format this plugin understands. Anything else installs nothing. */
     public const INDEX_SCHEMA = 1;
 
-    /** GitHub's own limit for the raw contents API - larger files can't be fetched that way. */
-    public const MAX_JAR_BYTES = 100 * 1024 * 1024;
+    /**
+     * Largest jar accepted from the index. The panel holds a jar in PHP memory while it checks
+     * and writes it (GitHub's raw contents API would allow 100 MB, a PHP worker usually not).
+     */
+    public const MAX_JAR_BYTES = 50 * 1024 * 1024;
 
     public const MAX_INDEX_BYTES = 1024 * 1024;
 
@@ -238,7 +241,7 @@ final class GitHubSourceRules
         if (($data['schema'] ?? null) !== self::INDEX_SCHEMA) {
             $schema = $data['schema'] ?? null;
 
-            throw new GitHubSourceException(GitHubSourceException::UNSUPPORTED_SCHEMA, 'Unsupported index schema: '.(is_scalar($schema) ? var_export($schema, true) : gettype($schema)));
+            throw new GitHubSourceException(GitHubSourceException::UNSUPPORTED_SCHEMA, 'Unsupported index schema: '.self::describeValue($schema));
         }
 
         if (!isset($data['plugins']) || !is_array($data['plugins']) || !array_is_list($data['plugins'])) {
@@ -367,18 +370,26 @@ final class GitHubSourceRules
      * Decide the CI state of a commit from its GitHub Actions workflow runs
      * (GET /repos/{repo}/actions/runs?head_sha=...&event=push&branch=...).
      *
+     * Only runs of a push of exactly $sha (and, when given, to exactly $branch) count:
+     *
      * - any finished run that didn't succeed -> failed (definitive, even if others still run)
      * - anything still queued/running        -> pending
      * - everything success/skipped/neutral and at least one success -> green
      * - no runs at all, or nothing actually succeeded -> unverified
      *
+     * With $requiredWorkflow (a workflow file name such as "build.yml"), green additionally
+     * needs a successful run of exactly that workflow: while it hasn't run yet the commit is
+     * unverified, while it runs pending - so a quick, unrelated workflow finishing first can't
+     * turn CI green before the build itself has finished.
+     *
      * @param  array<int, mixed>  $runs
      */
-    public static function evaluateWorkflowRuns(array $runs, string $sha): CiStatus
+    public static function evaluateWorkflowRuns(array $runs, string $sha, ?string $branch = null, ?string $requiredWorkflow = null): CiStatus
     {
         $relevant = array_values(array_filter($runs, fn ($run) => is_array($run)
             && ($run['head_sha'] ?? null) === $sha
-            && ($run['event'] ?? null) === 'push'));
+            && ($run['event'] ?? null) === 'push'
+            && ($branch === null || ($run['head_branch'] ?? null) === $branch)));
 
         if (empty($relevant)) {
             return CiStatus::Unverified;
@@ -386,8 +397,12 @@ final class GitHubSourceRules
 
         $pending = false;
         $succeeded = false;
+        $requiredSucceeded = false;
 
         foreach ($relevant as $run) {
+            $isRequired = $requiredWorkflow !== null && $requiredWorkflow !== ''
+                && self::workflowFileOfRun($run) === strtolower($requiredWorkflow);
+
             if (($run['status'] ?? null) !== 'completed') {
                 $pending = true;
 
@@ -398,6 +413,7 @@ final class GitHubSourceRules
 
             if ($conclusion === 'success') {
                 $succeeded = true;
+                $requiredSucceeded = $requiredSucceeded || $isRequired;
             } elseif (!in_array($conclusion, ['skipped', 'neutral'], true)) {
                 return CiStatus::Failed;
             }
@@ -407,7 +423,41 @@ final class GitHubSourceRules
             return CiStatus::Pending;
         }
 
+        if ($requiredWorkflow !== null && $requiredWorkflow !== '' && !$requiredSucceeded) {
+            // Not run (yet), or only skipped: nothing proves the required build passed.
+            return CiStatus::Unverified;
+        }
+
         return $succeeded ? CiStatus::Green : CiStatus::Unverified;
+    }
+
+    /**
+     * File name (lower case) of the workflow a run belongs to, from its "path"
+     * (".github/workflows/build.yml", sometimes with an "@ref" suffix), or null.
+     *
+     * @param  array<mixed>  $run
+     */
+    public static function workflowFileOfRun(array $run): ?string
+    {
+        $path = $run['path'] ?? null;
+
+        if (!is_string($path) || $path === '') {
+            return null;
+        }
+
+        $path = explode('@', $path, 2)[0];
+
+        if (!str_starts_with($path, '.github/workflows/')) {
+            return null;
+        }
+
+        return strtolower(basename($path));
+    }
+
+    /** A workflow file name as the "Required workflow" setting takes it, e.g. "build.yml". */
+    public static function isValidWorkflowFile(string $file): bool
+    {
+        return (bool) preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml$/', $file) && !str_contains($file, '..');
     }
 
     /**
@@ -516,15 +566,16 @@ final class GitHubSourceRules
      * @param  array<int, array{id: string, version: string, sha256: string, filename: string}>  $installed
      * @param  array<int, string>  $dismissedIds
      * @param  array<int, string>  $jarNames
+     * @param  array<int, string>  $alsoManaged  further jar names of this plugin (old jars waiting to be deleted)
      * @return array{new: array<int, T>, updates: array<int, T>}
      */
-    public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames): array
+    public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames, array $alsoManaged = []): array
     {
         $byId = [];
         foreach ($installed as $entry) {
             $byId[$entry['id']] = $entry;
         }
-        $managed = array_column($installed, 'filename');
+        $managed = array_merge(array_column($installed, 'filename'), $alsoManaged);
 
         $offers = ['new' => [], 'updates' => []];
 
@@ -598,6 +649,69 @@ final class GitHubSourceRules
             || $host === 'objects.githubusercontent.com'
             || $host === 'codeload.github.com'
             || (bool) preg_match('/^[a-z0-9-]+\.githubusercontent\.com$/', $host);
+    }
+
+    // ------------------------------------------------------------------
+    // Settings, daemon responses, housekeeping
+    // ------------------------------------------------------------------
+
+    /** The automatic update time as it may go into .env and Schedule::dailyAt(): HH:MM[:SS]. */
+    public static function isValidAutoUpdateTime(string $time): bool
+    {
+        return (bool) preg_match('/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/', $time);
+    }
+
+    /** "HH:MM" for Schedule::dailyAt(), or the fallback when the saved value is unusable. */
+    public static function scheduleTime(mixed $time, string $fallback = '00:00'): string
+    {
+        return is_string($time) && self::isValidAutoUpdateTime($time) ? substr($time, 0, 5) : $fallback;
+    }
+
+    /** Temporary name a jar is written under before it is renamed into place. */
+    public static function isTemporaryUploadName(string $name): bool
+    {
+        return (bool) preg_match('/^\.(github|modrinth)-[0-9a-f]{12}\.part$/', $name);
+    }
+
+    /**
+     * Whether a left-over temporary upload may be removed: only when its modification time
+     * is known and older than $maxAgeSeconds (an upload running right now is never touched).
+     */
+    public static function isStaleTemporaryUpload(string $name, mixed $modified, int $now, int $maxAgeSeconds = 3600): bool
+    {
+        if (!self::isTemporaryUploadName($name) || !is_string($modified) || $modified === '') {
+            return false;
+        }
+
+        $time = strtotime($modified);
+
+        return $time !== false && $time < $now - $maxAgeSeconds;
+    }
+
+    /** Wings' answer when the node itself doesn't know the server (as opposed to a missing file). */
+    public static function isUnknownServerResponse(int $status, string $body): bool
+    {
+        return $status === 404 && str_contains(strtolower($body), 'does not exist on this instance');
+    }
+
+    /** Wings' answer when the server's disk quota is used up. */
+    public static function isDiskSpaceResponse(string $body): bool
+    {
+        $body = strtolower($body);
+
+        return str_contains($body, 'not enough disk space') || (str_contains($body, 'disk space') && str_contains($body, 'exceed'));
+    }
+
+    /** A short, printable description of an untrusted value for a log line. */
+    public static function describeValue(mixed $value, int $maxLength = 32): string
+    {
+        if (!is_scalar($value)) {
+            return gettype($value);
+        }
+
+        $text = preg_replace('/[^\x20-\x7E]/', '?', var_export($value, true)) ?? '';
+
+        return strlen($text) > $maxLength ? substr($text, 0, $maxLength).'...' : $text;
     }
 
     /** Remove anything token-shaped from a string that might end up in a log or notification. */

@@ -5,6 +5,7 @@ namespace Boy132\MinecraftModrinth\Providers;
 use Boy132\MinecraftModrinth\Console\Commands\AutoUpdateModsCommand;
 use Boy132\MinecraftModrinth\Console\Commands\CheckGitHubOffersCommand;
 use Boy132\MinecraftModrinth\GitHub\GitHubOffers;
+use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\ServiceProvider;
 
@@ -20,14 +21,16 @@ class MinecraftModrinthPluginProvider extends ServiceProvider
     {
         Schedule::command(AutoUpdateModsCommand::class)
             ->timezone(config('minecraft-modrinth.auto_update_timezone') ?: config('app.timezone'))
-            ->dailyAt(config('minecraft-modrinth.auto_update_time', '00:00'))
-            ->withoutOverlapping();
+            // An unusable saved time falls back to midnight instead of breaking the whole schedule.
+            ->dailyAt(GitHubSourceRules::scheduleTime(config('minecraft-modrinth.auto_update_time', '00:00')))
+            // The lock expires after 3 hours: a run killed halfway can't block every later day.
+            ->withoutOverlapping(180);
 
         // New plugins / updates from the GitHub repository source: badge counts and one
         // notification per new plugin and server. Does nothing while the source is off.
         Schedule::command(CheckGitHubOffersCommand::class)
             ->hourlyAt(7)
-            ->withoutOverlapping()
+            ->withoutOverlapping(30)
             ->when(fn () => (bool) config('minecraft-modrinth.github.enabled'));
     }
 }

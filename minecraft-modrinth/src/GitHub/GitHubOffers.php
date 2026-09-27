@@ -191,21 +191,28 @@ class GitHubOffers
         $platform = $this->service()->platformForServer($server);
 
         // Unknown platform (no loader tag, no plugins feature, ...): no offers, no notifications.
-        if ($platform === null || !$server->isInstalled() || $server->isSuspended()) {
+        // Neither for a server that is suspended, installing, being transferred or restored.
+        if ($platform === null || $server->isInConflictState()) {
             $this->forgetCounts($server);
 
             return null;
         }
 
         try {
-            $installed = $this->service()->getInstalled($server);
-            $jarNames = $this->service()->listJarNames($server);
+            $metadata = $this->service()->readMetadata($server);
+            $files = $this->service()->listPluginFiles($server);
         } catch (GitHubSourceException $exception) {
-            $this->service()->reportOncePerWindow("offers:{$server->id}:{$exception->reason}", $exception);
+            // A server its node doesn't know (any more) is skipped quietly, not counted as empty.
+            if ($exception->reason !== GitHubSourceException::UNKNOWN_SERVER) {
+                $this->service()->reportOncePerWindow("offers:{$server->id}:{$exception->reason}", $exception);
+            }
             $this->forgetCounts($server);
 
             return null;
         }
+
+        $installed = $metadata['installed'];
+        $jarNames = $this->service()->jarNamesOf($files);
 
         try {
             $dismissed = $this->dismissedIds($server);
@@ -216,8 +223,11 @@ class GitHubOffers
             $notified = null;
         }
 
-        $offers = GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames);
+        $offers = GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, array_column($metadata['pending_delete'], 'filename'));
         $this->rememberCounts($server, $offers);
+
+        // Old jars pending deletion and temporary uploads left behind by an interrupted install.
+        $this->service()->cleanupServer($server, $files);
 
         $announced = [];
 
@@ -289,27 +299,30 @@ class GitHubOffers
     {
         $locale = $user->language ?? 'en';
 
+        // Filament renders notification bodies as (sanitized) HTML: everything that isn't our own
+        // text is escaped, so a server name can't inject links or markup.
+
         $notifications = count($plugins) > self::MAX_SINGLE_NOTIFICATIONS
             ? [[
                 'title' => trans('minecraft-modrinth::strings.github.offers.notification_title_many', [], $locale),
                 'body' => trans('minecraft-modrinth::strings.github.offers.notification_body_many', [
-                    'server' => $server->name,
-                    'plugins' => implode(', ', array_map(fn (array $plugin) => $plugin['name'].' '.$plugin['version'], $plugins)),
+                    'server' => e($server->name),
+                    'plugins' => e(implode(', ', array_map(fn (array $plugin) => $plugin['name'].' '.$plugin['version'], $plugins))),
                 ], $locale),
             ]]
             : array_map(fn (array $plugin) => [
                 'title' => trans('minecraft-modrinth::strings.github.offers.notification_title', [], $locale),
                 'body' => trans('minecraft-modrinth::strings.github.offers.notification_body', [
-                    'server' => $server->name,
-                    'name' => $plugin['name'],
-                    'version' => $plugin['version'],
+                    'server' => e($server->name),
+                    'name' => e($plugin['name']),
+                    'version' => e($plugin['version']),
                 ], $locale),
             ], $plugins);
 
         $url = $this->pageUrl($server);
 
         foreach ($notifications as $notification) {
-            Notification::make()
+            $databaseNotification = Notification::make()
                 ->info()
                 ->icon('tabler-brand-github')
                 ->title($notification['title'])
@@ -321,7 +334,11 @@ class GitHubOffers
                         ->markAsRead()
                         ->url($url),
                 ])
-                ->sendToDatabase($user);
+                ->toDatabase();
+
+            // Sent right away instead of through the queue (Filament's sendToDatabase() queues
+            // it), so it arrives even when the panel's queue worker isn't running.
+            $user->notifyNow($databaseNotification);
         }
     }
 

@@ -13,10 +13,12 @@ declare(strict_types=1);
 require __DIR__.'/../src/GitHub/CiStatus.php';
 require __DIR__.'/../src/GitHub/GitHubSourceException.php';
 require __DIR__.'/../src/GitHub/GitHubSourceRules.php';
+require __DIR__.'/../src/Modrinth/ModrinthRules.php';
 
 use Boy132\MinecraftModrinth\GitHub\CiStatus;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceException;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules as R;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthRules as M;
 
 final class Result
 {
@@ -293,6 +295,154 @@ check(R::navigationBadge(['new' => 0, 'updates' => 0]) === null, 'nothing offere
 check(R::navigationBadge(['new' => 2, 'updates' => 0]) === ['label' => '2', 'color' => 'info', 'new' => 2, 'updates' => 0], 'only new = info');
 check(R::navigationBadge(['new' => 1, 'updates' => 2])['color'] === 'warning' && R::navigationBadge(['new' => 1, 'updates' => 2])['label'] === '3', 'updates = warning, total');
 check(R::navigationBadge(['new' => '1', 'updates' => 0]) === null, 'garbage in cache, no badge');
+
+// 1.3.1: CI with branch and required workflow
+$wf = fn (string $file, string $status, ?string $conclusion, array $overrides = []) => $run($status, $conclusion, array_merge(['head_branch' => 'main', 'path' => ".github/workflows/$file"], $overrides));
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success')], $sha, 'main', 'build.yml') === CiStatus::Green, 'required workflow succeeded = green');
+check(R::evaluateWorkflowRuns([$wf('lint.yml', 'completed', 'success')], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'required workflow missing = unverified');
+check(R::evaluateWorkflowRuns([$wf('lint.yml', 'completed', 'success'), $wf('build.yml', 'in_progress', null)], $sha, 'main', 'build.yml') === CiStatus::Pending, 'required workflow running = pending');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'skipped'), $wf('lint.yml', 'completed', 'success')], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'required workflow only skipped = unverified');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success'), $wf('lint.yml', 'completed', 'failure')], $sha, 'main', 'build.yml') === CiStatus::Failed, 'other workflow failed = failed');
+check(R::evaluateWorkflowRuns([$wf('BUILD.yml', 'completed', 'success')], $sha, 'main', 'build.yml') === CiStatus::Green, 'workflow file compared case-insensitively');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['path' => '.github/workflows/build.yml@refs/heads/main'])], $sha, 'main', 'build.yml') === CiStatus::Green, 'workflow path with @ref');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['head_branch' => 'other'])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'run of another branch ignored');
+check(R::evaluateWorkflowRuns([$wf('x.yml', 'completed', 'success', ['head_branch' => 'other'])], $sha, 'main') === CiStatus::Unverified, 'branch checked without required workflow too');
+check(R::evaluateWorkflowRuns([$wf('x.yml', 'completed', 'failure', ['head_branch' => 'other']), $wf('y.yml', 'completed', 'success')], $sha, 'main') === CiStatus::Green, 'failure on another branch ignored');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['head_sha' => str_repeat('b', 40)])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'run of another sha ignored');
+check(R::evaluateWorkflowRuns([$run('completed', 'success')], $sha) === CiStatus::Green, 'old call without branch still works');
+check(R::workflowFileOfRun(['path' => 'dynamic/pages/pages-build-deployment']) === null, 'dynamic workflow has no file');
+check(R::workflowFileOfRun([]) === null, 'run without path');
+
+check(R::isValidWorkflowFile('build.yml') && R::isValidWorkflowFile('ci-build.yaml'), 'workflow file ok');
+check(!R::isValidWorkflowFile('.github/workflows/build.yml'), 'workflow path refused');
+check(!R::isValidWorkflowFile('build') && !R::isValidWorkflowFile('../x.yml') && !R::isValidWorkflowFile(''), 'invalid workflow files');
+
+// Settings / daemon / housekeeping helpers
+check(R::isValidAutoUpdateTime('03:45') && R::isValidAutoUpdateTime('23:59:59') && R::isValidAutoUpdateTime('00:00'), 'valid times');
+check(!R::isValidAutoUpdateTime('24:00') && !R::isValidAutoUpdateTime('3:45') && !R::isValidAutoUpdateTime("03:45\nX=1") && !R::isValidAutoUpdateTime('03:45 '), 'invalid times');
+check(R::scheduleTime('03:45:00') === '03:45' && R::scheduleTime('bogus') === '00:00' && R::scheduleTime(null) === '00:00', 'schedule time with fallback');
+
+check(R::isTemporaryUploadName('.github-0123456789ab.part') && R::isTemporaryUploadName('.modrinth-0123456789ab.part'), 'temporary upload names');
+check(!R::isTemporaryUploadName('github-0123456789ab.part') && !R::isTemporaryUploadName('.github-0123.part') && !R::isTemporaryUploadName('x.jar'), 'not temporary upload names');
+$now = strtotime('2026-09-27T12:00:00Z');
+check(R::isStaleTemporaryUpload('.github-0123456789ab.part', '2026-09-27T10:00:00Z', $now), 'part older than an hour is stale');
+check(!R::isStaleTemporaryUpload('.github-0123456789ab.part', '2026-09-27T11:30:00Z', $now), 'recent part is kept');
+check(!R::isStaleTemporaryUpload('.github-0123456789ab.part', null, $now) && !R::isStaleTemporaryUpload('.github-0123456789ab.part', 'garbage', $now), 'unknown age is kept');
+check(!R::isStaleTemporaryUpload('plugin.jar', '2020-01-01T00:00:00Z', $now), 'a jar is never a stale upload');
+
+check(R::isUnknownServerResponse(404, '{"error":"The requested resource does not exist on this instance."}'), 'unknown server');
+check(!R::isUnknownServerResponse(404, '{"error":"The requested resource was not found on the system."}'), 'missing file is not an unknown server');
+check(!R::isUnknownServerResponse(500, 'does not exist on this instance'), 'unknown server only with 404');
+check(R::isDiskSpaceResponse('{"error":"There is not enough disk space available to perform that action."}'), 'disk full');
+check(!R::isDiskSpaceResponse('{"error":"An unexpected error was encountered."}'), 'other error is not disk full');
+
+check(R::describeValue(2) === '2' && R::describeValue(['x']) === 'array', 'describe value');
+check(strlen(R::describeValue(str_repeat('a', 500))) <= 35 && !str_contains(R::describeValue("a\nb\x1b"), "\n"), 'describe value short and printable');
+check(throwsReason(fn () => R::parseIndex(json_encode(['schema' => str_repeat('x', 5000), 'plugins' => []])), GitHubSourceException::UNSUPPORTED_SCHEMA), 'long schema still unsupported');
+try {
+    R::parseIndex(json_encode(['schema' => str_repeat('x', 5000), 'plugins' => []]));
+} catch (GitHubSourceException $exception) {
+    check(strlen($exception->getMessage()) < 100, 'unsupported schema message is short');
+}
+
+check(R::validateIndexEntry($entry(['size' => R::MAX_JAR_BYTES])) !== null && R::validateIndexEntry($entry(['size' => 50 * 1024 * 1024 + 1])) === null, 'jar size limit 50 MB');
+
+// Offers: old jars pending deletion are ours, not a manual copy
+$pendingPlugin = ['id' => 'gdprerase-paper', 'name' => 'GdprErase', 'platform' => 'paper', 'version' => '1.5.0', 'filename' => 'gdprerase-paper-1.5.0.jar', 'sha256' => $jarSha];
+$offers = R::offers([$pendingPlugin], 'paper', [], [], ['gdprerase-paper-1.4.0.jar']);
+check($offers['new'] === [], 'unmanaged old jar: not offered (manual)');
+$offers = R::offers([$pendingPlugin], 'paper', [], [], ['gdprerase-paper-1.4.0.jar'], ['gdprerase-paper-1.4.0.jar']);
+check(array_column($offers['new'], 'id') === ['gdprerase-paper'], 'jar pending deletion counts as managed');
+
+// Modrinth metadata and downloads
+$mod = fn (array $overrides = []) => array_merge([
+    'project_id' => 'AANobbMI',
+    'project_slug' => 'sodium',
+    'project_title' => 'Sodium',
+    'version_id' => 'abcDEF12',
+    'version_number' => '0.6.0',
+    'filename' => 'sodium-fabric-0.6.0.jar',
+    'installed_at' => '2026-09-01T00:00:00+00:00',
+], $overrides);
+$meta = fn (array $mods) => json_encode(['installed_mods' => $mods]);
+
+check(M::isValidId('AANobbMI') && !M::isValidId('AANobbM') && !M::isValidId('AANobbM/') && !M::isValidId(['x']) && !M::isValidId(null), 'modrinth ids');
+check(M::isValidJarFilename('Geyser-Spigot.jar') && M::isValidJarFilename('[1.21] My Plugin (v2).JAR'), 'modrinth jar names with spaces/brackets');
+foreach (['', '.hidden.jar', 'a/b.jar', 'a\\b.jar', '../x.jar', 'x..jar', "x\0.jar", "x\n.jar", 'plugin.zip', 'folder', str_repeat('a', 253).'.jar'] as $bad) {
+    check(!M::isValidJarFilename($bad), 'invalid modrinth file name: '.json_encode($bad));
+}
+
+$parsed = M::parseMetadata($meta([$mod(), $mod(['project_id' => 'P7dR8mSH', 'filename' => 'fabric-api.jar'])]));
+check(count($parsed['entries']) === 2 && count($parsed['raw']) === 2, 'valid metadata');
+foreach ([
+    'project_id not a string' => ['project_id' => ['x']],
+    'project_id wrong format' => ['project_id' => 'x'],
+    'filename a folder' => ['filename' => 'config'],
+    'filename with path' => ['filename' => '../server.jar'],
+    'title not a string' => ['project_title' => 5],
+    'version_id empty' => ['version_id' => ''],
+    'string too long' => ['project_slug' => str_repeat('a', 300)],
+] as $name => $override) {
+    $parsed = M::parseMetadata($meta([$mod($override), $mod(['project_id' => 'P7dR8mSH'])]));
+    check(count($parsed['entries']) === 1 && count($parsed['raw']) === 2, "invalid metadata entry skipped but kept raw: $name");
+}
+$parsed = M::parseMetadata($meta([$mod(), $mod(['version_number' => '0.7.0'])]));
+check(count($parsed['entries']) === 1 && $parsed['entries'][0]['version_number'] === '0.6.0', 'first entry per project wins');
+$parsed = M::parseMetadata($meta([$mod(['author' => 'jellysquid', 'updated_at' => '2026-09-02', 'extra' => 'x'])]));
+check(($parsed['entries'][0]['author'] ?? null) === 'jellysquid' && !isset($parsed['entries'][0]['extra']), 'optional fields kept, unknown dropped from entries');
+$parsed = M::parseMetadata($meta([$mod(['author' => ['x']])]));
+check(!isset($parsed['entries'][0]['author']) && count($parsed['entries']) === 1, 'invalid optional field ignored');
+
+$many = [];
+for ($i = 0; $i < M::MAX_ENTRIES + 5; $i++) {
+    $many[] = $mod(['project_id' => sprintf('A%07d', $i)]);
+}
+check(count(M::parseMetadata($meta($many))['entries']) === M::MAX_ENTRIES, 'entries capped');
+
+$throwsUnexpected = function (callable $fn): bool {
+    try {
+        $fn();
+    } catch (UnexpectedValueException) {
+        return true;
+    }
+
+    return false;
+};
+check($throwsUnexpected(fn () => M::parseMetadata('{broken')), 'broken metadata json refused');
+check($throwsUnexpected(fn () => M::parseMetadata('')), 'empty metadata refused');
+check($throwsUnexpected(fn () => M::parseMetadata('{"installed_mods": {"a": 1}}')), 'installed_mods not a list refused');
+check($throwsUnexpected(fn () => M::parseMetadata('[]')), 'metadata without installed_mods refused');
+check($throwsUnexpected(fn () => M::parseMetadata(str_repeat(' ', M::MAX_METADATA_BYTES + 1))), 'oversized metadata refused');
+check(M::parseMetadata('{"installed_mods": []}') === ['entries' => [], 'raw' => []], 'empty metadata list ok');
+
+$raw = [$mod(), 'garbage', $mod(['project_id' => 'P7dR8mSH', 'filename' => 'fabric-api.jar'])];
+$upd = M::upsertEntry($raw, $mod(['version_number' => '0.7.0']));
+check(count($upd) === 3 && $upd[0]['version_number'] === '0.7.0' && $upd[1] === 'garbage', 'upsert replaces in place, keeps others verbatim');
+$upd = M::upsertEntry($raw, $mod(['project_id' => 'NEWPROJ1']));
+check(count($upd) === 4 && $upd[3]['project_id'] === 'NEWPROJ1', 'upsert appends new project');
+$upd = M::upsertEntry([$mod(), $mod()], $mod(['version_number' => '0.8.0']));
+check(count($upd) === 1, 'upsert collapses duplicate entries of the project');
+$rem = M::removeEntry($raw, 'AANobbMI');
+check(count($rem) === 2 && $rem[0] === 'garbage', 'remove keeps other entries');
+
+check(M::isAllowedDownloadUrl('https://cdn.modrinth.com/data/AANobbMI/versions/abc/sodium.jar'), 'cdn url allowed');
+foreach (['http://cdn.modrinth.com/x.jar', 'https://evil.com/x.jar', 'https://cdn.modrinth.com.evil.com/x.jar', 'https://user@cdn.modrinth.com/x.jar', 'https://cdn.modrinth.com:8443/x.jar', 'file:///etc/passwd', 'https://cdn.modrinth.com/x y.jar', 'https://127.0.0.1/x.jar', null] as $bad) {
+    check(!M::isAllowedDownloadUrl($bad), 'download url refused: '.json_encode($bad));
+}
+
+$sha512 = hash('sha512', 'jar');
+$file = ['url' => 'https://cdn.modrinth.com/data/x/sodium.jar', 'filename' => 'sodium.jar', 'size' => 3, 'hashes' => ['sha512' => strtoupper($sha512), 'sha1' => 'x'], 'primary' => true];
+check(M::downloadSpec($file) === ['url' => $file['url'], 'filename' => 'sodium.jar', 'size' => 3, 'sha512' => $sha512], 'download spec');
+foreach ([
+    'no sha512' => ['hashes' => ['sha1' => 'x']],
+    'bad url' => ['url' => 'https://github.com/x.jar'],
+    'zip' => ['filename' => 'pack.zip'],
+    'size missing' => ['size' => null],
+    'size too big' => ['size' => M::MAX_DOWNLOAD_BYTES + 1],
+] as $name => $override) {
+    $problem = null;
+    check(M::downloadSpec(array_merge($file, $override), $problem) === null && is_string($problem), "download spec refused: $name");
+}
 
 echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
 exit(Result::$failures === 0 ? 0 : 1);

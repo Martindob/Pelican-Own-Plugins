@@ -19,6 +19,9 @@ return [
         // never the token itself - see MinecraftModrinthPlugin::saveSettings().
         'token_encrypted' => (string) env('MINECRAFT_MODRINTH_GITHUB_TOKEN_ENCRYPTED', ''),
         'require_green_ci' => (bool) env('MINECRAFT_MODRINTH_GITHUB_REQUIRE_GREEN_CI', true),
+        // Workflow file (e.g. "build.yml") that must have a successful push run on the commit
+        // for CI to count as green. Empty: any successful run is enough.
+        'required_workflow' => (string) env('MINECRAFT_MODRINTH_GITHUB_REQUIRED_WORKFLOW', ''),
         // The same GitHub failure is only logged once per this many minutes.
         'report_throttle_minutes' => (int) env('MINECRAFT_MODRINTH_GITHUB_REPORT_THROTTLE_MINUTES', 60),
     ],

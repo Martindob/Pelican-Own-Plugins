@@ -3,12 +3,10 @@
 namespace Boy132\MinecraftModrinth\GitHub;
 
 use App\Models\Server;
-use App\Repositories\Daemon\DaemonFileRepository;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
-use Exception;
+use Boy132\MinecraftModrinth\Support\DaemonFileException;
+use Boy132\MinecraftModrinth\Support\DaemonFiles;
 use Illuminate\Contracts\Encryption\DecryptException;
-use Illuminate\Contracts\Filesystem\FileNotFoundException;
-use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Crypt;
 use Throwable;
@@ -25,6 +23,8 @@ use Throwable;
  * @phpstan-type IndexPlugin array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}
  * @phpstan-type Snapshot array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, IndexPlugin>, problems: array<int, string>}
  * @phpstan-type InstalledPlugin array{id: string, name: string, platform: string, version: string, sha256: string, size: int, filename: string, repository: string, commit: string, installed_at: string, updated_at?: string}
+ * @phpstan-type PendingDelete array{filename: string, size: int}
+ * @phpstan-type Metadata array{installed: array<int, InstalledPlugin>, pending_delete: array<int, PendingDelete>}
  */
 class GitHubPluginService
 {
@@ -42,6 +42,13 @@ class GitHubPluginService
     protected const DOWNLOAD_TIMEOUT = 120;
 
     protected const JAR_CACHE_BYTES = 64 * 1024 * 1024;
+
+    /** The metadata file is read into PHP memory: anything larger is refused. */
+    public const MAX_METADATA_BYTES = 1024 * 1024;
+
+    protected const MAX_METADATA_ENTRIES = 1000;
+
+    protected const MAX_PENDING_DELETES = 50;
 
     /** @var array<string, string> Verified jar contents of this run, by sha256 (one download for many servers). */
     protected array $jarCache = [];
@@ -79,6 +86,14 @@ class GitHubPluginService
         return (bool) config('minecraft-modrinth.github.require_green_ci', true);
     }
 
+    /** Workflow file ("build.yml") that must have succeeded for CI to count as green, or null. */
+    public function requiredWorkflow(): ?string
+    {
+        $workflow = trim((string) config('minecraft-modrinth.github.required_workflow'));
+
+        return $workflow !== '' ? $workflow : null;
+    }
+
     public function hasToken(): bool
     {
         return trim((string) config('minecraft-modrinth.github.token_encrypted')) !== '';
@@ -90,7 +105,8 @@ class GitHubPluginService
         return $this->isEnabled()
             && GitHubSourceRules::isValidRepository($this->repository())
             && GitHubSourceRules::isValidBranch($this->branch())
-            && GitHubSourceRules::isValidIndexPath($this->indexPath());
+            && GitHubSourceRules::isValidIndexPath($this->indexPath())
+            && ($this->requiredWorkflow() === null || GitHubSourceRules::isValidWorkflowFile($this->requiredWorkflow()));
     }
 
     public function commitUrl(string $sha): string
@@ -157,14 +173,14 @@ class GitHubPluginService
 
     public function getCiStatus(string $sha): CiStatus
     {
-        $key = $this->cacheKey('ci', $this->branch(), $sha);
+        $key = $this->cacheKey('ci', $this->branch(), $sha, (string) $this->requiredWorkflow());
 
         $cached = Cache::get($key);
         if (is_string($cached) && ($status = CiStatus::tryFrom($cached))) {
             return $status;
         }
 
-        $status = GitHubSourceRules::evaluateWorkflowRuns($this->client()->getWorkflowRuns($sha, $this->branch()), $sha);
+        $status = GitHubSourceRules::evaluateWorkflowRuns($this->client()->getWorkflowRuns($sha, $this->branch()), $sha, $this->branch(), $this->requiredWorkflow());
         Cache::put($key, $status->value, now()->addMinutes($status->cacheMinutes()));
 
         return $status;
@@ -241,7 +257,7 @@ class GitHubPluginService
         Cache::forget($key);
 
         if (is_string($sha)) {
-            Cache::forget($this->cacheKey('ci', $this->branch(), $sha));
+            Cache::forget($this->cacheKey('ci', $this->branch(), $sha, (string) $this->requiredWorkflow()));
         }
     }
 
@@ -284,12 +300,28 @@ class GitHubPluginService
      */
     public function getInstalled(Server $server): array
     {
+        return $this->readMetadata($server)['installed'];
+    }
+
+    /**
+     * The metadata file: installed plugins, and old jars of updated plugins that still have to
+     * be deleted (see installLocked()).
+     *
+     * @return Metadata
+     *
+     * @throws GitHubSourceException when the metadata file exists but can't be read or trusted
+     */
+    public function readMetadata(Server $server): array
+    {
         try {
-            $content = app(DaemonFileRepository::class)->setServer($server)->getContent(self::FOLDER.'/'.self::METADATA_FILE);
-        } catch (FileNotFoundException) {
-            return [];
-        } catch (Exception) {
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not read the plugin metadata of server #{$server->id} from the daemon");
+            $content = DaemonFiles::readSmallFile($server, self::FOLDER.'/'.self::METADATA_FILE, self::MAX_METADATA_BYTES);
+        } catch (DaemonFileException $exception) {
+            // Too large counts as damaged; an unknown server stays recognisable for the callers.
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::DAEMON);
+        }
+
+        if ($content === null) {
+            return ['installed' => [], 'pending_delete' => []];
         }
 
         $data = json_decode($content, true);
@@ -301,30 +333,39 @@ class GitHubPluginService
         }
 
         $installed = [];
-        foreach ($data['installed'] as $entry) {
+        foreach (array_slice($data['installed'], 0, self::MAX_METADATA_ENTRIES) as $entry) {
             if (!is_array($entry)
-                || !is_string($entry['id'] ?? null)
+                || !is_string($entry['id'] ?? null) || !preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/', $entry['id'])
                 || !is_string($entry['filename'] ?? null) || !GitHubSourceRules::isValidJarFilename($entry['filename'])
-                || !is_string($entry['version'] ?? null)
+                || !is_string($entry['version'] ?? null) || strlen($entry['version']) > 64
                 || isset($installed[$entry['id']])) {
                 continue;
             }
 
+            $string = fn (string $key, int $max = 256) => is_string($entry[$key] ?? null) && strlen($entry[$key]) <= $max ? $entry[$key] : '';
+
             $installed[$entry['id']] = [
                 'id' => $entry['id'],
-                'name' => is_string($entry['name'] ?? null) ? $entry['name'] : $entry['id'],
-                'platform' => is_string($entry['platform'] ?? null) ? $entry['platform'] : '',
+                'name' => $string('name') !== '' ? $string('name') : $entry['id'],
+                'platform' => $string('platform', 32),
                 'version' => $entry['version'],
-                'sha256' => is_string($entry['sha256'] ?? null) ? $entry['sha256'] : '',
+                'sha256' => $string('sha256', 64),
                 'size' => is_int($entry['size'] ?? null) ? $entry['size'] : 0,
                 'filename' => $entry['filename'],
-                'repository' => is_string($entry['repository'] ?? null) ? $entry['repository'] : '',
-                'commit' => is_string($entry['commit'] ?? null) ? $entry['commit'] : '',
-                'installed_at' => is_string($entry['installed_at'] ?? null) ? $entry['installed_at'] : '',
-            ] + (is_string($entry['updated_at'] ?? null) ? ['updated_at' => $entry['updated_at']] : []);
+                'repository' => $string('repository'),
+                'commit' => $string('commit', 64),
+                'installed_at' => $string('installed_at', 64),
+            ] + ($string('updated_at', 64) !== '' ? ['updated_at' => $string('updated_at', 64)] : []);
         }
 
-        return array_values($installed);
+        $pending = [];
+        foreach (is_array($data['pending_delete'] ?? null) ? array_slice($data['pending_delete'], 0, self::MAX_PENDING_DELETES) : [] as $item) {
+            if (is_array($item) && is_string($item['filename'] ?? null) && GitHubSourceRules::isValidJarFilename($item['filename']) && is_int($item['size'] ?? null)) {
+                $pending[] = ['filename' => $item['filename'], 'size' => $item['size']];
+            }
+        }
+
+        return ['installed' => array_values($installed), 'pending_delete' => $pending];
     }
 
     /**
@@ -342,15 +383,23 @@ class GitHubPluginService
         return null;
     }
 
-    /** @param  array<int, InstalledPlugin>  $installed */
-    protected function writeMetadata(Server $server, array $installed): void
+    /**
+     * @param  array<int, InstalledPlugin>  $installed
+     * @param  array<int, PendingDelete>  $pendingDelete
+     */
+    protected function writeMetadata(Server $server, array $installed, array $pendingDelete = []): void
     {
-        $json = json_encode(['schema' => 1, 'installed' => array_values($installed)], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $data = ['schema' => 1, 'installed' => array_values($installed)];
+
+        // Only present while there is something to delete, so the file otherwise stays as in 1.2.0.
+        if (!empty($pendingDelete)) {
+            $data['pending_delete'] = array_values($pendingDelete);
+        }
 
         try {
-            app(DaemonFileRepository::class)->setServer($server)->putContent(self::FOLDER.'/'.self::METADATA_FILE, $json);
-        } catch (Exception) {
-            throw new GitHubSourceException(GitHubSourceException::METADATA, 'Could not write plugins/'.self::METADATA_FILE." on server #{$server->id}");
+            DaemonFiles::writeFile($server, self::FOLDER.'/'.self::METADATA_FILE, json_encode($data, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), (int) config('panel.guzzle.timeout', 15));
+        } catch (DaemonFileException $exception) {
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::METADATA);
         }
     }
 
@@ -358,17 +407,20 @@ class GitHubPluginService
      * Install a plugin from the snapshot, or update it when it's already installed.
      *
      * The new jar is written under a name that isn't taken yet (never over an existing file),
-     * then the metadata is saved, then the old jar is removed - rolled back step by step when
-     * something fails, so plugins/ never keeps two jars of the same plugin. The running server
-     * keeps using what it loaded; the new version is used after its next restart.
+     * then the metadata is saved (recording the old jar as "to delete"), then the old jar is
+     * removed. If the old jar can't be removed, the new version stays recorded and the old jar
+     * stays in the metadata as pending deletion: it is deleted at the next action or check, so
+     * no jar is ever left untracked. The running server keeps using what it loaded; the new
+     * version is used after its next restart.
      *
      * @param  IndexPlugin  $plugin
      * @param  Snapshot  $snapshot
+     * @param  bool|null  $expectInstalled  true for "Update", false for "Install": refused when the state changed meanwhile
      * @return InstalledPlugin
      *
      * @throws GitHubSourceException
      */
-    public function installOrUpdate(Server $server, array $plugin, array $snapshot, bool $requireGreenCi): array
+    public function installOrUpdate(Server $server, array $plugin, array $snapshot, bool $requireGreenCi, ?bool $expectInstalled = null): array
     {
         if ($this->platformForServer($server) !== $plugin['platform']) {
             throw new GitHubSourceException(GitHubSourceException::INVALID_INDEX, "{$plugin['id']} is for {$plugin['platform']}, which server #{$server->id} is not");
@@ -385,7 +437,7 @@ class GitHubPluginService
         }
 
         try {
-            return $this->installLocked($server, $plugin, $snapshot);
+            return $this->installLocked($server, $plugin, $snapshot, $expectInstalled);
         } finally {
             $lock->release();
         }
@@ -396,15 +448,29 @@ class GitHubPluginService
      * @param  Snapshot  $snapshot
      * @return InstalledPlugin
      */
-    protected function installLocked(Server $server, array $plugin, array $snapshot): array
+    protected function installLocked(Server $server, array $plugin, array $snapshot, ?bool $expectInstalled): array
     {
-        $installedList = $this->getInstalled($server);
+        $metadata = $this->readMetadata($server);
+        $installedList = $metadata['installed'];
         $previous = $this->findInstalled($installedList, $plugin['id']);
+
+        if ($expectInstalled === false && $previous !== null) {
+            throw new GitHubSourceException(GitHubSourceException::STATE_CHANGED, "{$plugin['id']} was installed on server #{$server->id} in the meantime");
+        }
+
+        if ($expectInstalled === true && $previous === null) {
+            throw new GitHubSourceException(GitHubSourceException::STATE_CHANGED, "{$plugin['id']} is no longer installed on server #{$server->id}");
+        }
 
         // Download and verify before touching the server at all.
         $content = $this->downloadVerifiedJar($plugin, $snapshot['sha']);
 
-        $existing = $this->listJarNames($server);
+        $files = $this->listPluginFiles($server);
+        $pending = $this->deletePending($server, $metadata['pending_delete'], $installedList, $files);
+
+        // Old jars still waiting for deletion are ours, not another copy of the plugin.
+        $pendingNames = array_column($pending, 'filename');
+        $existing = array_values(array_diff($this->jarNamesOf($files), $pendingNames));
         $target = $this->chooseTargetFilename($plugin, $previous, $existing);
 
         $this->writeJar($server, $target, $content);
@@ -440,32 +506,150 @@ class GitHubPluginService
             $newList[] = $entry;
         }
 
+        $replacesOldJar = $previous !== null && $previous['filename'] !== $target;
+
+        // The old jar is recorded as "to delete" before it is deleted: whatever fails from here
+        // on, the metadata always knows about every jar of this plugin.
+        $pendingWithOld = $replacesOldJar
+            ? [...$pending, ['filename' => $previous['filename'], 'size' => $previous['size']]]
+            : $pending;
+
         try {
-            $this->writeMetadata($server, $newList);
+            $this->writeMetadata($server, $newList, $pendingWithOld);
         } catch (GitHubSourceException $exception) {
-            $this->deleteQuietly($server, $target);
-
-            throw $exception;
-        }
-
-        if ($previous && $previous['filename'] !== $target) {
-            try {
-                $this->deleteJar($server, $previous['filename']);
-            } catch (GitHubSourceException $exception) {
-                // Back to exactly how it was: old jar + old metadata, new jar gone.
+            // A write that timed out may still have gone through: only roll back what didn't.
+            if (!$this->metadataRecords($server, $entry)) {
                 $this->deleteQuietly($server, $target);
-
-                try {
-                    $this->writeMetadata($server, $installedList);
-                } catch (GitHubSourceException $restoreException) {
-                    $this->report($restoreException);
-                }
 
                 throw $exception;
             }
         }
 
+        if (!$replacesOldJar) {
+            return $entry;
+        }
+
+        try {
+            $this->deleteJar($server, $previous['filename']);
+        } catch (GitHubSourceException $exception) {
+            if (!$this->oldJarGone($server, $previous['filename'])) {
+                // Stays recorded as pending deletion (written above) and is retried later.
+                throw new GitHubSourceException(GitHubSourceException::OLD_JAR_PENDING, "Updated {$plugin['id']} to {$plugin['version']} on server #{$server->id}, but plugins/{$previous['filename']} could not be deleted yet ({$exception->getMessage()})");
+            }
+        }
+
+        // Deleted: drop it from the pending list again. If this write fails the entry only
+        // points at a file that no longer exists and is dropped at the next cleanup.
+        try {
+            $this->writeMetadata($server, $newList, $pending);
+        } catch (GitHubSourceException $exception) {
+            $this->report($exception);
+        }
+
         return $entry;
+    }
+
+    /**
+     * Whether the metadata on the server records exactly this entry (after an unclear write).
+     *
+     * @param  InstalledPlugin  $entry
+     */
+    protected function metadataRecords(Server $server, array $entry): bool
+    {
+        try {
+            $recorded = $this->findInstalled($this->getInstalled($server), $entry['id']);
+        } catch (GitHubSourceException) {
+            return false;
+        }
+
+        return $recorded !== null && $recorded['filename'] === $entry['filename'] && $recorded['version'] === $entry['version'];
+    }
+
+    /** After a failed delete: whether the file is gone anyway (e.g. the request timed out after it). */
+    protected function oldJarGone(Server $server, string $filename): bool
+    {
+        try {
+            return DaemonFiles::find($this->listPluginFiles($server), $filename) === null;
+        } catch (GitHubSourceException) {
+            return false;
+        }
+    }
+
+    /**
+     * Delete old jars recorded as pending deletion. Only a regular file with exactly the
+     * recorded name and size is deleted; one that is gone, changed or taken over by an
+     * installed plugin is simply forgotten. Returns what is still pending.
+     *
+     * @param  array<int, PendingDelete>  $pending
+     * @param  array<int, InstalledPlugin>  $installed
+     * @param  array<int, array<string, mixed>>  $files  listing of plugins/
+     * @return array<int, PendingDelete>
+     */
+    protected function deletePending(Server $server, array $pending, array $installed, array $files): array
+    {
+        $installedNames = array_column($installed, 'filename');
+        $remaining = [];
+
+        foreach ($pending as $item) {
+            $file = DaemonFiles::find($files, $item['filename']);
+
+            if (in_array($item['filename'], $installedNames, true) || $file === null || !DaemonFiles::isRegularFile($file)
+                || ($item['size'] > 0 && (int) ($file['size'] ?? -1) !== $item['size'])) {
+                continue;
+            }
+
+            try {
+                $this->deleteJar($server, $item['filename']);
+            } catch (GitHubSourceException $exception) {
+                $this->reportOncePerWindow("server:{$server->id}:pending:{$item['filename']}", $exception);
+                $remaining[] = $item;
+            }
+        }
+
+        return $remaining;
+    }
+
+    /**
+     * Housekeeping outside of an installation: delete old jars that are pending deletion and
+     * temporary uploads (.github-*.part) left behind for more than an hour. Does nothing while
+     * an installation runs on the server; never throws.
+     *
+     * @param  array<int, array<string, mixed>>|null  $files  a fresh listing of plugins/, if at hand
+     */
+    public function cleanupServer(Server $server, ?array $files = null): void
+    {
+        $lock = Cache::lock("minecraft-modrinth:github:install:{$server->id}", 60);
+
+        if (!$lock->get()) {
+            return;
+        }
+
+        try {
+            $files ??= $this->listPluginFiles($server);
+
+            foreach ($files as $file) {
+                if (is_string($file['name'] ?? null) && DaemonFiles::isRegularFile($file)
+                    && GitHubSourceRules::isStaleTemporaryUpload($file['name'], $file['modified'] ?? null, time())) {
+                    $this->deleteQuietly($server, $file['name']);
+                }
+            }
+
+            $metadata = $this->readMetadata($server);
+
+            if (!empty($metadata['pending_delete'])) {
+                $pending = $this->deletePending($server, $metadata['pending_delete'], $metadata['installed'], $files);
+
+                if ($pending !== $metadata['pending_delete']) {
+                    $this->writeMetadata($server, $metadata['installed'], $pending);
+                }
+            }
+        } catch (GitHubSourceException $exception) {
+            if ($exception->reason !== GitHubSourceException::UNKNOWN_SERVER) {
+                $this->reportOncePerWindow("server:{$server->id}:cleanup:{$exception->reason}", $exception);
+            }
+        } finally {
+            $lock->release();
+        }
     }
 
     /**
@@ -482,7 +666,8 @@ class GitHubPluginService
         }
 
         try {
-            $installedList = $this->getInstalled($server);
+            $metadata = $this->readMetadata($server);
+            $installedList = $metadata['installed'];
             $entry = $this->findInstalled($installedList, $id);
 
             if (!$entry) {
@@ -490,7 +675,7 @@ class GitHubPluginService
             }
 
             $this->deleteJar($server, $entry['filename']);
-            $this->writeMetadata($server, array_values(array_filter($installedList, fn (array $item) => $item['id'] !== $id)));
+            $this->writeMetadata($server, array_values(array_filter($installedList, fn (array $item) => $item['id'] !== $id)), $metadata['pending_delete']);
         } finally {
             $lock->release();
         }
@@ -562,56 +747,45 @@ class GitHubPluginService
     }
 
     /**
+     * Everything in plugins/ (Wings list-directory entries); empty when the folder doesn't exist.
+     *
+     * @return array<int, array<string, mixed>>
+     *
+     * @throws GitHubSourceException
+     */
+    public function listPluginFiles(Server $server): array
+    {
+        try {
+            return DaemonFiles::listDirectory($server, self::FOLDER) ?? [];
+        } catch (DaemonFileException $exception) {
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::DAEMON);
+        }
+    }
+
+    /**
      * @return array<int, string>
      *
      * @throws GitHubSourceException
      */
     public function listJarNames(Server $server): array
     {
-        try {
-            $files = app(DaemonFileRepository::class)->setServer($server)->getDirectory(self::FOLDER);
-        } catch (RequestException $exception) {
-            if ($exception->response->status() === 404) {
-                return [];
-            }
+        return $this->jarNamesOf($this->listPluginFiles($server));
+    }
 
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not list plugins/ of server #{$server->id}");
-        } catch (Exception) {
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not list plugins/ of server #{$server->id}");
-        }
-
-        if (isset($files['error'])) {
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Daemon returned an error while listing plugins/ of server #{$server->id}");
-        }
-
+    /**
+     * @param  array<int, array<string, mixed>>  $files
+     * @return array<int, string>
+     */
+    public function jarNamesOf(array $files): array
+    {
         $names = [];
         foreach ($files as $file) {
-            if (is_array($file) && is_string($file['name'] ?? null) && ($file['file'] ?? true) && str_ends_with(strtolower($file['name']), '.jar')) {
+            if (is_string($file['name'] ?? null) && ($file['file'] ?? true) && str_ends_with(strtolower($file['name']), '.jar')) {
                 $names[] = $file['name'];
             }
         }
 
         return $names;
-    }
-
-    /**
-     * @return array{name: string, size: int}|null
-     */
-    protected function statFile(Server $server, string $filename): ?array
-    {
-        try {
-            $files = app(DaemonFileRepository::class)->setServer($server)->getDirectory(self::FOLDER);
-        } catch (Exception) {
-            return null;
-        }
-
-        foreach ($files as $file) {
-            if (is_array($file) && ($file['name'] ?? null) === $filename) {
-                return ['name' => $filename, 'size' => (int) ($file['size'] ?? -1)];
-            }
-        }
-
-        return null;
     }
 
     /**
@@ -628,30 +802,30 @@ class GitHubPluginService
         }
 
         $temporary = '.github-'.bin2hex(random_bytes(6)).'.part';
-        $repository = app(DaemonFileRepository::class)->setServer($server);
 
         try {
-            $repository->getHttpClient()
-                ->timeout(max((int) config('panel.guzzle.timeout'), self::DAEMON_WRITE_TIMEOUT))
-                ->withQueryParameters(['file' => self::FOLDER.'/'.$temporary])
-                ->withBody($content, 'application/octet-stream')
-                ->post("/api/servers/{$server->uuid}/files/write");
-        } catch (Exception) {
+            DaemonFiles::writeFile($server, self::FOLDER.'/'.$temporary, $content, self::DAEMON_WRITE_TIMEOUT);
+        } catch (DaemonFileException $exception) {
             $this->deleteQuietly($server, $temporary);
 
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not write the jar to server #{$server->id}");
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::DAEMON);
         }
 
         try {
-            $repository->renameFiles(self::FOLDER, [['from' => $temporary, 'to' => $filename]]);
-        } catch (Exception) {
+            DaemonFiles::rename($server, self::FOLDER, $temporary, $filename);
+        } catch (DaemonFileException $exception) {
             $this->deleteQuietly($server, $temporary);
 
-            throw new GitHubSourceException(GitHubSourceException::FILE_CONFLICT, "Could not move the new jar into place as plugins/$filename on server #{$server->id} (does it exist already?)");
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::DAEMON);
         }
 
-        $stat = $this->statFile($server, $filename);
-        if ($stat === null || $stat['size'] !== strlen($content)) {
+        try {
+            $file = DaemonFiles::find($this->listPluginFiles($server), $filename);
+        } catch (GitHubSourceException) {
+            $file = null;
+        }
+
+        if ($file === null || (int) ($file['size'] ?? -1) !== strlen($content)) {
             $this->deleteQuietly($server, $filename);
 
             throw new GitHubSourceException(GitHubSourceException::DAEMON, "plugins/$filename on server #{$server->id} is missing or has the wrong size after writing it");
@@ -672,19 +846,9 @@ class GitHubPluginService
     protected function deleteFile(Server $server, string $filename): void
     {
         try {
-            $response = app(DaemonFileRepository::class)->setServer($server)->deleteFiles(self::FOLDER, [$filename]);
-        } catch (RequestException $exception) {
-            if ($exception->response->status() === 404) {
-                return;
-            }
-
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not delete plugins/$filename on server #{$server->id}");
-        } catch (Exception) {
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not delete plugins/$filename on server #{$server->id}");
-        }
-
-        if ($response->failed() && $response->status() !== 404) {
-            throw new GitHubSourceException(GitHubSourceException::DAEMON, "Could not delete plugins/$filename on server #{$server->id}");
+            DaemonFiles::delete($server, self::FOLDER, $filename);
+        } catch (DaemonFileException $exception) {
+            throw GitHubSourceException::fromDaemon($exception, GitHubSourceException::DAEMON);
         }
     }
 
@@ -716,16 +880,23 @@ class GitHubPluginService
         }
 
         try {
-            $installed = $this->getInstalled($server);
+            $metadata = $this->readMetadata($server);
         } catch (GitHubSourceException $exception) {
-            $this->reportOncePerWindow("server:{$server->id}:metadata", $exception);
+            // A server its node doesn't know (any more) has nothing to update.
+            if ($exception->reason !== GitHubSourceException::UNKNOWN_SERVER) {
+                $this->reportOncePerWindow("server:{$server->id}:metadata", $exception);
+            }
 
             return [];
         }
 
+        if (!empty($metadata['pending_delete'])) {
+            $this->cleanupServer($server);
+        }
+
         $updated = [];
 
-        foreach ($installed as $entry) {
+        foreach ($metadata['installed'] as $entry) {
             $plugin = null;
             foreach ($this->pluginsForPlatform($snapshot['plugins'], $platform) as $candidate) {
                 if ($candidate['id'] === $entry['id']) {
@@ -740,9 +911,14 @@ class GitHubPluginService
             }
 
             try {
-                $this->installOrUpdate($server, $plugin, $snapshot, true);
+                $this->installOrUpdate($server, $plugin, $snapshot, true, true);
                 $updated[] = $plugin['id'];
             } catch (GitHubSourceException $exception) {
+                if ($exception->reason === GitHubSourceException::OLD_JAR_PENDING) {
+                    // Updated; only the old jar is left for later.
+                    $updated[] = $plugin['id'];
+                }
+
                 $this->reportOncePerWindow("server:{$server->id}:update:{$plugin['id']}:{$exception->reason}", $exception);
             }
         }

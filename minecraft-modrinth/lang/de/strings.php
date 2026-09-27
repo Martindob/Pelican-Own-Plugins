@@ -9,9 +9,10 @@ return [
         'always_use_latest_version' => 'Immer neueste Version verwenden',
         'always_use_latest_version_hint' => 'Überspringt die Prüfung der Minecraft-Versionskompatibilität bei der Suche und Installation von Mods/Plugins und verwendet immer die neueste verfügbare Version für den erkannten Loader. Nützlich, um Mods/Plugins schon vor einem Upgrade des Servers auf eine neuere Minecraft-Version zu aktualisieren, basierend auf deren üblicher Abwärtskompatibilität. Die Loader-Kompatibilität (Paper/Spigot/Fabric/...) wird weiterhin geprüft.',
         'auto_update_enabled' => 'Automatische Updates aktivieren',
-        'auto_update_enabled_hint' => 'Aktualisiert einmal täglich automatisch jedes installierte Mod/Plugin auf jedem Server auf die neueste kompatible Version, ohne manuell auf Aktualisieren klicken zu müssen. Gilt unabhängig davon, ob der Server online ist. Ein fehlgeschlagenes automatisches Update wird protokolliert, ein erfolgreiches nicht.',
+        'auto_update_enabled_hint' => 'Aktualisiert einmal täglich automatisch jedes installierte Mod/Plugin auf jedem Server auf die neueste kompatible Version, ohne manuell auf Aktualisieren klicken zu müssen. Gilt unabhängig davon, ob der Server online ist. Ein fehlgeschlagenes automatisches Update wird protokolliert, ein erfolgreiches nicht. Aktualisiert auch Plugins aus der GitHub-Repository-Quelle (nur auf eine höhere Version aus einem Commit mit grüner CI; nichts Neues wird installiert). Gesperrte, gerade installierte oder übertragene Server werden übersprungen.',
         'auto_update_time' => 'Uhrzeit für automatische Updates',
         'auto_update_time_hint' => 'Die Uhrzeit, zu der automatische Updates ausgeführt werden, in der Zeitzone deines eigenen Kontos (aktuell :timezone), erfasst beim Speichern dieser Seite - nicht in der Zeitzone des Panels (oft UTC). Wird nur verwendet, wenn "Automatische Updates aktivieren" eingeschaltet ist. Nützlich, um sie ein paar Minuten vor dem eigenen Neustart-Zeitplan eines Servers einzuplanen, damit die Updates schon vorhanden sind, wenn er wieder hochfährt.',
+        'time_invalid' => 'Gib die Uhrzeit als HH:MM ein.',
         'settings_saved' => 'Einstellungen gespeichert',
     ],
 
@@ -74,6 +75,7 @@ return [
         'uninstall_partial_body' => 'Die Datei von :name wurde gelöscht, konnte aber nicht aus der Liste der installierten Mods/Plugins entfernt werden. Sie wird eventuell weiterhin als installiert angezeigt.',
         'uninstall_failed' => 'Deinstallation fehlgeschlagen',
         'uninstall_failed_body' => 'Bei der Deinstallation ist ein Fehler aufgetreten. Bitte versuche es erneut oder wende dich an den Support, wenn das Problem weiterhin besteht.',
+        'metadata_unreadable_body' => 'Die Liste der installierten Mods/Plugins (:folder/.modrinth-metadata.json) konnte nicht gelesen werden oder ist beschädigt, daher wurde nichts geändert. Versuche es gleich noch einmal; wenn es weiter fehlschlägt, repariere oder lösche diese Datei (siehe README).',
     ],
 
     'github' => [
@@ -99,6 +101,9 @@ return [
             'token_clear' => 'Gespeicherten Token löschen',
             'require_green_ci' => 'Grüne CI voraussetzen',
             'require_green_ci_hint' => 'Installieren und Aktualisieren nur aus einem Commit erlauben, dessen GitHub-Actions-Läufe alle erfolgreich abgeschlossen sind. Automatische Updates setzen immer grüne CI voraus.',
+            'required_workflow' => 'Erforderlicher Workflow',
+            'required_workflow_hint' => 'Optional. Dateiname des GitHub-Actions-Workflows (z. B. build.yml), der für den Commit erfolgreich gelaufen sein muss - zusätzlich dazu, dass alle anderen Läufe bestanden haben. Leer: jeder erfolgreiche Lauf genügt.',
+            'required_workflow_invalid' => 'Gib nur den Dateinamen des Workflows ein, z. B. build.yml.',
             'test_connection' => 'Verbindung testen',
             'test_connection_hint' => 'Verwendet die gespeicherten Einstellungen.',
             'test_ok' => 'Verbindung funktioniert',
@@ -121,6 +126,9 @@ return [
             'ci_not_green' => 'Installieren ist gesperrt, bis die CI grün ist',
             'ci_not_green_description' => 'Der neueste Commit hat GitHub Actions (noch) nicht bestanden. Installieren und Aktualisieren ist wieder möglich, sobald alle seine Läufe erfolgreich abgeschlossen sind.',
             'ci_blocks_install' => 'Gesperrt: CI des neuesten Commits ist nicht grün',
+            'refresh_throttled' => 'GitHub wurde gerade erst abgefragt. Versuche es in :seconds Sekunden erneut.',
+            'pending_delete' => 'Alte Jars warten auf das Löschen',
+            'pending_delete_description' => 'Nach einem Update konnten diese alten Jars noch nicht gelöscht werden: :files. Sie werden bei der nächsten Installation, der stündlichen Prüfung oder dem automatischen Update gelöscht. Lösche sie vor dem Neustart des Servers von Hand, sonst werden zwei Kopien des Plugins geladen.',
         ],
         'table' => [
             'name' => 'Plugin',
@@ -163,6 +171,7 @@ return [
         'notifications' => [
             'installed_body' => ':name :version ist bereit und wird beim nächsten Serverneustart geladen.',
             'uninstalled_body' => ':name wurde entfernt. Die Konfiguration wurde behalten.',
+            'old_jar_pending_title' => 'Aktualisiert - altes Jar noch vorhanden',
         ],
         'offers' => [
             'callout_heading' => '{1} :count neues Plugin wird zur Installation angeboten|[2,*] :count neue Plugins werden zur Installation angeboten',
@@ -204,6 +213,10 @@ return [
             'metadata' => 'Die Liste der installierten GitHub-Plugins (plugins/.github-plugins.json) konnte nicht gelesen oder geschrieben werden.',
             'daemon' => 'Die Node des Servers (Wings) konnte den Dateivorgang nicht abschließen.',
             'offer_store' => 'Die Plugin-Angebote pro Server konnten nicht gelesen oder gespeichert werden. Stelle sicher, dass die Datenbankmigration des Plugins gelaufen ist (Plugin aktualisieren oder neu installieren).',
+            'disk_full' => 'Auf dem Server ist nicht genug Speicherplatz. Gib Platz frei und versuche es erneut.',
+            'unknown_server' => 'Der Node des Servers kennt diesen Server (nicht mehr).',
+            'state_changed' => 'Das Plugin wurde inzwischen installiert, aktualisiert oder entfernt. Die Seite zeigt jetzt den aktuellen Stand.',
+            'old_jar_pending' => 'Die neue Version ist installiert, aber das alte Jar konnte noch nicht gelöscht werden. Es wird später automatisch gelöscht - oder lösche es vor dem nächsten Neustart von Hand.',
             'unknown' => 'Ein unerwarteter Fehler ist aufgetreten.',
         ],
     ],

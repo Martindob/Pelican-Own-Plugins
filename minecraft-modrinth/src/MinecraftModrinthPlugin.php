@@ -52,6 +52,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'github_token' => null,
             'github_token_clear' => false,
             'github_require_green_ci' => (bool) config('minecraft-modrinth.github.require_green_ci', true),
+            'github_required_workflow' => (string) config('minecraft-modrinth.github.required_workflow', ''),
         ];
     }
 
@@ -79,6 +80,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                 ->native(false)
                 ->seconds(false)
                 ->required()
+                ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::isValidAutoUpdateTime($value), 'time_invalid', 'minecraft-modrinth::strings.settings.'))
                 ->default(fn () => config('minecraft-modrinth.auto_update_time')),
             Section::make(trans('minecraft-modrinth::strings.github.settings.section'))
                 ->description(trans('minecraft-modrinth::strings.github.settings.section_description'))
@@ -130,6 +132,12 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                         ->helperText(trans('minecraft-modrinth::strings.github.settings.require_green_ci_hint'))
                         ->inline(false)
                         ->default(fn () => config('minecraft-modrinth.github.require_green_ci', true)),
+                    TextInput::make('github_required_workflow')
+                        ->label(trans('minecraft-modrinth::strings.github.settings.required_workflow'))
+                        ->helperText(trans('minecraft-modrinth::strings.github.settings.required_workflow_hint'))
+                        ->placeholder('build.yml')
+                        ->maxLength(100)
+                        ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::isValidWorkflowFile(trim($value)), 'required_workflow_invalid')),
                     Actions::make([
                         Action::make('github_test_connection')
                             ->label(trans('minecraft-modrinth::strings.github.settings.test_connection'))
@@ -147,21 +155,33 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
      *
      * @param  Closure(string): bool  $check
      */
-    protected function validationRule(Closure $check, string $messageKey): Closure
+    protected function validationRule(Closure $check, string $messageKey, string $messagePrefix = 'minecraft-modrinth::strings.github.settings.'): Closure
     {
-        return function (string $attribute, mixed $value, Closure $fail) use ($check, $messageKey) {
+        return function (string $attribute, mixed $value, Closure $fail) use ($check, $messageKey, $messagePrefix) {
             if (is_string($value) && $value !== '' && !$check($value)) {
-                $fail(trans('minecraft-modrinth::strings.github.settings.'.$messageKey));
+                $fail(trans($messagePrefix.$messageKey));
             }
         };
     }
 
     public function saveSettings(array $data): void
     {
+        // Re-checked here as well: this value ends up in .env and in the schedule.
+        $time = is_string($data['auto_update_time'] ?? null) ? trim($data['auto_update_time']) : '';
+
+        if (!GitHubSourceRules::isValidAutoUpdateTime($time)) {
+            Notification::make()
+                ->title(trans('minecraft-modrinth::strings.settings.time_invalid'))
+                ->danger()
+                ->send();
+
+            return;
+        }
+
         $values = [
             'MINECRAFT_MODRINTH_ALWAYS_USE_LATEST_VERSION' => $data['always_use_latest_version'],
             'MINECRAFT_MODRINTH_AUTO_UPDATE_ENABLED' => $data['auto_update_enabled'],
-            'MINECRAFT_MODRINTH_AUTO_UPDATE_TIME' => $data['auto_update_time'],
+            'MINECRAFT_MODRINTH_AUTO_UPDATE_TIME' => $time,
             // The time above is only meaningful together with a timezone: capture the saving
             // admin's own account timezone here so the schedule actually fires at that wall-clock
             // time, instead of Schedule::dailyAt() defaulting to config('app.timezone') (UTC on a
@@ -200,12 +220,14 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
         $branch = trim((string) ($data['github_branch'] ?? '')) ?: 'main';
         $indexPath = trim((string) ($data['github_index_path'] ?? '')) ?: 'minecraft/releases.json';
         $token = trim((string) ($data['github_token'] ?? ''));
+        $requiredWorkflow = trim((string) ($data['github_required_workflow'] ?? ''));
 
         // Re-checked here as well: the form rules are the first line, not the only one.
         $valid = ($repository === '' ? !$enabled : GitHubSourceRules::isValidRepository($repository))
             && GitHubSourceRules::isValidBranch($branch)
             && GitHubSourceRules::isValidIndexPath($indexPath)
-            && ($token === '' || GitHubSourceRules::isPlausibleToken($token));
+            && ($token === '' || GitHubSourceRules::isPlausibleToken($token))
+            && ($requiredWorkflow === '' || GitHubSourceRules::isValidWorkflowFile($requiredWorkflow));
 
         if (!$valid) {
             Notification::make()
@@ -222,6 +244,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'MINECRAFT_MODRINTH_GITHUB_BRANCH' => $branch,
             'MINECRAFT_MODRINTH_GITHUB_INDEX_PATH' => $indexPath,
             'MINECRAFT_MODRINTH_GITHUB_REQUIRE_GREEN_CI' => (bool) ($data['github_require_green_ci'] ?? true),
+            'MINECRAFT_MODRINTH_GITHUB_REQUIRED_WORKFLOW' => $requiredWorkflow,
         ];
 
         if (!empty($data['github_token_clear'])) {

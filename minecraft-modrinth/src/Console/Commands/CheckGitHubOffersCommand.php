@@ -8,6 +8,7 @@ use Boy132\MinecraftModrinth\GitHub\GitHubOffers;
 use Boy132\MinecraftModrinth\GitHub\GitHubPluginService;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceException;
 use Illuminate\Console\Command;
+use Throwable;
 
 /**
  * Hourly: count what the GitHub repository offers every Paper/Velocity server (new plugins and
@@ -48,9 +49,17 @@ class CheckGitHubOffersCommand extends Command
             $this->warn('Table '.GitHubOffers::TABLE.' is missing (plugin migration not run): counting offers, but not notifying anyone.');
         }
 
-        Server::query()->with(['egg', 'user', 'subusers.user'])->chunkById(50, function ($servers) use ($offers, $snapshot, $announce) {
+        Server::query()->with(['egg', 'node', 'transfer', 'user', 'subusers.user'])->chunkById(50, function ($servers) use ($github, $offers, $snapshot, $announce) {
             foreach ($servers as $server) {
-                $result = $offers->checkServer($server, $snapshot, $announce);
+                // One broken server must never stop the check for all the others.
+                try {
+                    $result = $offers->checkServer($server, $snapshot, $announce);
+                } catch (Throwable $exception) {
+                    $github->reportOncePerWindow("offers:{$server->id}:unexpected:".get_class($exception), $exception);
+                    $this->warn("Server #{$server->id}: skipped after an error (".get_class($exception).').');
+
+                    continue;
+                }
 
                 if ($result !== null && ($result['new'] > 0 || $result['updates'] > 0)) {
                     $this->line("Server #{$server->id}: {$result['new']} new, {$result['updates']} update(s)".(empty($result['announced']) ? '' : '; announced '.implode(', ', $result['announced'])).'.');

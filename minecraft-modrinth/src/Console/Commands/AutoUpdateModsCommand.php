@@ -10,6 +10,8 @@ use Boy132\MinecraftModrinth\GitHub\GitHubPluginService;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceException;
 use Exception;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
+use Throwable;
 
 class AutoUpdateModsCommand extends Command
 {
@@ -28,23 +30,51 @@ class AutoUpdateModsCommand extends Command
         $github = app(GitHubPluginService::class);
         $githubSnapshot = $this->getGitHubSnapshot($github);
 
-        Server::query()->chunk(50, function ($servers) use ($github, $githubSnapshot) {
+        Server::query()->with(['egg', 'node', 'transfer'])->chunkById(50, function ($servers) use ($github, $githubSnapshot) {
             foreach ($servers as $server) {
-                foreach (ModrinthProjectType::fromServer($server) as $modrinthProjectType) {
-                    $this->updateServer($server, $modrinthProjectType);
-                }
-
-                if ($githubSnapshot !== null) {
-                    $updated = $github->autoUpdateServer($server, $githubSnapshot);
-
-                    if (!empty($updated)) {
-                        $this->line("Server #{$server->id}: updated ".implode(', ', $updated).' from GitHub.');
-                    }
+                // One broken server (unreachable node, damaged metadata, ...) must never stop the
+                // run for all the others.
+                try {
+                    $this->updateServerFromAllSources($server, $github, $githubSnapshot);
+                } catch (Throwable $exception) {
+                    $this->reportThrottled("server:{$server->id}:".get_class($exception), $exception);
+                    $this->warn("Server #{$server->id}: skipped after an error (".get_class($exception).').');
                 }
             }
         });
 
         return 0;
+    }
+
+    /**
+     * @param  array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}>, problems: array<int, string>}|null  $githubSnapshot
+     */
+    protected function updateServerFromAllSources(Server $server, GitHubPluginService $github, ?array $githubSnapshot): void
+    {
+        // Suspended, (re)installing, being transferred or restored, node in maintenance: leave it alone.
+        if ($server->isInConflictState()) {
+            return;
+        }
+
+        foreach (ModrinthProjectType::fromServer($server) as $modrinthProjectType) {
+            $this->updateServer($server, $modrinthProjectType);
+        }
+
+        if ($githubSnapshot !== null) {
+            $updated = $github->autoUpdateServer($server, $githubSnapshot);
+
+            if (!empty($updated)) {
+                $this->line("Server #{$server->id}: updated ".implode(', ', $updated).' from GitHub.');
+            }
+        }
+    }
+
+    /** Report a failure at most once a day per key, so a server that keeps failing doesn't flood the log. */
+    protected function reportThrottled(string $key, Throwable $exception): void
+    {
+        if (Cache::add('minecraft-modrinth:auto-update:reported:'.md5($key), true, now()->addDay())) {
+            report($exception);
+        }
     }
 
     /**
@@ -116,7 +146,7 @@ class AutoUpdateModsCommand extends Command
             try {
                 MinecraftModrinth::performInstallOrUpdate($server, $modrinthProjectType, $record, $latestVersion, $primaryFile, $installedMod);
             } catch (Exception $exception) {
-                report($exception);
+                $this->reportThrottled("server:{$server->id}:modrinth:{$installedMod['project_id']}", $exception);
             }
         }
     }

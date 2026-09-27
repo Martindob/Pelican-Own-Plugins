@@ -9,11 +9,46 @@ Easily download, update, and manage Minecraft mods and plugins directly from Mod
 Add `modrinth_mods` and/or `modrinth_plugins` to the _features_ of your egg to enable the mod/plugins page.
 Also make sure your egg has the `minecraft` _tag_ and a tag matching a Modrinth loader name. (e.g. `paper` or `neoforge`)
 
+Subuser permissions (the same for the Modrinth pages and the GitHub Plugins page): seeing the page
+needs *file.read*, installing *file.create*, updating (or installing another version over an
+installed one) *file.create* and *file.delete*, uninstalling *file.delete*. A subuser with only
+console access doesn't see the pages at all.
+
+## Installing and updating this plugin
+
+> **Important (Pelican v1.0.0-beta38): after clicking _Update_ for this plugin in *Admin → Plugins*,
+> always check its status there.** Pelican beta38's plugin update replaces the files and then fails
+> (`PluginService::updatePlugin()` crashes on `$plugin->refresh()`), which leaves the plugin
+> **"Not installed"**: it isn't loaded, its database migration doesn't run and its scheduled tasks
+> (automatic updates, hourly offer check) stop. Click **Install** (beta38) - or **Enable** on newer
+> Pelican versions that leave it disabled - to bring it back. Your settings in `.env` are kept.
+>
+> This is a bug in Pelican, not something this plugin can work around: a plugin that is
+> "Not installed" isn't loaded at all, so none of its code can run to repair itself. The
+> plugin's migration is safe to run again (it skips an existing table), and the GitHub pages keep
+> working without the table (hiding offers and notifications then stay off until it exists).
+
 ## Settings
 
 - **Always Use Latest Version**: skip the Minecraft version compatibility check entirely when searching for and installing mods/plugins, always using the newest available version for the detected loader. Useful for updating mods/plugins ahead of upgrading a server to a newer Minecraft version.
-- **Enable Automatic Updates**: once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually. A failed automatic update is logged; a successful one is not.
-- **Automatic Update Time**: what time of day that runs, in your own account's time zone (captured when you save the settings page), not the panel's. Handy for scheduling it a few minutes ahead of a server's own restart schedule.
+- **Enable Automatic Updates**: once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually - and plugins installed from the GitHub repository source (see below). A failed automatic update is logged (the same failure at most once a day); a successful one is not.
+- **Automatic Update Time**: what time of day that runs, in your own account's time zone (captured when you save the settings page), not the panel's. Handy for scheduling it a few minutes ahead of a server's own restart schedule. Only `HH:MM` is accepted; an unusable value in `.env` falls back to midnight instead of breaking the panel's schedule.
+
+### Modrinth installs
+
+- A file is downloaded by the panel (streamed to a temporary file, at most 256 MB), checked
+  against the size and sha512 from Modrinth, written to the server under a temporary name
+  (`.modrinth-*.part`) and only then renamed into place. A file with the same name (an update that
+  keeps the file name) is set aside first and only deleted once the new one is in place.
+  Temporary files left behind by an interrupted install are removed at the next install into
+  that folder once they are older than an hour.
+- Only plain `.jar` file names are installed or deleted; a folder is never deleted, even if the
+  metadata names one.
+- The installed list is kept in `mods/.modrinth-metadata.json` / `plugins/.modrinth-metadata.json`.
+  If it can't be read (node unreachable, file damaged or larger than 1 MB), **nothing is installed,
+  updated or removed** until it can - writing it would replace every entry with a single one. To
+  recover a damaged file, fix the JSON by hand, or delete it (the mods/plugins stay installed but
+  are no longer listed as installed from Modrinth; install them again from the page to track them).
 - **GitHub repository source**: see below.
 
 ## Features
@@ -26,7 +61,8 @@ Also make sure your egg has the `minecraft` _tag_ and a tag matching a Modrinth 
 - **Metadata Management**: Tracks installed versions, filenames, and installation dates
 - **Version Compatibility**: Automatic filtering by Minecraft version and mod loader
 - **Seamless Installation**: Downloads to the correct server directory (mods/ or plugins/)
-- **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction
+- **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction (servers that are suspended, installing, being transferred or restored are skipped; one failing server never stops the run for the others)
+- **Verified Downloads**: The panel downloads every Modrinth file itself, only from `https://cdn.modrinth.com`, and checks it against the size and sha512 Modrinth publishes before it is written to the server
 - **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI; new plugins in the repository are offered (never installed automatically)
 - **Multilingual**: Supports English, German and Czech translations
 
@@ -86,6 +122,10 @@ Individual invalid entries are skipped and logged.
    path (default `minecraft/releases.json`), paste the token and save. Then use **Test connection**.
    - **Require green CI** (on by default): installing and updating is only possible from a commit
      whose GitHub Actions runs all finished successfully.
+   - **Required workflow** (optional, empty by default): the file name of a workflow (e.g.
+     `build.yml`) that must have a successful `push` run on exactly that commit and branch for CI
+     to count as green. Without it, a quick workflow (e.g. a linter) that finishes before the
+     build has even started could make CI green too early. **For Ethoria set `build.yml`.**
    - Automatic updates use the existing **Enable Automatic Updates** setting and time.
 3. The servers need the same egg setup as the Modrinth plugins page (`modrinth_plugins` or
    `plugins` feature, `minecraft` tag) plus a loader tag: `paper` (or `purpur`, `pufferfish`,
@@ -95,30 +135,51 @@ Individual invalid entries are skipped and logged.
 ### How it works
 
 - The panel reads the head commit of the branch, the GitHub Actions runs of that commit
-  (`push` event on that branch) and the index file at exactly that commit. CI counts as **green**
-  only when every run has finished as success/skipped/neutral and at least one succeeded; any
-  failed run makes it **red**, running ones **pending**, and a commit without runs stays
-  **not verified** (not installable while green CI is required). Results are cached briefly
-  (head commit 5 minutes, CI 1-10 minutes); the page's refresh button checks again.
+  (`push` event on that branch - the run's `head_sha` and `head_branch` are checked too) and the
+  index file at exactly that commit. CI counts as **green** only when every run has finished as
+  success/skipped/neutral and at least one succeeded (and, with a *Required workflow*, that one
+  succeeded); any failed run makes it **red**, running ones **pending**, and a commit without runs
+  stays **not verified** (not installable while green CI is required). Results are cached briefly
+  (head commit 5 minutes, CI 1-10 minutes); the page's refresh button checks again - at most once
+  per 30 seconds per server and 10 times a minute for the whole panel, so the token's rate limit
+  can't be used up by clicking. Installing asks GitHub again under the same limit, otherwise it
+  uses the cached state (the CI rule still applies to exactly the commit that is installed).
 - **The panel downloads the jar itself** (GitHub contents API), verifies its sha256 and size
   against the index, and only then writes it to the server through the Wings file API. Wings
   never gets a GitHub URL or the token.
 - The jar is written under a temporary name and renamed into `plugins/`; an existing file is never
   overwritten in place (if the indexed name is already taken by the plugin's own current jar, a
-  name with a hash suffix is used). On update the new jar is written first, then the metadata,
-  then the old jar is deleted - with a rollback at each step, so `plugins/` never keeps two jars of
-  the same plugin. If another jar that looks like the same plugin is already there (another
-  version of the same file, or a jar named after the plugin, e.g. a manual install), installing is
+  name with a hash suffix is used). On update the new jar is written first, then the metadata
+  (which records the old jar as *to be deleted*), then the old jar is deleted. If the new jar or
+  the metadata can't be written, the new jar is removed again and nothing changes. If only the
+  **old jar can't be deleted**, the update stays (the new version is recorded) and the old jar
+  stays listed as `pending_delete` in the metadata: it is deleted at the next installation, the
+  hourly check or the automatic update, and the page shows a warning. Until then `plugins/` has
+  two jars of the plugin - delete the old one by hand before restarting. A jar is never left
+  untracked. A pending jar is only deleted if a regular file with the recorded name and size is
+  still there. If another jar that looks like the same plugin is already there (another version
+  of the same file, or a jar named after the plugin, e.g. a manual install), installing is
   refused until you remove it.
+- A full disk on the server is reported as such ("not enough disk space"), not as a conflict.
+- Temporary uploads (`.github-*.part`) left behind by an interrupted install are removed by the
+  hourly check once they are older than an hour.
 - **Plugin configuration is never changed**: only the jar in `plugins/` and the metadata file
   `plugins/.github-plugins.json` (id, name, version, sha256, file name, repository, commit,
-  install/update time) are written. Removing a plugin deletes its jar and metadata entry and keeps
-  its folder (`plugins/<Plugin>/config.yml`, data, ...).
+  install/update time, and `pending_delete` while an old jar waits for deletion) are written.
+  Removing a plugin deletes its jar and metadata entry and keeps its folder
+  (`plugins/<Plugin>/config.yml`, data, ...).
+- **Damaged `plugins/.github-plugins.json`**: if it can't be read or isn't valid (or is larger than
+  1 MB), the page says so and nothing is installed, updated or removed on that server - an empty
+  list written over it would make every recorded jar untracked. To recover, fix the JSON by hand
+  (the format is shown above), or delete the file and then delete the jars it listed from
+  `plugins/` and install them again from the page (their configuration folders stay).
 - The running server keeps using what it loaded: **a new or updated plugin is used after the next
   server restart**.
 - **Automatic updates** (daily, at the configured time) only update plugins that are already
   installed, only to a higher version, and only from a commit with green CI - regardless of the
-  "Require green CI" setting. Nothing new is ever installed automatically.
+  "Require green CI" setting. Nothing new is ever installed automatically. Servers in a conflict
+  state (suspended, installing, being transferred or restored, node in maintenance) and servers
+  their node doesn't know are skipped; an error on one server never stops the run for the others.
 - Page access requires the subuser permission *file.read*; installing requires *file.create*,
   updating *file.create* and *file.delete*, removing *file.delete*; hiding an offer ("Doesn't
   belong on this server") and "Offer again" require *file.create*.
@@ -147,13 +208,16 @@ never installed automatically.
 - **Notifications**: an hourly check (`p:minecraft-modrinth:github-offers`, runs only while the
   GitHub source is enabled) reads the repository state once for all servers, then the metadata
   file and the jar list of `plugins/` of every Paper/Velocity server (two Wings requests per server;
-  suspended and not yet installed servers are skipped). For every new plugin a server hasn't been
+  servers in a conflict state - suspended, installing, being transferred or restored - and servers
+  their node doesn't know are skipped). For every new plugin a server hasn't been
   told about yet, the panel sends a notification (the bell in the panel): *"On server {server},
   the new plugin {name} {version} from the repository is available for installation"*, with a
   button to the GitHub Plugins page. Each plugin is announced **once per server** - not again for
   a newer version, after a hide/offer again, or after it was removed; more than three new plugins
   at once are announced in one notification. With *Require green CI* on, nothing is announced
   while CI of the newest commit isn't green (the next check after it turns green does it).
+- **Delivery**: the notifications are written to the panel database directly, not through the
+  queue, so they arrive even without a running queue worker.
 - **Who is notified**: the server owner and every subuser with *file.create* on that server (the
   people who can install it). Panel admins are not notified for every server they can see - they
   see the badge when they open a server.
@@ -182,6 +246,30 @@ configuration.
 - Everything from the repository is validated: repository/branch/index path in the settings, the
   index (paths must be relative, without `.`/`..`, ending in `.jar`; versions `x.y.z`; sha256 64 hex
   characters), and every jar's sha256 and size. Requests to GitHub time out after 3 s (connect) /
-  15 s (120 s for a jar download); jars are limited to 100 MB (GitHub's limit for this API).
+  15 s (120 s for a jar download); jars are limited to **50 MB** (index entries with a larger
+  `size` are skipped): the panel holds a jar in PHP memory while it checks and writes it.
+- Names, versions and server names in notifications are escaped (Filament renders notification
+  text as HTML).
 - A fine-grained token limited to one repository with read-only Contents/Actions can't change
   anything on GitHub.
+
+### Limitations
+
+- A manually installed jar is recognised only by its file name (another version of the indexed
+  file name, or a jar named after the plugin). A manual copy with an unrelated file name is not
+  recognised; the `name` inside its `plugin.yml` / `paper-plugin.yml` / `velocity-plugin.json` is
+  not read (that would mean downloading every jar in `plugins/` from the node).
+- The panel keeps a jar in memory while installing it, hence the 50 MB limit.
+
+## Changes
+
+- **1.3.1** - Security and reliability fixes from an audit: the Modrinth pages now check subuser
+  permissions like the GitHub page (seeing *file.read*, installing *file.create*, updating also
+  *file.delete*, uninstalling *file.delete*); Modrinth files are downloaded by the panel only from
+  `cdn.modrinth.com` and checked against their sha512; unreadable or damaged metadata is never
+  overwritten; only `.jar` files are ever deleted, never folders; an old jar that can't be deleted
+  after a GitHub update is recorded and deleted later instead of leaving two untracked jars; a
+  broken server no longer stops the daily update or the hourly check for everyone; metadata files
+  are read with a 1 MB limit; full disks and unknown servers are recognised; names in
+  notifications are escaped and the loader icon is static; new *Required workflow* setting;
+  GitHub refreshes are rate limited; scheduled tasks can no longer block each other forever.

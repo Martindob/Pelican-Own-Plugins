@@ -9,9 +9,10 @@ return [
         'always_use_latest_version' => 'Vždy použít nejnovější verzi',
         'always_use_latest_version_hint' => 'Přeskočí kontrolu kompatibility s verzí Minecraftu při hledání a instalaci modů/pluginů a vždy použije nejnovější dostupnou verzi pro detekovaný loader. Užitečné pro aktualizaci modů/pluginů ještě před povýšením serveru na novější verzi Minecraftu, protože se spoléhá na jejich obvyklou zpětnou kompatibilitu. Kompatibilita loaderu (Paper/Spigot/Fabric/...) se pořád kontroluje.',
         'auto_update_enabled' => 'Povolit automatické aktualizace',
-        'auto_update_enabled_hint' => 'Jednou denně automaticky aktualizuje každý nainstalovaný mod/plugin na každém serveru na jeho nejnovější kompatibilní verzi, bez nutnosti ručně kliknout na aktualizaci. Platí bez ohledu na to, jestli je server online. Neúspěšná automatická aktualizace se zaznamená do logu, úspěšná ne.',
+        'auto_update_enabled_hint' => 'Jednou denně automaticky aktualizuje každý nainstalovaný mod/plugin na každém serveru na jeho nejnovější kompatibilní verzi, bez nutnosti ručně kliknout na aktualizaci. Platí bez ohledu na to, jestli je server online. Neúspěšná automatická aktualizace se zaznamená do logu, úspěšná ne. Aktualizuje i pluginy nainstalované ze zdroje GitHub repozitáře (jen na vyšší verzi z commitu se zelenou CI; nic nového se neinstaluje). Pozastavené, právě instalované nebo přenášené servery se přeskočí.',
         'auto_update_time' => 'Čas automatické aktualizace',
         'auto_update_time_hint' => 'Čas, kdy se spustí automatická aktualizace, v časové zóně tvého účtu (aktuálně :timezone), zachycené při uložení této stránky - ne v časové zóně panelu (často UTC). Použije se jen když je zapnuté "Povolit automatické aktualizace". Užitečné pro naplánování pár minut před vlastním rozvrhem restartu serveru, aby byly aktualizace hotové, než se server zase spustí.',
+        'time_invalid' => 'Zadej čas ve tvaru HH:MM.',
         'settings_saved' => 'Nastavení uloženo',
     ],
 
@@ -74,6 +75,7 @@ return [
         'uninstall_partial_body' => 'Soubor :name byl smazán, ale nepodařilo se ho odebrat ze seznamu nainstalovaných. Stále se může zobrazovat jako nainstalovaný.',
         'uninstall_failed' => 'Odinstalace se nezdařila',
         'uninstall_failed_body' => 'Při odinstalaci došlo k chybě. Zkuste to prosím znovu nebo kontaktujte podporu, pokud problém přetrvává.',
+        'metadata_unreadable_body' => 'Seznam nainstalovaných modů/pluginů (:folder/.modrinth-metadata.json) se nepodařilo přečíst nebo je poškozený, proto se nic nezměnilo. Zkus to za chvíli znovu; když to bude dál selhávat, soubor oprav nebo smaž (viz README).',
     ],
 
     'github' => [
@@ -99,6 +101,9 @@ return [
             'token_clear' => 'Smazat uložený token',
             'require_green_ci' => 'Vyžadovat zelenou CI',
             'require_green_ci_hint' => 'Instalovat a aktualizovat jen z commitu, jehož běhy GitHub Actions všechny úspěšně doběhly. Automatické aktualizace vyžadují zelenou CI vždy.',
+            'required_workflow' => 'Povinný workflow',
+            'required_workflow_hint' => 'Volitelné. Název souboru workflow GitHub Actions (např. build.yml), který musí mít pro commit úspěšný běh - navíc k tomu, že všechny ostatní běhy prošly. Prázdné: stačí jakýkoli úspěšný běh.',
+            'required_workflow_invalid' => 'Zadej jen název souboru workflow, např. build.yml.',
             'test_connection' => 'Otestovat připojení',
             'test_connection_hint' => 'Použije uložené nastavení.',
             'test_ok' => 'Připojení funguje',
@@ -121,6 +126,9 @@ return [
             'ci_not_green' => 'Instalace je zablokovaná, dokud CI není zelená',
             'ci_not_green_description' => 'Nejnovější commit (zatím) neprošel GitHub Actions. Instalovat a aktualizovat půjde, až všechny jeho běhy úspěšně doběhnou.',
             'ci_blocks_install' => 'Zablokováno: CI nejnovějšího commitu není zelená',
+            'refresh_throttled' => 'GitHub se právě kontroloval. Zkus to znovu za :seconds s.',
+            'pending_delete' => 'Staré jary čekají na smazání',
+            'pending_delete_description' => 'Po aktualizaci se tyto staré jary zatím nepodařilo smazat: :files. Smažou se samy při další instalaci, hodinové kontrole nebo automatické aktualizaci. Před restartem serveru je smaž ručně, jinak se načtou dvě kopie pluginu.',
         ],
         'table' => [
             'name' => 'Plugin',
@@ -163,6 +171,7 @@ return [
         'notifications' => [
             'installed_body' => ':name :version je připravený a načte se při příštím restartu serveru.',
             'uninstalled_body' => ':name byl odebrán. Konfigurace zůstala.',
+            'old_jar_pending_title' => 'Aktualizováno - starý jar ještě zůstal',
         ],
         'offers' => [
             'callout_heading' => '{1} K instalaci se nabízí :count nový plugin|[2,4] K instalaci se nabízejí :count nové pluginy|[5,*] K instalaci se nabízí :count nových pluginů',
@@ -204,6 +213,10 @@ return [
             'metadata' => 'Seznam nainstalovaných GitHub pluginů (plugins/.github-plugins.json) se nepodařilo načíst nebo zapsat.',
             'daemon' => 'Node serveru (Wings) nedokázal operaci se souborem dokončit.',
             'offer_store' => 'Nabídky pluginů pro server se nepodařilo načíst ani uložit. Zkontroluj, že proběhla databázová migrace pluginu (aktualizuj nebo přeinstaluj plugin).',
+            'disk_full' => 'Na serveru není dost místa na disku. Uvolni místo a zkus to znovu.',
+            'unknown_server' => 'Node serveru tento server (už) nezná.',
+            'state_changed' => 'Plugin se mezitím nainstaloval, aktualizoval nebo odebral. Stránka teď ukazuje aktuální stav.',
+            'old_jar_pending' => 'Nová verze je na místě, ale starý jar se zatím nepodařilo smazat. Smaže se později sám - nebo ho před dalším restartem smaž ručně.',
             'unknown' => 'Došlo k neočekávané chybě.',
         ],
     ],

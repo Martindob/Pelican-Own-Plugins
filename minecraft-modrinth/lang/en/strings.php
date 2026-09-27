@@ -9,9 +9,10 @@ return [
         'always_use_latest_version' => 'Always Use Latest Version',
         'always_use_latest_version_hint' => 'Skip the Minecraft version compatibility check when searching for and installing mods/plugins, always using the newest available version for the detected loader. Useful for updating mods/plugins ahead of upgrading the server to a newer Minecraft version, relying on their usual backwards compatibility. Loader compatibility (Paper/Spigot/Fabric/...) is still enforced.',
         'auto_update_enabled' => 'Enable Automatic Updates',
-        'auto_update_enabled_hint' => 'Once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually. Applies regardless of whether the server is online. A failed automatic update is logged for you to look into; a successful one is not.',
+        'auto_update_enabled_hint' => 'Once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually. Applies regardless of whether the server is online. A failed automatic update is logged for you to look into; a successful one is not. Also updates plugins installed from the GitHub repository source (only to a higher version from a commit with green CI; nothing new is installed). Servers that are suspended, installing or being transferred are skipped.',
         'auto_update_time' => 'Automatic Update Time',
         'auto_update_time_hint' => 'The time of day automatic updates run, in your account\'s own time zone (currently :timezone), captured when you save this page - not the panel\'s time zone (often UTC). Only used while "Enable Automatic Updates" is on. Useful to schedule it a few minutes before a server\'s own restart schedule, so updates are already in place by the time it comes back up.',
+        'time_invalid' => 'Enter the time as HH:MM.',
         'settings_saved' => 'Settings saved',
     ],
 
@@ -74,6 +75,7 @@ return [
         'uninstall_partial_body' => 'The file for :name was deleted, but it could not be removed from the installed list. It may still appear as installed.',
         'uninstall_failed' => 'Uninstall failed',
         'uninstall_failed_body' => 'An error occurred during uninstallation. Please try again or contact support if the issue persists.',
+        'metadata_unreadable_body' => 'The list of installed mods/plugins (:folder/.modrinth-metadata.json) could not be read or is damaged, so nothing was changed. Try again in a moment; if it keeps failing, fix or delete that file (see the README).',
     ],
 
     'github' => [
@@ -99,6 +101,9 @@ return [
             'token_clear' => 'Delete the saved token',
             'require_green_ci' => 'Require green CI',
             'require_green_ci_hint' => 'Only allow installing and updating from a commit whose GitHub Actions runs all finished successfully. Automatic updates always require green CI.',
+            'required_workflow' => 'Required workflow',
+            'required_workflow_hint' => 'Optional. File name of the GitHub Actions workflow (e.g. build.yml) that must have a successful run for the commit, in addition to all other runs having passed. Empty: any successful run is enough.',
+            'required_workflow_invalid' => 'Enter only the workflow file name, e.g. build.yml.',
             'test_connection' => 'Test connection',
             'test_connection_hint' => 'Uses the saved settings.',
             'test_ok' => 'Connection works',
@@ -121,6 +126,9 @@ return [
             'ci_not_green' => 'Installing is blocked until CI is green',
             'ci_not_green_description' => 'The newest commit has not passed GitHub Actions (yet). Installing and updating is possible again once all its runs have finished successfully.',
             'ci_blocks_install' => 'Blocked: CI of the newest commit is not green',
+            'refresh_throttled' => 'GitHub was checked just now. Try again in :seconds seconds.',
+            'pending_delete' => 'Old jars waiting to be deleted',
+            'pending_delete_description' => 'After an update, these old jars could not be deleted yet: :files. They are deleted automatically at the next installation, the hourly check or the automatic update. Delete them by hand before restarting the server, otherwise two copies of the plugin are loaded.',
         ],
         'table' => [
             'name' => 'Plugin',
@@ -163,6 +171,7 @@ return [
         'notifications' => [
             'installed_body' => ':name :version is in place and will be loaded at the next server restart.',
             'uninstalled_body' => ':name was removed. Its configuration was kept.',
+            'old_jar_pending_title' => 'Updated - old jar still there',
         ],
         'offers' => [
             'callout_heading' => '{1} :count new plugin is offered for installation|[2,*] :count new plugins are offered for installation',
@@ -204,6 +213,10 @@ return [
             'metadata' => 'The list of installed GitHub plugins (plugins/.github-plugins.json) could not be read or written.',
             'daemon' => 'The server\'s node (Wings) could not complete the file operation.',
             'offer_store' => 'The per-server plugin offers could not be read or saved. Make sure the plugin\'s database migration has run (update or reinstall the plugin).',
+            'disk_full' => 'There is not enough disk space on the server. Free some space and try again.',
+            'unknown_server' => 'The server\'s node does not know this server (any more).',
+            'state_changed' => 'The plugin was installed, updated or removed in the meantime. The page shows the current state now.',
+            'old_jar_pending' => 'The new version is in place, but the old jar could not be deleted yet. It is deleted automatically later - or delete it by hand before the next restart.',
             'unknown' => 'An unexpected error occurred.',
         ],
     ],

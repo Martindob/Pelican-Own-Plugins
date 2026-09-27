@@ -3,20 +3,30 @@
 namespace Boy132\MinecraftModrinth\Services;
 
 use App\Models\Server;
-use App\Repositories\Daemon\DaemonFileRepository;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
+use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthMetadataException;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthRules;
+use Boy132\MinecraftModrinth\Support\DaemonFileException;
+use Boy132\MinecraftModrinth\Support\DaemonFiles;
 use Exception;
-use Illuminate\Contracts\Filesystem\FileNotFoundException;
+use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Client\Pool;
-use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Psr\Http\Message\ResponseInterface;
+use RuntimeException;
+use Throwable;
+use UnexpectedValueException;
 
 class MinecraftModrinthService
 {
-    // Seconds to wait for the daemon while it downloads a file for us.
+    // Seconds a download from Modrinth, and the upload of it to the daemon, may take.
     protected const DOWNLOAD_TIMEOUT = 120;
+
+    // Version lists fetched from Modrinth at the same time (a full page has 20 projects).
+    protected const POOL_CONCURRENCY = 5;
 
     // Version list cache TTL (minutes); kept short so a transient empty Modrinth response can't hide updates for long.
     protected const VERSIONS_CACHE_MINUTES = 30;
@@ -455,7 +465,7 @@ class MinecraftModrinthService
                 ->timeout(5)
                 ->connectTimeout(5)
                 ->throw()
-                ->get("https://api.modrinth.com/v2/project/$projectId/version", $this->getVersionsQuery($server, $minecraftLoader))
+                ->get('https://api.modrinth.com/v2/project/'.rawurlencode($projectId).'/version', $this->getVersionsQuery($server, $minecraftLoader))
                 ->json();
         } catch (Exception $exception) {
             report($exception);
@@ -513,19 +523,22 @@ class MinecraftModrinthService
             return $results;
         }
 
-        try {
-            $responses = Http::pool(fn (Pool $pool) => array_map(
-                fn (string $projectId) => $pool->as($projectId)
-                    ->asJson()
-                    ->timeout(10)
-                    ->connectTimeout(5)
-                    ->get("https://api.modrinth.com/v2/project/$projectId/version", $query),
-                $missing
-            ));
-        } catch (Exception $exception) {
-            report($exception);
-
-            $responses = [];
+        // In small batches: a pool of every project at once opens that many connections to
+        // Modrinth at the same moment.
+        $responses = [];
+        foreach (array_chunk($missing, self::POOL_CONCURRENCY) as $batch) {
+            try {
+                $responses += Http::pool(fn (Pool $pool) => array_map(
+                    fn (string $projectId) => $pool->as($projectId)
+                        ->asJson()
+                        ->timeout(10)
+                        ->connectTimeout(5)
+                        ->get('https://api.modrinth.com/v2/project/'.rawurlencode($projectId).'/version', $query),
+                    $batch
+                ));
+            } catch (Exception $exception) {
+                report($exception);
+            }
         }
 
         foreach ($missing as $projectId) {
@@ -560,56 +573,73 @@ class MinecraftModrinthService
         return join_paths($modrinthProjectType->getFolder(), '.modrinth-metadata.json');
     }
 
-    /** @return array<int, array{project_id: string, project_slug: string, project_title: string, version_id: string, version_number: string, filename: string, installed_at: string, author?: string}> */
+    /**
+     * Installed mods/plugins for display and automatic updates. Anything that can't be read
+     * right now counts as nothing installed here - never use this list to write the file back,
+     * see readModsMetadata().
+     *
+     * @return array<int, array{project_id: string, project_slug: string, project_title: string, version_id: string, version_number: string, filename: string, installed_at: string, author?: string}>
+     */
     public function getInstalledModsMetadata(Server $server, ModrinthProjectType $modrinthProjectType): array
     {
         try {
-            $fileRepository = app(DaemonFileRepository::class);
-
-            $metadataPath = $this->getMetadataFilePath($modrinthProjectType);
-            $content = $fileRepository->setServer($server)->getContent($metadataPath);
-            $metadata = json_decode($content, true);
-        } catch (FileNotFoundException) {
-            return [];
-        } catch (Exception $exception) {
-            report($exception);
+            return $this->readModsMetadata($server, $modrinthProjectType)['entries'];
+        } catch (ModrinthMetadataException $exception) {
+            if (!$exception->getPrevious() instanceof DaemonFileException || $exception->getPrevious()->reason !== DaemonFileException::UNKNOWN_SERVER) {
+                report($exception);
+            }
 
             return [];
         }
+    }
 
-        if (!is_array($metadata) || !isset($metadata['installed_mods']) || !is_array($metadata['installed_mods'])) {
-            return [];
+    /**
+     * The metadata file, strictly: a missing file is an empty list, but a file that can't be
+     * read (daemon unreachable, too large) or isn't valid throws - so nothing is ever written
+     * over it with only the entry at hand.
+     *
+     * @return array{entries: array<int, array{project_id: string, project_slug: string, project_title: string, version_id: string, version_number: string, filename: string, installed_at: string, author?: string}>, raw: array<int, mixed>}
+     *
+     * @throws ModrinthMetadataException
+     */
+    public function readModsMetadata(Server $server, ModrinthProjectType $modrinthProjectType): array
+    {
+        $metadataPath = $this->getMetadataFilePath($modrinthProjectType);
+
+        try {
+            $content = DaemonFiles::readSmallFile($server, $metadataPath, ModrinthRules::MAX_METADATA_BYTES);
+        } catch (DaemonFileException $exception) {
+            throw new ModrinthMetadataException("Could not read $metadataPath of server #{$server->id}: {$exception->getMessage()}", 0, $exception);
         }
 
-        $requiredKeysFlipped = array_flip([
-            'project_id',
-            'project_slug',
-            'project_title',
-            'version_id',
-            'version_number',
-            'filename',
-            'installed_at',
-        ]);
-
-        $validInstalledMods = [];
-
-        foreach ($metadata['installed_mods'] as $entry) {
-            if (!is_array($entry)) {
-                continue;
-            }
-
-            if (!empty(array_diff_key($requiredKeysFlipped, $entry))) {
-                continue;
-            }
-
-            if (isset($validInstalledMods[$entry['project_id']])) {
-                continue;
-            }
-
-            $validInstalledMods[$entry['project_id']] = $entry;
+        if ($content === null) {
+            return ['entries' => [], 'raw' => []];
         }
 
-        return array_values($validInstalledMods);
+        try {
+            return ModrinthRules::parseMetadata($content);
+        } catch (UnexpectedValueException $exception) {
+            throw new ModrinthMetadataException("$metadataPath of server #{$server->id} can't be used: {$exception->getMessage()}", 0, $exception);
+        }
+    }
+
+    /**
+     * @param  array<int, mixed>  $raw
+     *
+     * @throws Exception
+     */
+    protected function writeModsMetadata(Server $server, ModrinthProjectType $modrinthProjectType, array $raw): void
+    {
+        try {
+            DaemonFiles::writeFile(
+                $server,
+                $this->getMetadataFilePath($modrinthProjectType),
+                json_encode(['installed_mods' => array_values($raw)], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES),
+                (int) config('panel.guzzle.timeout', 15)
+            );
+        } catch (DaemonFileException $exception) {
+            throw new Exception($exception->getMessage());
+        }
     }
 
     public function saveModMetadata(
@@ -625,14 +655,13 @@ class MinecraftModrinthService
     ): bool {
         try {
             return Cache::lock("modrinth_metadata:{$server->id}", 10)->block(5, function () use ($server, $modrinthProjectType, $projectId, $projectSlug, $projectTitle, $versionId, $versionNumber, $filename, $author) {
-                $fileRepository = app(DaemonFileRepository::class);
+                // Strict: if the file can't be read, nothing is written (see readModsMetadata()).
+                $metadata = $this->readModsMetadata($server, $modrinthProjectType);
 
-                $installedMods = $this->getInstalledModsMetadata($server, $modrinthProjectType);
-
-                $existingIndex = null;
-                foreach ($installedMods as $index => $mod) {
+                $existing = null;
+                foreach ($metadata['entries'] as $mod) {
                     if ($mod['project_id'] === $projectId) {
-                        $existingIndex = $index;
+                        $existing = $mod;
 
                         break;
                     }
@@ -645,12 +674,10 @@ class MinecraftModrinthService
                     'version_id' => $versionId,
                     'version_number' => $versionNumber,
                     'filename' => $filename,
-                    'installed_at' => $existingIndex !== null
-                        ? $installedMods[$existingIndex]['installed_at']
-                        : now()->toIso8601String(),
+                    'installed_at' => $existing['installed_at'] ?? now()->toIso8601String(),
                 ];
 
-                if ($existingIndex !== null) {
+                if ($existing !== null) {
                     $modEntry['updated_at'] = now()->toIso8601String();
                 }
 
@@ -658,21 +685,10 @@ class MinecraftModrinthService
                     $modEntry['author'] = $author;
                 }
 
-                if ($existingIndex !== null) {
-                    // Replace in place. Removing and re-appending pushed the entry to the end of the
-                    // list, which moved the row to the bottom of the installed tab on every update.
-                    $installedMods[$existingIndex] = $modEntry;
-                } else {
-                    $installedMods[] = $modEntry;
-                }
+                // Replaced in place (the row keeps its position); every other entry is kept as stored.
+                $this->writeModsMetadata($server, $modrinthProjectType, ModrinthRules::upsertEntry($metadata['raw'], $modEntry));
 
-                $metadataPath = $this->getMetadataFilePath($modrinthProjectType);
-                $response = $fileRepository->setServer($server)->putContent(
-                    $metadataPath,
-                    json_encode(['installed_mods' => array_values($installedMods)], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
-                );
-
-                return !$response->failed();
+                return true;
             }) === true;
         } catch (Exception $exception) {
             report($exception);
@@ -685,20 +701,11 @@ class MinecraftModrinthService
     {
         try {
             return Cache::lock("modrinth_metadata:{$server->id}", 10)->block(5, function () use ($server, $modrinthProjectType, $projectId) {
-                $fileRepository = app(DaemonFileRepository::class);
+                $metadata = $this->readModsMetadata($server, $modrinthProjectType);
 
-                $installedMods = collect($this->getInstalledModsMetadata($server, $modrinthProjectType))
-                    ->filter(fn ($mod) => $mod['project_id'] !== $projectId)
-                    ->values()
-                    ->toArray();
+                $this->writeModsMetadata($server, $modrinthProjectType, ModrinthRules::removeEntry($metadata['raw'], $projectId));
 
-                $metadataPath = $this->getMetadataFilePath($modrinthProjectType);
-                $response = $fileRepository->setServer($server)->putContent(
-                    $metadataPath,
-                    json_encode(['installed_mods' => $installedMods], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
-                );
-
-                return !$response->failed();
+                return true;
             }) === true;
         } catch (Exception $exception) {
             report($exception);
@@ -708,69 +715,167 @@ class MinecraftModrinthService
     }
 
     /**
-     * Ask the daemon to download a file and wait until it is actually on disk.
+     * Download a file from Modrinth into a temporary file of the panel, streamed and checked
+     * against the size and sha512 Modrinth publishes for it. Only https://cdn.modrinth.com is
+     * ever contacted, without following redirects.
      *
-     * Without `foreground` the daemon downloads in the background, so the panel gets a success
-     * response before the file exists and never hears about a failed download. The explicit file
-     * name matters too: otherwise the daemon derives it from the URL, which can differ from the
-     * name Modrinth reports and would leave the metadata pointing at a file that isn't there.
+     * @param  array{url: string, filename: string, size: int, sha512: string}  $spec
+     * @return string path of the verified temporary file (the caller deletes it)
      *
      * @throws Exception
      */
-    public function downloadFile(Server $server, string $url, string $folder, string $filename): void
+    protected function downloadVerified(array $spec): string
     {
-        // An update often reuses the name of the file it replaces. If the name is already taken,
-        // finding it there afterwards says nothing about whether our download replaced it.
-        $nameWasTaken = $this->fileExists($server, $folder, $filename);
-
-        try {
-            app(DaemonFileRepository::class)
-                ->setServer($server)
-                ->getHttpClient()
-                // The daemon holds the request open for the whole download, which easily outlives
-                // the timeout used for the small file operations everything else here does.
-                ->timeout(max((int) config('panel.guzzle.timeout'), self::DOWNLOAD_TIMEOUT))
-                ->post("/api/servers/{$server->uuid}/files/pull", [
-                    'url' => $url,
-                    'root' => $folder,
-                    'file_name' => $filename,
-                    'foreground' => true,
-                ]);
-        } catch (Exception $exception) {
-            // A slow download can outlive our request while still finishing on the node, but a
-            // file appearing under a name that was free before is the only proof of that we get.
-            if ($nameWasTaken) {
-                throw $exception;
-            }
-
-            try {
-                $landed = $this->fileExists($server, $folder, $filename);
-            } catch (Exception) {
-                throw $exception;
-            }
-
-            if (!$landed) {
-                throw $exception;
-            }
-
-            return;
+        if (!ModrinthRules::isAllowedDownloadUrl($spec['url'])) {
+            throw new Exception('Refusing to download from outside https://'.ModrinthRules::DOWNLOAD_HOST);
         }
 
-        if (!$this->fileExists($server, $folder, $filename)) {
-            throw new Exception("Daemon reported success but $folder/$filename is missing after downloading $url");
+        $temporary = tempnam(sys_get_temp_dir(), 'minecraft-modrinth-');
+        if ($temporary === false) {
+            throw new Exception('Could not create a temporary file for the download');
+        }
+
+        $maxBytes = $spec['size'];
+        $abortIfLarger = function (int $bytes) use ($maxBytes): void {
+            if ($bytes > $maxBytes) {
+                throw new RuntimeException('minecraft-modrinth: download larger than announced');
+            }
+        };
+
+        try {
+            $response = Http::withUserAgent('pelican-minecraft-modrinth')
+                ->withOptions([
+                    'allow_redirects' => false,
+                    'on_headers' => function (ResponseInterface $response) use ($abortIfLarger) {
+                        $length = $response->getHeaderLine('Content-Length');
+                        if ($length !== '' && ctype_digit($length)) {
+                            $abortIfLarger((int) $length);
+                        }
+                    },
+                    'progress' => fn ($downloadTotal, $downloaded) => $abortIfLarger((int) $downloaded),
+                ])
+                ->connectTimeout(3)
+                ->timeout(self::DOWNLOAD_TIMEOUT)
+                ->sink($temporary)
+                ->get($spec['url']);
+
+            if ($response->status() !== 200) {
+                throw new Exception("Downloading {$spec['filename']} from Modrinth failed (HTTP {$response->status()})");
+            }
+
+            clearstatcache(true, $temporary);
+
+            if (filesize($temporary) !== $spec['size'] || !hash_equals($spec['sha512'], (string) hash_file('sha512', $temporary))) {
+                throw new Exception("{$spec['filename']} from Modrinth does not match the size/sha512 Modrinth published for it");
+            }
+
+            return $temporary;
+        } catch (Throwable $exception) {
+            @unlink($temporary);
+
+            throw $exception instanceof Exception ? $exception : new Exception($exception->getMessage());
         }
     }
 
     /**
+     * Put a verified file into the server's folder: written under a temporary name that no
+     * loader picks up, then renamed into place. A file that already has the name (the old
+     * version of an update with the same file name) is set aside first and only deleted once
+     * the new one is in place, so a failure never leaves the folder without it.
+     *
+     * @throws Exception
+     */
+    protected function placeFile(Server $server, string $folder, string $filename, string $localFile, int $size): void
+    {
+        $files = $this->listFolder($server, $folder);
+
+        // Temporary uploads left behind by an interrupted install (older than an hour).
+        foreach ($files as $file) {
+            if (is_string($file['name'] ?? null) && DaemonFiles::isRegularFile($file)
+                && GitHubSourceRules::isStaleTemporaryUpload($file['name'], $file['modified'] ?? null, time())) {
+                $this->deleteQuietly($server, $folder, $file['name']);
+            }
+        }
+
+        $existing = DaemonFiles::find($files, $filename);
+        if ($existing !== null && !DaemonFiles::isRegularFile($existing)) {
+            throw new Exception("$folder/$filename exists and is not a file");
+        }
+
+        $temporary = '.modrinth-'.bin2hex(random_bytes(6)).'.part';
+        $stream = fopen($localFile, 'rb');
+        if ($stream === false) {
+            throw new Exception('Could not open the downloaded file');
+        }
+
+        try {
+            DaemonFiles::writeFile($server, "$folder/$temporary", Utils::streamFor($stream), self::DOWNLOAD_TIMEOUT);
+        } catch (DaemonFileException $exception) {
+            $this->deleteQuietly($server, $folder, $temporary);
+
+            throw new Exception($exception->reason === DaemonFileException::DISK_FULL
+                ? "Not enough disk space on server #{$server->id} for $filename"
+                : $exception->getMessage());
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+
+        $backup = null;
+
+        try {
+            if ($existing !== null) {
+                $backup = '.modrinth-'.bin2hex(random_bytes(6)).'.part';
+                DaemonFiles::rename($server, $folder, $filename, $backup);
+            }
+
+            DaemonFiles::rename($server, $folder, $temporary, $filename);
+        } catch (DaemonFileException $exception) {
+            $this->deleteQuietly($server, $folder, $temporary);
+
+            if ($backup !== null) {
+                try {
+                    DaemonFiles::rename($server, $folder, $backup, $filename);
+                } catch (DaemonFileException $restoreException) {
+                    report($restoreException);
+                }
+            }
+
+            throw new Exception($exception->getMessage());
+        }
+
+        $placed = DaemonFiles::find($this->listFolder($server, $folder), $filename);
+        if ($placed === null || (int) ($placed['size'] ?? -1) !== $size) {
+            throw new Exception("$folder/$filename on server #{$server->id} is missing or has the wrong size after writing it");
+        }
+
+        if ($backup !== null) {
+            $this->deleteQuietly($server, $folder, $backup);
+        }
+    }
+
+    protected function deleteQuietly(Server $server, string $folder, string $name): void
+    {
+        try {
+            DaemonFiles::delete($server, $folder, $name);
+        } catch (DaemonFileException $exception) {
+            report($exception);
+        }
+    }
+
+    /**
+     * Delete a mod/plugin file. Only a regular file is ever deleted - never a folder, even if
+     * the metadata names one; a file that is already gone counts as deleted.
+     *
      * @throws Exception
      */
     public function deleteFile(Server $server, string $folder, string $filename): void
     {
-        $response = app(DaemonFileRepository::class)
-            ->setServer($server)
-            ->deleteFiles('/', [join_paths($folder, $filename)]);
+        $filename = $this->validateFilename($filename);
+        $file = DaemonFiles::find($this->listFolder($server, $folder), $filename);
 
-        if ($response->status() === 404) {
+        if ($file === null) {
             // Already gone, e.g. deleted by hand outside the panel. The desired end state (the
             // file isn't there) already holds, so treat it as success instead of leaving the
             // caller stuck: an uninstall that can never get past "delete the file" would keep
@@ -778,29 +883,39 @@ class MinecraftModrinthService
             return;
         }
 
-        $response->throw();
+        if (!DaemonFiles::isRegularFile($file)) {
+            throw new Exception("Refusing to delete $folder/$filename: it is not a file");
+        }
+
+        try {
+            DaemonFiles::delete($server, $folder, $filename);
+        } catch (DaemonFileException $exception) {
+            throw new Exception($exception->getMessage());
+        }
     }
 
     /**
+     * A plain .jar file name directly in mods/ or plugins/ (see ModrinthRules::isValidJarFilename()).
+     *
      * @throws Exception
      */
     public function validateFilename(string $filename): string
     {
-        if ($filename === '' || $filename === '.' || str_contains($filename, "\0") || str_contains($filename, '..') || str_contains($filename, '/') || str_contains($filename, '\\')) {
-            throw new Exception('Invalid filename: potential path traversal detected');
+        if (!ModrinthRules::isValidJarFilename($filename)) {
+            throw new Exception('Invalid filename: only a plain .jar file name is allowed');
         }
 
-        return basename($filename);
+        return $filename;
     }
 
     /**
-     * @param  array<int, array{primary: bool, filename: string, url: string}>  $files
-     * @return array{primary: bool, filename: string, url: string}|null
+     * @param  array<int, mixed>  $files
+     * @return array<string, mixed>|null
      */
     public function getPrimaryFile(array $files): ?array
     {
         foreach ($files as $file) {
-            if (!empty($file['primary'])) {
+            if (is_array($file) && !empty($file['primary'])) {
                 return $file;
             }
         }
@@ -811,7 +926,7 @@ class MinecraftModrinthService
     /**
      * @param  array{project_id: string, slug: string, title: string, author?: ?string}  $record
      * @param  array<string, mixed>  $versionData
-     * @param  array{primary: bool, filename: string, url: string}  $primaryFile
+     * @param  array<string, mixed>  $primaryFile  Modrinth file object (url, filename, size, hashes)
      * @param  array<string, mixed>|null  $installedMod
      *
      * @throws Exception
@@ -824,12 +939,29 @@ class MinecraftModrinthService
         array $primaryFile,
         ?array $installedMod = null
     ): void {
-        $safeNewFilename = $this->validateFilename($primaryFile['filename']);
+        $problem = null;
+        $spec = ModrinthRules::downloadSpec($primaryFile, $problem);
+
+        if ($spec === null || !ModrinthRules::isValidId($record['project_id'] ?? null) || !is_string($versionData['id'] ?? null) || !is_string($versionData['version_number'] ?? null)) {
+            throw new Exception('Refusing to install from Modrinth: '.($problem ?? 'invalid project or version data'));
+        }
+
+        $safeNewFilename = $spec['filename'];
         $oldFilename = $installedMod ? $this->validateFilename($installedMod['filename']) : null;
 
         $folder = $modrinthProjectType->getFolder();
 
-        $this->downloadFile($server, $primaryFile['url'], $folder, $safeNewFilename);
+        // Before downloading anything: with metadata that can't be trusted nothing is installed,
+        // since it couldn't be recorded without losing every other entry.
+        $this->readModsMetadata($server, $modrinthProjectType);
+
+        $localFile = $this->downloadVerified($spec);
+
+        try {
+            $this->placeFile($server, $folder, $safeNewFilename, $localFile, $spec['size']);
+        } finally {
+            @unlink($localFile);
+        }
 
         $saved = $this->saveModMetadata(
             $server,
@@ -896,28 +1028,18 @@ class MinecraftModrinthService
     }
 
     /**
-     * @return array<string, mixed>
+     * @return array<int, array<string, mixed>>
      *
      * @throws Exception
      */
     public function listFolder(Server $server, string $folder): array
     {
         try {
-            $files = app(DaemonFileRepository::class)->setServer($server)->getDirectory($folder);
-        } catch (RequestException $exception) {
-            if ($exception->response->status() === 404) {
-                // The folder simply doesn't exist yet.
-                return [];
-            }
-
-            throw $exception;
+            // null: the folder simply doesn't exist yet.
+            return DaemonFiles::listDirectory($server, $folder) ?? [];
+        } catch (DaemonFileException $exception) {
+            throw new Exception($exception->getMessage());
         }
-
-        if (isset($files['error'])) {
-            throw new Exception("Daemon returned an error while listing $folder: ".(is_string($files['error']) ? $files['error'] : 'unknown error'));
-        }
-
-        return $files;
     }
 
     /** @return array{project_id: string, project_slug: string, project_title: string, version_id: string, version_number: string, filename: string, installed_at: string, author?: string}|null */

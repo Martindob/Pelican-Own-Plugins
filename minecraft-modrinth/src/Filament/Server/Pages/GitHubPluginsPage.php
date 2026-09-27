@@ -24,6 +24,7 @@ use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Concerns\InteractsWithTable;
 use Filament\Tables\Contracts\HasTable;
 use Filament\Tables\Table;
+use Illuminate\Support\Facades\RateLimiter;
 
 /**
  * Plugins from the configured GitHub repository (see README "GitHub repository source"),
@@ -54,6 +55,15 @@ class GitHubPluginsPage extends Page implements HasTable
 
     /** @var array<int, InstalledPlugin>|null */
     protected ?array $installed = null;
+
+    /** @var array<int, string> old jars recorded for deletion */
+    protected array $pendingDeletes = [];
+
+    /** Forced GitHub refreshes: at most one per server in this many seconds ... */
+    protected const REFRESH_PER_SERVER_SECONDS = 30;
+
+    /** ... and at most this many per minute for the whole panel (they all use one token). */
+    protected const REFRESH_GLOBAL_PER_MINUTE = 10;
 
     protected ?GitHubSourceException $installedError = null;
 
@@ -173,10 +183,13 @@ class GitHubPluginsPage extends Page implements HasTable
     {
         if ($this->installed === null) {
             try {
-                $this->installed = static::service()->getInstalled(static::server());
+                $metadata = static::service()->readMetadata(static::server());
+                $this->installed = $metadata['installed'];
+                $this->pendingDeletes = array_column($metadata['pending_delete'], 'filename');
             } catch (GitHubSourceException $exception) {
                 $this->installedError = $exception;
                 $this->installed = [];
+                $this->pendingDeletes = [];
             }
         }
 
@@ -220,6 +233,7 @@ class GitHubPluginsPage extends Page implements HasTable
         $this->snapshotLoaded = false;
         $this->installed = null;
         $this->installedError = null;
+        $this->pendingDeletes = [];
         $this->jarNames = null;
         $this->jarNamesError = null;
         $this->dismissed = null;
@@ -267,7 +281,7 @@ class GitHubPluginsPage extends Page implements HasTable
 
         // Without the installed list or the directory listing we can't tell what is new.
         $knowsServerState = $this->installedError === null && $this->jarNamesError === null;
-        $managedFilenames = array_column($installed, 'filename');
+        $managedFilenames = [...array_column($installed, 'filename'), ...$this->pendingDeletes];
 
         $rows = [];
 
@@ -323,7 +337,7 @@ class GitHubPluginsPage extends Page implements HasTable
 
         // Keep the navigation badge in step with what this page shows.
         if ($snapshot !== null && $platform !== null && $knowsServerState && $this->dismissedError === null) {
-            static::offers()->rememberCounts($server, GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames));
+            static::offers()->rememberCounts($server, GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, $this->pendingDeletes));
         }
 
         return $rows;
@@ -476,14 +490,53 @@ class GitHubPluginsPage extends Page implements HasTable
             ]);
     }
 
+    /**
+     * Whether a forced refresh from GitHub is allowed now: at most once per server every
+     * REFRESH_PER_SERVER_SECONDS and REFRESH_GLOBAL_PER_MINUTE times a minute in total, so
+     * clicking around can't use up the token's rate limit. Counts the attempt when allowed.
+     */
+    protected function mayRefreshFromGitHub(): bool
+    {
+        $serverKey = 'minecraft-modrinth:github:refresh:server:'.static::server()->id;
+        $globalKey = 'minecraft-modrinth:github:refresh:global';
+
+        if (RateLimiter::tooManyAttempts($serverKey, 1) || RateLimiter::tooManyAttempts($globalKey, self::REFRESH_GLOBAL_PER_MINUTE)) {
+            return false;
+        }
+
+        RateLimiter::hit($serverKey, self::REFRESH_PER_SERVER_SECONDS);
+        RateLimiter::hit($globalKey, 60);
+
+        return true;
+    }
+
+    protected function refreshWaitSeconds(): int
+    {
+        return max(
+            RateLimiter::availableIn('minecraft-modrinth:github:refresh:server:'.static::server()->id),
+            RateLimiter::tooManyAttempts('minecraft-modrinth:github:refresh:global', self::REFRESH_GLOBAL_PER_MINUTE)
+                ? RateLimiter::availableIn('minecraft-modrinth:github:refresh:global')
+                : 0,
+            1,
+        );
+    }
+
     protected function install(string $id, bool $isUpdate): void
     {
         $server = static::server();
 
+        // Also checked here: the action's own authorization is the first line, not the only one.
+        if (!static::userCan(...($isUpdate ? [SubuserPermission::FileCreate, SubuserPermission::FileDelete] : [SubuserPermission::FileCreate]))) {
+            abort(403);
+        }
+
         try {
-            // Always the current state, never a stale page: the confirmation may have been open
-            // for a while, and the CI rule has to hold for exactly what gets installed.
-            static::service()->forgetCachedState();
+            // The current state whenever the rate limit allows it: the confirmation may have been
+            // open for a while. Otherwise the cached state (head <= 5 min, CI <= 10 min) is used -
+            // the CI rule still holds for exactly the commit that gets installed.
+            if ($this->mayRefreshFromGitHub()) {
+                static::service()->forgetCachedState();
+            }
             $this->forgetState(false);
 
             $snapshot = $this->getSnapshot();
@@ -502,23 +555,28 @@ class GitHubPluginsPage extends Page implements HasTable
                 throw new GitHubSourceException(GitHubSourceException::INVALID_INDEX, "$id is not in the index at {$snapshot['sha']}");
             }
 
-            $entry = static::service()->installOrUpdate($server, $plugin, $snapshot, static::service()->requiresGreenCi());
+            $entry = static::service()->installOrUpdate($server, $plugin, $snapshot, static::service()->requiresGreenCi(), $isUpdate);
 
             Notification::make()
                 ->title(trans($isUpdate ? 'minecraft-modrinth::strings.notifications.update_success' : 'minecraft-modrinth::strings.notifications.install_success'))
                 ->body(trans('minecraft-modrinth::strings.github.notifications.installed_body', [
-                    'name' => $entry['name'],
-                    'version' => $entry['version'],
+                    'name' => e($entry['name']),
+                    'version' => e($entry['version']),
                 ]))
                 ->success()
                 ->send();
         } catch (GitHubSourceException $exception) {
             static::service()->reportOncePerWindow("ui:{$server->id}:$id:{$exception->reason}", $exception);
 
+            $partial = $exception->reason === GitHubSourceException::OLD_JAR_PENDING;
+
             Notification::make()
-                ->title(trans($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed'))
+                ->title(trans($partial
+                    ? 'minecraft-modrinth::strings.github.notifications.old_jar_pending_title'
+                    : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed')))
                 ->body($exception->getUserMessage())
-                ->danger()
+                ->status($partial ? 'warning' : 'danger')
+                ->persistent()
                 ->send();
         }
 
@@ -530,12 +588,16 @@ class GitHubPluginsPage extends Page implements HasTable
     {
         $server = static::server();
 
+        if (!static::userCan(SubuserPermission::FileCreate)) {
+            abort(403);
+        }
+
         try {
             $dismissed ? static::offers()->dismiss($server, $id) : static::offers()->restore($server, $id);
 
             Notification::make()
                 ->title(trans($dismissed ? 'minecraft-modrinth::strings.github.offers.dismissed_title' : 'minecraft-modrinth::strings.github.offers.restored_title'))
-                ->body(trans($dismissed ? 'minecraft-modrinth::strings.github.offers.dismissed_body' : 'minecraft-modrinth::strings.github.offers.restored_body', ['name' => $name]))
+                ->body(trans($dismissed ? 'minecraft-modrinth::strings.github.offers.dismissed_body' : 'minecraft-modrinth::strings.github.offers.restored_body', ['name' => e($name)]))
                 ->success()
                 ->send();
         } catch (GitHubSourceException $exception) {
@@ -555,12 +617,16 @@ class GitHubPluginsPage extends Page implements HasTable
     {
         $server = static::server();
 
+        if (!static::userCan(SubuserPermission::FileDelete)) {
+            abort(403);
+        }
+
         try {
             static::service()->uninstall($server, $id);
 
             Notification::make()
                 ->title(trans('minecraft-modrinth::strings.notifications.uninstall_success'))
-                ->body(trans('minecraft-modrinth::strings.github.notifications.uninstalled_body', ['name' => $name]))
+                ->body(trans('minecraft-modrinth::strings.github.notifications.uninstalled_body', ['name' => e($name)]))
                 ->success()
                 ->send();
         } catch (GitHubSourceException $exception) {
@@ -595,6 +661,15 @@ class GitHubPluginsPage extends Page implements HasTable
                 ->icon('tabler-reload')
                 ->color('gray')
                 ->action(function () {
+                    if (!$this->mayRefreshFromGitHub()) {
+                        Notification::make()
+                            ->title(trans('minecraft-modrinth::strings.github.page.refresh_throttled', ['seconds' => $this->refreshWaitSeconds()]))
+                            ->warning()
+                            ->send();
+
+                        return;
+                    }
+
                     static::service()->forgetCachedState();
                     $this->forgetState();
                 }),
@@ -650,6 +725,14 @@ class GitHubPluginsPage extends Page implements HasTable
                         $this->getInstalled();
 
                         return $this->installedError !== null;
+                    }),
+                Callout::make(trans('minecraft-modrinth::strings.github.page.pending_delete'))
+                    ->description(fn () => trans('minecraft-modrinth::strings.github.page.pending_delete_description', ['files' => implode(', ', $this->pendingDeletes)]))
+                    ->warning()
+                    ->visible(function () {
+                        $this->getInstalled();
+
+                        return !empty($this->pendingDeletes);
                     }),
                 Callout::make(fn () => trans_choice('minecraft-modrinth::strings.github.offers.callout_heading', $this->countOffered()['new'], ['count' => $this->countOffered()['new']]))
                     ->description(trans('minecraft-modrinth::strings.github.offers.callout_description'))

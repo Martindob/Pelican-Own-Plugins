@@ -2,11 +2,13 @@
 
 namespace Boy132\MinecraftModrinth\Filament\Server\Pages;
 
+use App\Enums\SubuserPermission;
 use App\Filament\Server\Resources\Files\Pages\ListFiles;
 use App\Models\Server;
 use App\Traits\Filament\BlockAccessInConflict;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
 use Boy132\MinecraftModrinth\Facades\MinecraftModrinth;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthMetadataException;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
@@ -27,7 +29,6 @@ use Filament\Tables\Table;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\HtmlString;
 
 abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 {
@@ -54,7 +55,56 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
         /** @var Server $server */
         $server = Filament::getTenant();
 
-        return parent::canAccess() && static::$modrinthProjectType && in_array(static::$modrinthProjectType, ModrinthProjectType::fromServer($server));
+        return parent::canAccess()
+            && static::$modrinthProjectType
+            && in_array(static::$modrinthProjectType, ModrinthProjectType::fromServer($server))
+            && (bool) user()?->can(SubuserPermission::FileRead, $server);
+    }
+
+    protected static function userCan(SubuserPermission ...$permissions): bool
+    {
+        /** @var Server $server */
+        $server = Filament::getTenant();
+
+        foreach ($permissions as $permission) {
+            if (!user()?->can($permission, $server)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Checked again inside every action: the action's own authorization is the first line, not
+     * the only one. Installing needs file.create, replacing or removing a file also file.delete.
+     */
+    protected static function ensureUserCan(SubuserPermission ...$permissions): void
+    {
+        if (!static::userCan(...$permissions)) {
+            abort(403);
+        }
+    }
+
+    /**
+     * The permissions installing this project needs: an install over an installed version
+     * replaces (deletes) a file.
+     *
+     * @return array<int, SubuserPermission>
+     */
+    protected function installPermissions(string $projectId): array
+    {
+        return $this->getInstalledMod($projectId) === null
+            ? [SubuserPermission::FileCreate]
+            : [SubuserPermission::FileCreate, SubuserPermission::FileDelete];
+    }
+
+    /** Body of a failure notification: specific when the metadata file is the problem. */
+    protected static function failureBody(Exception $exception, string $genericKey): string
+    {
+        return $exception instanceof ModrinthMetadataException
+            ? trans('minecraft-modrinth::strings.notifications.metadata_unreadable_body', ['folder' => static::$modrinthProjectType?->getFolder() ?? ''])
+            : trans($genericKey);
     }
 
     public static function getNavigationLabel(): string
@@ -291,7 +341,10 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                                     ->label(trans('minecraft-modrinth::strings.actions.install'))
                                     ->icon('tabler-download')
                                     ->visible($primaryFile !== null)
+                                    ->authorize(fn () => static::userCan(...$this->installPermissions($record['project_id'])))
                                     ->action(function () use ($record, $versionData, $primaryFile) {
+                                        static::ensureUserCan(...$this->installPermissions($record['project_id']));
+
                                         try {
                                             /** @var Server $server */
                                             $server = Filament::getTenant();
@@ -309,8 +362,8 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                                             Notification::make()
                                                 ->title(trans('minecraft-modrinth::strings.notifications.install_success'))
                                                 ->body(trans('minecraft-modrinth::strings.notifications.install_success_body', [
-                                                    'name' => $record['title'],
-                                                    'version' => $versionData['version_number'],
+                                                    'name' => e($record['title']),
+                                                    'version' => e($versionData['version_number']),
                                                 ]))
                                                 ->success()
                                                 ->send();
@@ -321,7 +374,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 
                                             Notification::make()
                                                 ->title(trans('minecraft-modrinth::strings.notifications.install_failed'))
-                                                ->body(trans('minecraft-modrinth::strings.notifications.install_failed_body'))
+                                                ->body(static::failureBody($exception, 'minecraft-modrinth::strings.notifications.install_failed_body'))
                                                 ->danger()
                                                 ->send();
                                         }
@@ -355,7 +408,18 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 
                         return is_null($installedMod);
                     })
+                    ->authorize(fn () => static::userCan(SubuserPermission::FileCreate))
                     ->action(function (array $record) {
+                        static::ensureUserCan(SubuserPermission::FileCreate);
+
+                        if ($this->getInstalledMod($record['project_id']) !== null) {
+                            // Installed in the meantime (another tab, the automatic update): an
+                            // install now would replace it without asking.
+                            $this->forgetInstalledState();
+
+                            return;
+                        }
+
                         try {
                             /** @var Server $server */
                             $server = Filament::getTenant();
@@ -381,8 +445,8 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                             Notification::make()
                                 ->title(trans('minecraft-modrinth::strings.notifications.install_success'))
                                 ->body(trans('minecraft-modrinth::strings.notifications.install_success_body', [
-                                    'name' => $record['title'],
-                                    'version' => $latestVersion['version_number'],
+                                    'name' => e($record['title']),
+                                    'version' => e($latestVersion['version_number']),
                                 ]))
                                 ->success()
                                 ->send();
@@ -393,7 +457,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 
                             Notification::make()
                                 ->title(trans('minecraft-modrinth::strings.notifications.install_failed'))
-                                ->body(trans('minecraft-modrinth::strings.notifications.install_failed_body'))
+                                ->body(static::failureBody($exception, 'minecraft-modrinth::strings.notifications.install_failed_body'))
                                 ->danger()
                                 ->send();
                         }
@@ -418,6 +482,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 
                         return $installedMod['version_id'] !== $versions[0]['id'];
                     })
+                    ->authorize(fn () => static::userCan(SubuserPermission::FileCreate, SubuserPermission::FileDelete))
                     ->requiresConfirmation()
                     ->modalHeading(trans('minecraft-modrinth::strings.modals.update_heading'))
                     ->modalDescription(function (array $record) {
@@ -430,6 +495,8 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                         ]);
                     })
                     ->action(function (array $record) {
+                        static::ensureUserCan(SubuserPermission::FileCreate, SubuserPermission::FileDelete);
+
                         try {
                             /** @var Server $server */
                             $server = Filament::getTenant();
@@ -461,7 +528,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                             Notification::make()
                                 ->title(trans('minecraft-modrinth::strings.notifications.update_success'))
                                 ->body(trans('minecraft-modrinth::strings.notifications.update_success_body', [
-                                    'version' => $latestVersion['version_number'],
+                                    'version' => e($latestVersion['version_number']),
                                 ]))
                                 ->success()
                                 ->send();
@@ -472,7 +539,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
 
                             Notification::make()
                                 ->title(trans('minecraft-modrinth::strings.notifications.update_failed'))
-                                ->body(trans('minecraft-modrinth::strings.notifications.update_failed_body'))
+                                ->body(static::failureBody($exception, 'minecraft-modrinth::strings.notifications.update_failed_body'))
                                 ->danger()
                                 ->send();
                         }
@@ -506,10 +573,13 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                     ->visible(function (array $record) {
                         return !is_null($this->getInstalledMod($record['project_id']));
                     })
+                    ->authorize(fn () => static::userCan(SubuserPermission::FileDelete))
                     ->requiresConfirmation()
                     ->modalHeading(fn (array $record) => trans('minecraft-modrinth::strings.modals.uninstall_heading'))
                     ->modalDescription(fn (array $record) => trans('minecraft-modrinth::strings.modals.uninstall_description', ['name' => $record['title']]))
                     ->action(function (array $record) {
+                        static::ensureUserCan(SubuserPermission::FileDelete);
+
                         try {
                             /** @var Server $server */
                             $server = Filament::getTenant();
@@ -541,7 +611,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                                 Notification::make()
                                     ->title(trans('minecraft-modrinth::strings.notifications.uninstall_partial'))
                                     ->body(trans('minecraft-modrinth::strings.notifications.uninstall_partial_body', [
-                                        'name' => $record['title'],
+                                        'name' => e($record['title']),
                                     ]))
                                     ->warning()
                                     ->send();
@@ -552,7 +622,7 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                             Notification::make()
                                 ->title(trans('minecraft-modrinth::strings.notifications.uninstall_success'))
                                 ->body(trans('minecraft-modrinth::strings.notifications.uninstall_success_body', [
-                                    'name' => $record['title'],
+                                    'name' => e($record['title']),
                                 ]))
                                 ->success()
                                 ->send();
@@ -601,7 +671,9 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
                             ->badge(),
                         TextEntry::make('Loader')
                             ->state(fn () => MinecraftModrinth::getLoaderFromServer($server)['display_name'] ?? trans('minecraft-modrinth::strings.page.unknown'))
-                            ->icon(fn () => new HtmlString(MinecraftModrinth::getLoaderFromServer($server)['icon'] ?? ''))
+                            // A static icon: the loader icon from the Modrinth API is raw SVG markup,
+                            // which must never be rendered as HTML.
+                            ->icon('tabler-puzzle')
                             ->badge(),
                         TextEntry::make('installed')
                             ->label(fn () => trans('minecraft-modrinth::strings.page.installed', ['type' => static::$modrinthProjectType?->getLabel() ?? 'Modrinth']))

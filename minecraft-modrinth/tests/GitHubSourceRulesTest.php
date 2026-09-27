@@ -228,5 +228,71 @@ check(!str_contains(R::redact("failed with $token"), 'abcdefghijklmnop'), 'fine-
 check(!str_contains(R::redact('ghp_'.str_repeat('x', 36)), str_repeat('x', 36)), 'classic token redacted');
 check(!str_contains((new GitHubSourceException('network', "Bearer $token"))->getMessage(), 'abcdefghijklmnop'), 'exception message redacted');
 
+// Offers: new / dismissed / manual / updates, per platform
+$paper = fn (string $id, string $name, string $version = '1.0.0') => R::validateIndexEntry($entry([
+    'id' => $id, 'name' => $name, 'version' => $version, 'path' => "minecraft/$name/$id-$version.jar",
+]));
+$velocity = fn (string $id, string $name, string $version = '1.0.0') => R::validateIndexEntry($entry([
+    'id' => $id, 'name' => $name, 'platform' => 'velocity', 'version' => $version, 'path' => "minecraft/$name/$id-$version.jar",
+]));
+$installedEntry = fn (array $plugin, string $version, ?string $filename = null) => [
+    'id' => $plugin['id'], 'version' => $version, 'sha256' => $plugin['sha256'], 'filename' => $filename ?? $plugin['filename'],
+];
+
+$pNew = $paper('newpaper', 'NewPaper');
+$pUpd = $paper('updpaper', 'UpdPaper', '2.0.0');
+$pManual = $paper('manualpaper', 'ManualPaper');
+$pSame = $paper('samepaper', 'SamePaper');
+$vNew = $velocity('newvelo', 'NewVelo');
+$all = [$pNew, $pUpd, $pManual, $pSame, $vNew];
+$installedList = [$installedEntry($pUpd, '1.0.0', 'updpaper-1.0.0.jar'), $installedEntry($pSame, '1.0.0')];
+$jars = ['updpaper-1.0.0.jar', $pSame['filename'], 'ManualPaper.jar', 'LuckPerms-Bukkit-5.4.jar'];
+
+check(R::pluginsForPlatform($all, 'paper') === [$pNew, $pUpd, $pManual, $pSame], 'paper server sees only paper plugins');
+check(R::pluginsForPlatform($all, 'velocity') === [$vNew], 'velocity server sees only velocity plugins');
+check(R::pluginsForPlatform($all, null) === [], 'server without platform sees nothing');
+check(R::pluginsForPlatform($all, 'fabric') === [], 'unknown platform sees nothing');
+
+check(R::pluginState($pNew, null, false, false) === 'new', 'not installed = new');
+check(R::pluginState($pNew, null, true, false) === 'dismissed', 'dismissed');
+check(R::pluginState($pNew, null, true, true) === 'manual', 'manual copy wins over dismissed');
+check(R::pluginState($pNew, null, false, true) === 'manual', 'manual copy is not new');
+check(R::pluginState($pUpd, $installedEntry($pUpd, '1.0.0'), true, false) === 'update_available', 'dismissal does not hide an update');
+check(R::pluginState($pSame, $installedEntry($pSame, '1.0.0'), false, false) === 'up_to_date', 'up to date');
+check(R::pluginState($pSame, ['version' => '1.0.0', 'sha256' => str_repeat('b', 64)], false, false) === 'modified', 'modified');
+check(R::pluginState($pSame, $installedEntry($pSame, '2.0.0'), false, false) === 'repo_older', 'repo older');
+
+check(R::hasUnmanagedCopy($pManual, $jars, ['updpaper-1.0.0.jar']), 'manual jar named after the plugin');
+check(!R::hasUnmanagedCopy($pNew, $jars, ['updpaper-1.0.0.jar']), 'no copy of a new plugin');
+check(!R::hasUnmanagedCopy($pSame, [$pSame['filename']], [$pSame['filename']]), 'our own jar is not an unmanaged copy');
+check(R::hasUnmanagedCopy($pNew, ['newpaper-0.9.0.jar'], []), 'older version of the file is a copy');
+
+$offers = R::offers($all, 'paper', $installedList, [], $jars);
+check(array_column($offers['new'], 'id') === ['newpaper'], 'paper: only the really new plugin is offered');
+check(array_column($offers['updates'], 'id') === ['updpaper'], 'paper: update offered');
+
+$offers = R::offers($all, 'paper', $installedList, ['newpaper'], $jars);
+check($offers['new'] === [] && count($offers['updates']) === 1, 'dismissed plugin not offered');
+
+$offers = R::offers($all, 'velocity', [], [], []);
+check(array_column($offers['new'], 'id') === ['newvelo'] && $offers['updates'] === [], 'velocity: only the velocity plugin is offered');
+
+$offers = R::offers($all, null, [], [], []);
+check($offers === ['new' => [], 'updates' => []], 'no platform: nothing offered');
+
+// A velocity server with a paper plugin in its (odd) metadata still gets no paper offers.
+$offers = R::offers($all, 'velocity', [$installedEntry($pUpd, '1.0.0')], [], []);
+check($offers['updates'] === [] && array_column($offers['new'], 'id') === ['newvelo'], 'velocity: no paper update either');
+
+check(array_column(R::pluginsToAnnounce([$pNew, $vNew], ['newpaper']), 'id') === ['newvelo'], 'already announced plugin skipped');
+check(R::pluginsToAnnounce([$pNew], ['newpaper', 'other']) === [], 'nothing left to announce');
+check(R::pluginsToAnnounce([$pNew], []) === [$pNew], 'announce new plugin');
+
+check(R::navigationBadge(null) === null, 'no cache, no badge');
+check(R::navigationBadge(['new' => 0, 'updates' => 0]) === null, 'nothing offered, no badge');
+check(R::navigationBadge(['new' => 2, 'updates' => 0]) === ['label' => '2', 'color' => 'info', 'new' => 2, 'updates' => 0], 'only new = info');
+check(R::navigationBadge(['new' => 1, 'updates' => 2])['color'] === 'warning' && R::navigationBadge(['new' => 1, 'updates' => 2])['label'] === '3', 'updates = warning, total');
+check(R::navigationBadge(['new' => '1', 'updates' => 0]) === null, 'garbage in cache, no badge');
+
 echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
 exit(Result::$failures === 0 ? 0 : 1);

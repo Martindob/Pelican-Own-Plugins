@@ -44,6 +44,8 @@ class GitHubSourceException extends RuntimeException
 
     public const DAEMON = 'daemon';
 
+    public const OFFER_STORE = 'offer_store';
+
     public function __construct(public readonly string $reason, string $message, public readonly ?int $retryAfter = null)
     {
         parent::__construct(GitHubSourceRules::redact($message));

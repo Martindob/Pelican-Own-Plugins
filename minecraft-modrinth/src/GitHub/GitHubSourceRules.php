@@ -430,6 +430,165 @@ final class GitHubSourceRules
         return 60;
     }
 
+    // ------------------------------------------------------------------
+    // Offers: new plugins and updates for one server
+    // ------------------------------------------------------------------
+
+    /**
+     * The index entries meant for a server of this platform. A server whose platform couldn't be
+     * determined (null) gets nothing at all - no Paper plugin on a Velocity proxy or vice versa.
+     *
+     * @template T of array{platform: string}
+     *
+     * @param  array<int, T>  $plugins
+     * @return array<int, T>
+     */
+    public static function pluginsForPlatform(array $plugins, ?string $platform): array
+    {
+        if ($platform === null || !in_array($platform, self::PLATFORMS, true)) {
+            return [];
+        }
+
+        return array_values(array_filter($plugins, fn (array $plugin) => $plugin['platform'] === $platform));
+    }
+
+    /**
+     * Whether plugins/ holds a jar that looks like this plugin but isn't one this plugin manages
+     * (a manual install, a Modrinth copy, ...). Such a plugin is not offered as new: it's there.
+     *
+     * @param  array{filename: string, name: string}  $plugin
+     * @param  array<int, string>  $jarNames  jar names currently in plugins/
+     * @param  array<int, string>  $managedFilenames  jar names recorded in the metadata file
+     */
+    public static function hasUnmanagedCopy(array $plugin, array $jarNames, array $managedFilenames): bool
+    {
+        foreach ($jarNames as $name) {
+            if (in_array($name, $managedFilenames, true)) {
+                continue;
+            }
+
+            if (self::looksLikeSamePlugin($name, $plugin['filename'], $plugin['name'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * State of one index entry on one server.
+     *
+     * - new: not installed, not dismissed for this server, no unmanaged copy -> offered
+     * - dismissed: not installed, an admin said it doesn't belong on this server -> hidden
+     * - manual: not installed from here, but a jar of it is already in plugins/
+     * - update_available / up_to_date / repo_older / modified: installed from here
+     *
+     * @param  array{version: string, sha256: string}  $plugin
+     * @param  array{version: string, sha256: string}|null  $installed
+     */
+    public static function pluginState(array $plugin, ?array $installed, bool $dismissed, bool $unmanagedCopy): string
+    {
+        if ($installed === null) {
+            return match (true) {
+                $unmanagedCopy => 'manual',
+                $dismissed => 'dismissed',
+                default => 'new',
+            };
+        }
+
+        if (self::isNewerVersion($plugin['version'], $installed['version'])) {
+            return 'update_available';
+        }
+
+        if (!self::isValidVersion($installed['version']) || self::compareVersions($plugin['version'], $installed['version']) < 0) {
+            return 'repo_older';
+        }
+
+        return $installed['sha256'] === $plugin['sha256'] ? 'up_to_date' : 'modified';
+    }
+
+    /**
+     * What the repository offers one server: plugins to install (new) and to update.
+     *
+     * @template T of array{id: string, name: string, platform: string, version: string, filename: string, sha256: string}
+     *
+     * @param  array<int, T>  $plugins  the whole index
+     * @param  array<int, array{id: string, version: string, sha256: string, filename: string}>  $installed
+     * @param  array<int, string>  $dismissedIds
+     * @param  array<int, string>  $jarNames
+     * @return array{new: array<int, T>, updates: array<int, T>}
+     */
+    public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames): array
+    {
+        $byId = [];
+        foreach ($installed as $entry) {
+            $byId[$entry['id']] = $entry;
+        }
+        $managed = array_column($installed, 'filename');
+
+        $offers = ['new' => [], 'updates' => []];
+
+        foreach (self::pluginsForPlatform($plugins, $platform) as $plugin) {
+            $state = self::pluginState(
+                $plugin,
+                $byId[$plugin['id']] ?? null,
+                in_array($plugin['id'], $dismissedIds, true),
+                !isset($byId[$plugin['id']]) && self::hasUnmanagedCopy($plugin, $jarNames, $managed),
+            );
+
+            if ($state === 'new') {
+                $offers['new'][] = $plugin;
+            } elseif ($state === 'update_available') {
+                $offers['updates'][] = $plugin;
+            }
+        }
+
+        return $offers;
+    }
+
+    /**
+     * The new plugins a server hasn't been told about yet (each plugin is announced once per
+     * server, whatever its version).
+     *
+     * @template T of array{id: string}
+     *
+     * @param  array<int, T>  $new
+     * @param  array<int, string>  $notifiedIds
+     * @return array<int, T>
+     */
+    public static function pluginsToAnnounce(array $new, array $notifiedIds): array
+    {
+        return array_values(array_filter($new, fn (array $plugin) => !in_array($plugin['id'], $notifiedIds, true)));
+    }
+
+    /**
+     * Navigation badge for cached offer counts: the total, or null when there is nothing
+     * (or nothing known) to offer. Updates make it "warning", only new plugins "info".
+     *
+     * @param  mixed  $counts  whatever the cache returned
+     * @return array{label: string, color: string, new: int, updates: int}|null
+     */
+    public static function navigationBadge(mixed $counts): ?array
+    {
+        if (!is_array($counts) || !is_int($counts['new'] ?? null) || !is_int($counts['updates'] ?? null)) {
+            return null;
+        }
+
+        $new = max(0, $counts['new']);
+        $updates = max(0, $counts['updates']);
+
+        if ($new + $updates === 0) {
+            return null;
+        }
+
+        return [
+            'label' => (string) ($new + $updates),
+            'color' => $updates > 0 ? 'warning' : 'info',
+            'new' => $new,
+            'updates' => $updates,
+        ];
+    }
+
     /** Hosts a GitHub API response may redirect a download to (never sent the token). */
     public static function isAllowedRedirectHost(string $host): bool
     {

@@ -272,9 +272,9 @@ class GitHubPluginService
      * @param  array<int, IndexPlugin>  $plugins
      * @return array<int, IndexPlugin>
      */
-    public function pluginsForPlatform(array $plugins, string $platform): array
+    public function pluginsForPlatform(array $plugins, ?string $platform): array
     {
-        return array_values(array_filter($plugins, fn (array $plugin) => $plugin['platform'] === $platform));
+        return GitHubSourceRules::pluginsForPlatform($plugins, $platform);
     }
 
     /**
@@ -566,7 +566,7 @@ class GitHubPluginService
      *
      * @throws GitHubSourceException
      */
-    protected function listJarNames(Server $server): array
+    public function listJarNames(Server $server): array
     {
         try {
             $files = app(DaemonFileRepository::class)->setServer($server)->getDirectory(self::FOLDER);
@@ -745,6 +745,12 @@ class GitHubPluginService
             } catch (GitHubSourceException $exception) {
                 $this->reportOncePerWindow("server:{$server->id}:update:{$plugin['id']}:{$exception->reason}", $exception);
             }
+        }
+
+        if (!empty($updated)) {
+            // The cached offer count still includes these updates: drop it, the next offer check
+            // (or a visit of the page) counts again.
+            app(GitHubOffers::class)->forgetCounts($server);
         }
 
         return $updated;

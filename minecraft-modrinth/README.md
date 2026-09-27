@@ -2,7 +2,7 @@
 
 Easily download, update, and manage Minecraft mods and plugins directly from Modrinth within the server panel - and, optionally, plugins from a GitHub repository that ships pre-built jars (see [GitHub repository source](#github-repository-source)).
 
-> Originally created by [Boy132](https://github.com/Boy132) & [H1ghSyst3m](https://github.com/H1ghSyst3m) as part of [pelican-dev/plugins](https://github.com/pelican-dev/plugins), licensed under GPLv3 (see [LICENSE](LICENSE)). Modified by Martindob since September 2026 (search/filter fixes, Czech translation, "Always Use Latest Version" setting, automatic daily updates, the GitHub repository source, and various fixes — see the commit history for full details).
+> Originally created by [Boy132](https://github.com/Boy132) & [H1ghSyst3m](https://github.com/H1ghSyst3m) as part of [pelican-dev/plugins](https://github.com/pelican-dev/plugins), licensed under GPLv3 (see [LICENSE](LICENSE)). Modified by Martindob since September 2026 (search/filter fixes, Czech translation, "Always Use Latest Version" setting, automatic daily updates, the GitHub repository source with offers of new plugins, and various fixes — see the commit history for full details).
 
 ## Setup
 
@@ -27,7 +27,7 @@ Also make sure your egg has the `minecraft` _tag_ and a tag matching a Modrinth 
 - **Version Compatibility**: Automatic filtering by Minecraft version and mod loader
 - **Seamless Installation**: Downloads to the correct server directory (mods/ or plugins/)
 - **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction
-- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI
+- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI; new plugins in the repository are offered (never installed automatically)
 - **Multilingual**: Supports English, German and Czech translations
 
 ## GitHub repository source
@@ -120,7 +120,48 @@ Individual invalid entries are skipped and logged.
   installed, only to a higher version, and only from a commit with green CI - regardless of the
   "Require green CI" setting. Nothing new is ever installed automatically.
 - Page access requires the subuser permission *file.read*; installing requires *file.create*,
-  updating *file.create* and *file.delete*, removing *file.delete*.
+  updating *file.create* and *file.delete*, removing *file.delete*; hiding an offer ("Doesn't
+  belong on this server") and "Offer again" require *file.create*.
+
+### New plugins
+
+When the repository gets a plugin that a server doesn't have yet, the panel **offers** it - it is
+never installed automatically.
+
+- **What counts as new**: a plugin in the index for the server's platform (`paper` plugins only on
+  Paper/Purpur/... servers, `velocity` plugins only on Velocity servers) that is not installed from
+  the repository on that server and that nobody has hidden for that server. A server whose
+  platform can't be determined (no loader tag, no plugins feature) is offered nothing. A plugin
+  whose jar is already in `plugins/` without being installed from here (a manual install, a
+  Modrinth copy - recognised like the conflict check above) shows as **Installed manually** and
+  is not offered.
+- **GitHub Plugins page**: new plugins are listed first with the label **New - offered for
+  installation** (then available updates), with a note above the table. Next to **Install** there
+  is **Doesn't belong on this server**, which hides the offer on that server only. Hidden plugins
+  can be shown with **Show hidden (n)** and brought back with **Offer again**.
+- **Menu badge**: the *GitHub Plugins* menu item shows how many plugins are offered (new plus
+  updates) - orange when there are updates, blue when there are only new plugins; the tooltip
+  splits the number. The badge only reads a cached count (written by the hourly check below and by
+  every visit of the page), so drawing the menu never contacts GitHub or the server's node; while
+  there is no count (e.g. right after the plugin update, until the first check) there is no badge.
+- **Notifications**: an hourly check (`p:minecraft-modrinth:github-offers`, runs only while the
+  GitHub source is enabled) reads the repository state once for all servers, then the metadata
+  file and the jar list of `plugins/` of every Paper/Velocity server (two Wings requests per server;
+  suspended and not yet installed servers are skipped). For every new plugin a server hasn't been
+  told about yet, the panel sends a notification (the bell in the panel): *"On server {server},
+  the new plugin {name} {version} from the repository is available for installation"*, with a
+  button to the GitHub Plugins page. Each plugin is announced **once per server** - not again for
+  a newer version, after a hide/offer again, or after it was removed; more than three new plugins
+  at once are announced in one notification. With *Require green CI* on, nothing is announced
+  while CI of the newest commit isn't green (the next check after it turns green does it).
+- **Who is notified**: the server owner and every subuser with *file.create* on that server (the
+  people who can install it). Panel admins are not notified for every server they can see - they
+  see the badge when they open a server.
+- **Where it is stored**: hidden offers and which plugins were announced are kept per server in
+  the panel database (table `minecraft_modrinth_github_offers`, created by the plugin's migration
+  when the plugin is installed or updated, deleted together with the server). The server's
+  `plugins/.github-plugins.json` stays exactly as in 1.2.0. If the table is missing (migration not
+  run), offers are still shown and counted, but hiding is not possible and nothing is announced.
 
 ### Moving manually installed plugins over
 

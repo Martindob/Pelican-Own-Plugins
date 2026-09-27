@@ -5,7 +5,7 @@ A personal collection of [Pelican Panel](https://pelican.dev) plugins, forked fr
 ## Plugins
 
 - [Player Counter](/player-counter) - Show connected players count for game servers, including Velocity/BungeeCord/Waterfall proxy support
-- [Minecraft Modrinth](/minecraft-modrinth) - Download, update and automatically keep up to date Minecraft mods & plugins from Modrinth
+- [Minecraft Modrinth](/minecraft-modrinth) - Download, update and automatically keep up to date Minecraft mods & plugins from Modrinth, and plugins from a GitHub repository with pre-built jars
 - [Paper & Velocity Updater](/paper-velocity-updater) - Automatically downloads the newest Paper/Velocity build for a server before it (re)starts
 
 ## License

@@ -74,9 +74,10 @@ happened to fire before a slow download finished.
 
 **Phase 2 - swapping (on the next `start`/`restart`):**
 
-5. When a `start` or `restart` power action is sent to a server (from the console, the client API,
-   or a scheduled task), the plugin intercepts it before it reaches Wings and checks whether
-   anything is staged for it.
+5. When a `start` or `restart` power action is sent to a server through the panel's own API - a
+   Schedule's "Power Action" task, or the client API - the plugin intercepts it before it reaches
+   Wings and checks whether anything is staged for it. **Not** the Console page's own buttons - see
+   the note on this under Limitations below.
 6. If so, the existing jar is renamed to `<jarfile>.old` (best-effort, mirroring what the official
    install scripts themselves do before installing a new jar - an easy manual recovery path if a
    downloaded jar ever turns out to be bad; only a single rolling `.old` backup is ever kept, so
@@ -170,10 +171,24 @@ CDN is, since that download already happened, on its own schedule, before the re
   wait isn't enough, this restart's swap is simply skipped (the pending update stays staged and is
   retried on the *next* restart) - it never delays or fails the actual power action over this.
   `stop`/`kill` are untouched by this plugin entirely (it only hooks `start`/`restart`).
-- This only runs for power actions sent through the panel (console, client API, scheduled tasks).
-  If Wings itself restarts a crashed server without asking the panel, no swap happens for that
-  particular restart - the update stays staged and is applied on the next one that does go through
-  the panel.
+- **The Console page's own Start/Restart/Stop/Kill buttons do NOT trigger a swap.** Checked directly
+  against the panel's own source: those buttons send the signal over the browser's own WebSocket
+  connection straight to Wings (`resources/views/filament/components/server-console.blade.php`,
+  `socket.send({'event': 'set state', ...})`) - there is no panel-side PHP code in that path at all
+  for this plugin (or any plugin) to hook into. This is a hard protocol limitation Wings itself would
+  have to address, not something a Pelican plugin can intercept.
+  A restart **does** go through this plugin, and does swap in a staged update, when it's sent through
+  a panel API instead of the browser's console - which is exactly how the two ways you'd realistically
+  automate a restart already work:
+  - A **Schedule** with a "Power Action" task (checked directly against the panel's own
+    `TaskServiceProvider`: `PowerActionSchema` is constructed with the same `DaemonServerRepository`
+    this plugin decorates) - this is what a scheduled daily restart already uses, so it needs no
+    changes to pick up staged updates.
+  - The **client API** (`POST /api/client/servers/{id}/power` with an API key) - what an external
+    script or the "restart my server" button in some third-party integrations would use.
+  To manually verify a swap without waiting for a scheduled restart, use one of these two instead of
+  the Console page's buttons - e.g. a one-off Schedule task set to run in a minute, or a client API
+  call with `curl`.
 - Only `STABLE` channel builds are used for automatic updates. If a pinned version only has
   `BETA`/`ALPHA` builds, the newest available build is used instead.
 - A failed *check* (e.g. PaperMC being unreachable, or a pinned version that can't be verified)

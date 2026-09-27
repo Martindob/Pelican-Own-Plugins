@@ -11,9 +11,16 @@ use Martindob\PaperVelocityUpdater\Services\PaperVelocityUpdateService;
  * Decorates the panel's own DaemonServerRepository so that a "start"/"restart"
  * power action applies whatever update was already staged in the background
  * (see PaperVelocityUpdateService::checkForUpdates(), run on a schedule),
- * right before the signal is forwarded to Wings. This covers both manual
- * power actions (console, client API) and the "Power Action" scheduled task,
- * since both resolve this class out of the container.
+ * right before the signal is forwarded to Wings. This covers the client API
+ * and a Schedule's "Power Action" task, both of which resolve this class out
+ * of the container (checked directly against the panel's own PowerController
+ * and TaskServiceProvider).
+ *
+ * Deliberately does NOT cover the Console page's own Start/Restart/Stop/Kill
+ * buttons: those send the signal over the browser's own WebSocket connection
+ * straight to Wings (server-console.blade.php's `socket.send({'event': 'set
+ * state', ...})`), with no panel-side PHP code in that path at all - there is
+ * nothing here to hook for that specific interaction.
  */
 class UpdateCheckingDaemonServerRepository extends DaemonServerRepository
 {

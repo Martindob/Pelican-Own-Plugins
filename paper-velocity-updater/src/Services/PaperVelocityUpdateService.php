@@ -475,12 +475,24 @@ class PaperVelocityUpdateService
         // is otherwise trusted as-is - if that response were ever spoofed
         // (a compromised DNS/CDN/MITM) it could point Wings at an
         // attacker-controlled file. Fill only ever serves its own
-        // downloads, so pinning to its own host closes that path off
+        // downloads, so pinning to its own hosts closes that path off
         // without narrowing anything Fill would legitimately return.
+        //
+        // Verified live against real build responses for both projects:
+        // the actual jar is served from fill-data.papermc.io (Fill's own
+        // object storage, per its documented host list at
+        // docs.papermc.io/misc/downloads-service/), not fill.papermc.io
+        // itself - that only ever appeared as the *API* host, never inside
+        // a downloads.*.url field. An earlier version of this allowlist
+        // didn't include fill-data.papermc.io at all, so this check
+        // rejected every single real response it was ever given - the
+        // entire plugin never staged an update for any server, and the
+        // reason string logged before this comment existed was itself the
+        // only clue.
         $downloadHost = strtolower((string) parse_url((string) $download['url'], PHP_URL_HOST));
         $downloadScheme = strtolower((string) parse_url((string) $download['url'], PHP_URL_SCHEME));
-        if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'api.papermc.io'], true)) {
-            $this->logSkipOncePerDay($server, 'The resolved download URL failed validation (unexpected host/scheme) - refusing it for safety.');
+        if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'fill-data.papermc.io'], true)) {
+            $this->logSkipOncePerDay($server, "The resolved download URL failed validation (host \"$downloadHost\", scheme \"$downloadScheme\") - refusing it for safety.");
 
             return null;
         }

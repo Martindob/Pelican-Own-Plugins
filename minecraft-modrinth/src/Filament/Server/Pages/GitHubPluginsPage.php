@@ -354,6 +354,11 @@ class GitHubPluginsPage extends Page implements HasTable
         ];
     }
 
+    protected function countUpdateAvailable(): int
+    {
+        return count(array_keys(array_column($this->getAllRows(), 'state'), 'update_available', true));
+    }
+
     protected function ciAllowsInstall(): bool
     {
         $snapshot = $this->getSnapshot();
@@ -523,6 +528,40 @@ class GitHubPluginsPage extends Page implements HasTable
 
     protected function install(string $id, bool $isUpdate): void
     {
+        $result = $this->attemptInstall($id, $isUpdate);
+
+        if ($result['ok']) {
+            Notification::make()
+                ->title(trans($isUpdate ? 'minecraft-modrinth::strings.notifications.update_success' : 'minecraft-modrinth::strings.notifications.install_success'))
+                ->body(trans('minecraft-modrinth::strings.github.notifications.installed_body', [
+                    'name' => e($result['name']),
+                    'version' => e($result['version']),
+                ]))
+                ->success()
+                ->send();
+        } else {
+            Notification::make()
+                ->title(trans($result['partial']
+                    ? 'minecraft-modrinth::strings.github.notifications.old_jar_pending_title'
+                    : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed')))
+                ->body($result['message'])
+                ->status($result['partial'] ? 'warning' : 'danger')
+                ->persistent()
+                ->send();
+        }
+
+        $this->forgetState();
+    }
+
+    /**
+     * Core of install()/updateAll(): installs or updates one plugin and reports what happened,
+     * without sending a notification itself - install() sends one immediately, updateAll() folds
+     * several of these into a single summary notification instead.
+     *
+     * @return array{ok: bool, name: ?string, version: ?string, message: ?string, partial: bool}
+     */
+    protected function attemptInstall(string $id, bool $isUpdate): array
+    {
         $server = static::server();
 
         // Also checked here: the action's own authorization is the first line, not the only one.
@@ -533,7 +572,10 @@ class GitHubPluginsPage extends Page implements HasTable
         try {
             // The current state whenever the rate limit allows it: the confirmation may have been
             // open for a while. Otherwise the cached state (head <= 5 min, CI <= 10 min) is used -
-            // the CI rule still holds for exactly the commit that gets installed.
+            // the CI rule still holds for exactly the commit that gets installed. In updateAll()'s
+            // loop, only the first plugin can actually trigger a fresh GitHub read per the
+            // per-server rate limit (see mayRefreshFromGitHub()); the rest reuse that same read
+            // from the service's own cache, not a stale one from before the loop started.
             if ($this->mayRefreshFromGitHub()) {
                 static::service()->forgetCachedState();
             }
@@ -557,25 +599,75 @@ class GitHubPluginsPage extends Page implements HasTable
 
             $entry = static::service()->installOrUpdate($server, $plugin, $snapshot, static::service()->requiresGreenCi(), $isUpdate);
 
-            Notification::make()
-                ->title(trans($isUpdate ? 'minecraft-modrinth::strings.notifications.update_success' : 'minecraft-modrinth::strings.notifications.install_success'))
-                ->body(trans('minecraft-modrinth::strings.github.notifications.installed_body', [
-                    'name' => e($entry['name']),
-                    'version' => e($entry['version']),
-                ]))
-                ->success()
-                ->send();
+            return [
+                'ok' => true,
+                'name' => $entry['name'],
+                'version' => $entry['version'],
+                'message' => null,
+                'partial' => false,
+            ];
         } catch (GitHubSourceException $exception) {
             static::service()->reportOncePerWindow("ui:{$server->id}:$id:{$exception->reason}", $exception);
 
-            $partial = $exception->reason === GitHubSourceException::OLD_JAR_PENDING;
+            return [
+                'ok' => false,
+                'name' => null,
+                'version' => null,
+                'message' => $exception->getUserMessage(),
+                'partial' => $exception->reason === GitHubSourceException::OLD_JAR_PENDING,
+            ];
+        }
+    }
 
+    /**
+     * Updates every plugin currently showing "update_available" on this page in one action,
+     * instead of clicking each plugin's own update button in turn. Each is still updated
+     * independently through attemptInstall() - one failing (a checksum mismatch, a file
+     * conflict, ...) never stops the rest - and the page ends up in exactly the state it would
+     * if every update had been clicked one at a time. The only difference from doing that by hand
+     * is the notification: one summary here instead of one toast per plugin, which would otherwise
+     * stack up for a server with several updates pending.
+     */
+    protected function updateAll(): void
+    {
+        if (!static::userCan(SubuserPermission::FileCreate, SubuserPermission::FileDelete)) {
+            abort(403);
+        }
+
+        $candidates = array_values(array_filter($this->getRows(), fn (array $row) => $row['state'] === 'update_available'));
+
+        if (empty($candidates)) {
+            $this->forgetState();
+
+            return;
+        }
+
+        $succeededCount = 0;
+        $failures = [];
+
+        foreach ($candidates as $row) {
+            $result = $this->attemptInstall($row['id'], true);
+
+            if ($result['ok']) {
+                $succeededCount++;
+            } else {
+                $failures[] = "{$row['name']}: {$result['message']}";
+            }
+        }
+
+        if (empty($failures)) {
             Notification::make()
-                ->title(trans($partial
-                    ? 'minecraft-modrinth::strings.github.notifications.old_jar_pending_title'
-                    : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed')))
-                ->body($exception->getUserMessage())
-                ->status($partial ? 'warning' : 'danger')
+                ->title(trans_choice('minecraft-modrinth::strings.github.notifications.update_all_success', $succeededCount, ['count' => $succeededCount]))
+                ->success()
+                ->send();
+        } else {
+            Notification::make()
+                ->title(trans('minecraft-modrinth::strings.github.notifications.update_all_partial', [
+                    'succeeded' => $succeededCount,
+                    'total' => count($candidates),
+                ]))
+                ->body(implode("\n", $failures))
+                ->status($succeededCount > 0 ? 'warning' : 'danger')
                 ->persistent()
                 ->send();
         }
@@ -645,6 +737,18 @@ class GitHubPluginsPage extends Page implements HasTable
     protected function getHeaderActions(): array
     {
         return [
+            Action::make('update_all')
+                ->label(fn () => trans('minecraft-modrinth::strings.github.offers.update_all', ['count' => $this->countUpdateAvailable()]))
+                ->icon('tabler-refresh-dot')
+                ->color('warning')
+                ->visible(fn () => $this->countUpdateAvailable() > 0)
+                ->disabled(fn () => !$this->ciAllowsInstall())
+                ->tooltip(fn () => $this->ciAllowsInstall() ? null : trans('minecraft-modrinth::strings.github.page.ci_blocks_install'))
+                ->authorize(fn () => static::userCan(SubuserPermission::FileCreate, SubuserPermission::FileDelete))
+                ->requiresConfirmation()
+                ->modalHeading(trans('minecraft-modrinth::strings.github.modals.update_all_heading'))
+                ->modalDescription(fn () => trans_choice('minecraft-modrinth::strings.github.modals.update_all_description', $this->countUpdateAvailable(), ['count' => $this->countUpdateAvailable()]))
+                ->action(fn () => $this->updateAll()),
             Action::make('toggle_dismissed')
                 ->label(fn () => $this->showDismissed
                     ? trans('minecraft-modrinth::strings.github.offers.hide_dismissed')

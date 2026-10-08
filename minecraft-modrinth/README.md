@@ -63,7 +63,7 @@ console access doesn't see the pages at all.
 - **Seamless Installation**: Downloads to the correct server directory (mods/ or plugins/)
 - **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction (servers that are suspended, installing, being transferred or restored are skipped; one failing server never stops the run for the others)
 - **Verified Downloads**: The panel downloads every Modrinth file itself, only from `https://cdn.modrinth.com`, and checks it against the size and sha512 Modrinth publishes before it is written to the server
-- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI; new plugins in the repository are offered (never installed automatically)
+- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI, individually or all pending updates at once; new plugins in the repository are offered (never installed automatically)
 - **Multilingual**: Supports English, German and Czech translations
 
 ## GitHub repository source
@@ -175,6 +175,13 @@ Individual invalid entries are skipped and logged.
   `plugins/` and install them again from the page (their configuration folders stay).
 - The running server keeps using what it loaded: **a new or updated plugin is used after the next
   server restart**.
+- **Update all**: shown on the GitHub Plugins page whenever at least one installed plugin has an
+  update available, labelled with the count. Updates every one of them, each independently through
+  the same install/update logic a single plugin's own **Update** button uses - one plugin failing
+  (a checksum mismatch, a file conflict, GitHub being briefly unreachable, ...) never stops the
+  rest. Ends in a single summary notification ("Updated 5 plugins", or "Updated 4 of 6 plugins"
+  with what failed and why) instead of one per plugin. Subject to the same green-CI gate and rate
+  limit as a single update - and the same permissions (see below).
 - **Automatic updates** (daily, at the configured time) only update plugins that are already
   installed, only to a higher version, and only from a commit with green CI - regardless of the
   "Require green CI" setting. Nothing new is ever installed automatically. Servers in a conflict

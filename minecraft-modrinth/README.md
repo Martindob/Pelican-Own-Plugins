@@ -1,4 +1,4 @@
-# Minecraft Modrinth (by Boy132 & H1ghSyst3m, fork maintained by Martindob)
+# Minecraft Modrinth & GitHub (by Boy132 & H1ghSyst3m, fork maintained by Martindob)
 
 Easily download, update, and manage Minecraft mods and plugins directly from Modrinth within the server panel - and, optionally, plugins from a GitHub repository that ships pre-built jars (see [GitHub repository source](#github-repository-source)).
 
@@ -117,7 +117,7 @@ Individual invalid entries are skipped and logged.
    - Pick an expiry you'll remember to renew; an expired token shows up as "GitHub rejected the
      token" on the page and in the log.
    A public repository works without a token (with GitHub's much lower anonymous rate limit).
-2. In the panel: *Admin → Plugins → Minecraft Modrinth → Settings → GitHub repository source*:
+2. In the panel: *Admin → Plugins → Minecraft Modrinth & GitHub → Settings → GitHub repository source*:
    enable it, enter the repository (`owner/repository`), the branch (default `main`) and the index
    path (default `minecraft/releases.json`), paste the token and save. Then use **Test connection**.
    - **Require green CI** (on by default): installing and updating is only possible from a commit

@@ -1,8 +1,8 @@
 {
     "id": "minecraft-modrinth",
-    "name": "Minecraft Modrinth",
+    "name": "Minecraft Modrinth & GitHub",
     "author": "Boy132 & H1ghSyst3m (fork maintained by Martindob)",
-    "version": "1.3.2",
+    "version": "1.3.3",
     "description": "Easily download, update, and manage minecraft mods & plugins from modrinth, and plugins from a GitHub repository with pre-built jars",
     "category": "plugin",
     "url": "https://github.com/Martindob/Pelican-Own-Plugins/tree/main/minecraft-modrinth",

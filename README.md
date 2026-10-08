@@ -5,7 +5,7 @@ A personal collection of [Pelican Panel](https://pelican.dev) plugins, forked fr
 ## Plugins
 
 - [Player Counter](/player-counter) - Show connected players count for game servers, including Velocity/BungeeCord/Waterfall proxy support
-- [Minecraft Modrinth](/minecraft-modrinth) - Download, update and automatically keep up to date Minecraft mods & plugins from Modrinth, and plugins from a GitHub repository with pre-built jars (new ones are offered, never installed automatically)
+- [Minecraft Modrinth & GitHub](/minecraft-modrinth) - Download, update and automatically keep up to date Minecraft mods & plugins from Modrinth, and plugins from a GitHub repository with pre-built jars (new ones are offered, never installed automatically)
 
 > **Updating a plugin in the panel (Pelican v1.0.0-beta38):** after clicking **Update** in
 > *Admin → Plugins*, always check the plugin's status. Pelican beta38 fails halfway through its

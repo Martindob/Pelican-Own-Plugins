@@ -132,6 +132,7 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
             $color = match ($entry['level'] ?? 'info') {
                 'error' => 'rgb(220 38 38)',
                 'success' => 'rgb(22 163 74)',
+                'warning' => 'rgb(217 119 6)',
                 default => 'rgb(100 116 139)',
             };
 

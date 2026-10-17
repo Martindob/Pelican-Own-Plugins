@@ -199,10 +199,22 @@ CDN is, since that download already happened, on its own schedule, before the re
 - A failed *swap* (the daemon being briefly unreachable, the staged file having been deleted
   manually, ...) never blocks or delays the actual start/restart either - the server just starts on
   its current jar, and the update stays staged for the next restart to retry.
-- If you change `SERVER_JARFILE` or the project's version variable (or switch on `DL_PATH`) between
-  a check staging an update and the next restart, that stale staged update is discarded rather than
-  swapped in - the next hourly check stages the right thing for the new configuration instead (or
-  nothing, if you opted out via `DL_PATH`).
+- If you change `SERVER_JARFILE`, `BUILD_NUMBER` or the project's version variable (or switch on
+  `DL_PATH`) between a check staging an update and the next restart, that stale staged update is
+  not swapped in - the next hourly check stages the right thing for the new configuration instead
+  (or nothing, if you opted out via `DL_PATH`).
+- **Never downgrades automatically.** A world that has run on a newer Minecraft version can't be
+  safely opened by an older one, so if the target resolves to an older version (or a lower build)
+  than what this plugin last installed - e.g. you lower the version lock, or set it after the
+  server was already updated past it - nothing is staged and an orange warning appears under
+  **Recent activity**. Either set the version variable to the installed version, or restore a world
+  backup together with `<jarfile>.old` and delete `.paper-velocity-updater.json` from the server.
+- Before 1.3.4, the plugin read every startup variable as its egg **default** instead of the
+  server's own value (Pelican's `Server::variables()` relation returns no per-server values when
+  eager-loaded). On the official eggs that default is `latest`, so a version lock was ignored: a
+  server pinned to `26.2` stayed on 26.2 only while 26.3 had no stable build, then moved to 26.3.
+  Pinned servers that were moved that way stay where they are (see the point above) until you
+  decide how to handle them.
 - This plugin only hooks `start`/`restart` power actions - a reinstall runs the egg's own install
   script as usual, unaffected by this plugin.
 - **Only a rename ever touches the live jar - never an in-place overwrite - which is what makes it

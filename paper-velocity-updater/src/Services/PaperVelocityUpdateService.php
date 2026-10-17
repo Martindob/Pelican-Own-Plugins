@@ -155,12 +155,12 @@ class PaperVelocityUpdateService
      * actual exceptions) since a permanent condition like a pinned build
      * would otherwise repeat this every single hourly check forever.
      */
-    private function logSkipOncePerDay(Server $server, string $reason): void
+    private function logSkipOncePerDay(Server $server, string $reason, string $level = 'info'): void
     {
         $key = 'paper-velocity-updater:skip-logged:'.$server->id.':'.md5($reason);
 
         if (Cache::add($key, true, now()->addDay())) {
-            $this->logActivity('info', "Server #{$server->id} ({$server->name}): $reason");
+            $this->logActivity($level, "Server #{$server->id} ({$server->name}): $reason");
         }
     }
 
@@ -205,7 +205,7 @@ class PaperVelocityUpdateService
             return;
         }
 
-        $server->loadMissing('variables');
+        $this->loadVariables($server);
         if ($this->detectProject($server) === null) {
             return;
         }
@@ -239,7 +239,7 @@ class PaperVelocityUpdateService
     private function stage(Server $server): void
     {
         try {
-            $server->loadMissing('variables');
+            $this->loadVariables($server);
 
             if ($this->detectProject($server) === null) {
                 return;
@@ -264,6 +264,19 @@ class PaperVelocityUpdateService
 
                     if ($this->matchesTarget($state['installed'] ?? null, $target)) {
                         $this->logSkipOncePerDay($server, "Already up to date on {$target['project']} build {$target['build']} ({$target['version']}) - nothing to stage.");
+
+                        return;
+                    }
+
+                    // Never go backwards automatically: a world that has run
+                    // on a newer Minecraft version can't be safely opened by
+                    // an older one, so a target older than what this plugin
+                    // already installed (e.g. the pin was lowered, or set
+                    // after the server was already updated past it) needs a
+                    // human decision - restoring a backup, or raising the pin.
+                    $installed = $state['installed'] ?? null;
+                    if ($this->isOlderThanInstalled($target, $installed)) {
+                        $this->logSkipOncePerDay($server, "Target is {$target['project']} {$target['version']} build {$target['build']}, but {$installed['version']} build ".($installed['build'] ?? '?')." is already installed - not downgrading automatically. Either set the version variable to {$installed['version']}, or restore a world backup together with {$target['jar']}.old (the jar from before the last update) and delete ".self::STATE_FILE.'.', 'warning');
 
                         return;
                     }
@@ -332,6 +345,18 @@ class PaperVelocityUpdateService
         $project = $this->detectProject($server);
         $currentJarFile = $this->getVariable($server, 'SERVER_JARFILE') ?? ($project === 'velocity' ? 'velocity.jar' : 'server.jar');
         if ($project !== $pending['project'] || $currentJarFile !== $pending['jar'] || $this->getVariable($server, 'DL_PATH') !== null) {
+            return;
+        }
+
+        // Re-checked here, not only when staging: the pin may have been set
+        // or changed after this build was staged, and the swap is the last
+        // point where a build for the wrong version can still be stopped.
+        $buildVariable = $this->getVariable($server, 'BUILD_NUMBER');
+        $requestedVersion = $this->getRequestedVersion($server, $project);
+        if (($buildVariable !== null && !$this->isLatest($buildVariable))
+            || (!$this->isLatest($requestedVersion) && trim((string) $requestedVersion) !== ($pending['version'] ?? null))) {
+            $this->logSkipOncePerDay($server, "Not applying the staged {$pending['project']} build ".($pending['build'] ?? '?').' ('.($pending['version'] ?? '?').") - it no longer matches this server's BUILD_NUMBER/version settings.", 'warning');
+
             return;
         }
 
@@ -421,13 +446,7 @@ class PaperVelocityUpdateService
             return null;
         }
 
-        $requestedVersion = null;
-        foreach (self::PROJECT_VERSION_VARIABLES[$project] as $variableName) {
-            $requestedVersion = $this->getVariable($server, $variableName);
-            if ($requestedVersion !== null) {
-                break;
-            }
-        }
+        $requestedVersion = $this->getRequestedVersion($server, $project);
 
         // A pinned version is a hard lock: if it can't be positively
         // verified against PaperMC's own version list - genuinely invalid,
@@ -578,6 +597,73 @@ class PaperVelocityUpdateService
         }
 
         return null;
+    }
+
+    /**
+     * Loads the server's startup variables with their per-server values.
+     *
+     * Must never go through loadMissing()/load()/with(): Pelican's
+     * Server::variables() joins server_variables on `$this->id`, and Laravel
+     * eager-loads from a fresh model instance whose id is null - the join
+     * then matches nothing, every server_value comes back null, and
+     * getVariable() silently falls back to the egg's *default* values. That
+     * made a server pinned to e.g. MINECRAFT_VERSION=26.2 look like "latest"
+     * (the egg default), so it was moved to 26.3 as soon as 26.3 got a
+     * stable build. Calling the relation on the actual model builds the
+     * join with the right server id. Always re-queried (never reusing an
+     * already loaded relation), since a relation loaded elsewhere may have
+     * been eager-loaded the broken way.
+     */
+    private function loadVariables(Server $server): void
+    {
+        $server->setRelation('variables', $server->variables()->get());
+    }
+
+    private function getRequestedVersion(Server $server, string $project): ?string
+    {
+        foreach (self::PROJECT_VERSION_VARIABLES[$project] as $variableName) {
+            $value = $this->getVariable($server, $variableName);
+            if ($value !== null) {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether $target would move the server back from what this plugin last
+     * installed: an older version (by PaperMC's own newest-first version
+     * list, falling back to version_compare() for versions it no longer
+     * lists), or a lower build of the same version.
+     *
+     * @param  array{project: string, version: string, build: int}  $target
+     * @param  array{project?: string, version?: string, build?: int}|null  $installed
+     */
+    private function isOlderThanInstalled(array $target, ?array $installed): bool
+    {
+        if (!is_array($installed) || ($installed['project'] ?? null) !== $target['project'] || !is_string($installed['version'] ?? null)) {
+            return false;
+        }
+
+        if ($installed['version'] === $target['version']) {
+            return is_int($installed['build'] ?? null) && $target['build'] < $installed['build'];
+        }
+
+        $order = [];
+        foreach ($this->fetchVersionGroups($target['project']) as $group) {
+            foreach (is_array($group) ? $group : [] as $version) {
+                if (is_string($version) && !isset($order[$version])) {
+                    $order[$version] = count($order);
+                }
+            }
+        }
+
+        if (isset($order[$target['version']], $order[$installed['version']])) {
+            return $order[$target['version']] > $order[$installed['version']];
+        }
+
+        return version_compare($target['version'], $installed['version'], '<');
     }
 
     /** Whether the egg defines this variable at all, regardless of its value. */

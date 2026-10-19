@@ -661,6 +661,25 @@ final class GitHubSourceRules
         return (bool) preg_match('/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/', $time);
     }
 
+    /**
+     * The time from the settings form as "HH:MM", or null when it isn't a time of day.
+     * Filament's (non-native) time picker keeps its state as a full "YYYY-MM-DD HH:mm:ss"
+     * once a time is picked, so the date part (and seconds) are dropped here; a plain
+     * "HH:MM[:SS]" (the value loaded from .env) is accepted as well.
+     */
+    public static function normalizeAutoUpdateTime(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        if (!preg_match('/^(?:\d{4}-\d{2}-\d{2}[ T])?(([01]\d|2[0-3]):[0-5]\d)(?::[0-5]\d(?:\.\d{1,6})?)?$/', trim($value), $m)) {
+            return null;
+        }
+
+        return $m[1];
+    }
+
     /** "HH:MM" for Schedule::dailyAt(), or the fallback when the saved value is unusable. */
     public static function scheduleTime(mixed $time, string $fallback = '00:00'): string
     {

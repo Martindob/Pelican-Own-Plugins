@@ -320,6 +320,8 @@ check(!R::isValidWorkflowFile('build') && !R::isValidWorkflowFile('../x.yml') &&
 // Settings / daemon / housekeeping helpers
 check(R::isValidAutoUpdateTime('03:45') && R::isValidAutoUpdateTime('23:59:59') && R::isValidAutoUpdateTime('00:00'), 'valid times');
 check(!R::isValidAutoUpdateTime('24:00') && !R::isValidAutoUpdateTime('3:45') && !R::isValidAutoUpdateTime("03:45\nX=1") && !R::isValidAutoUpdateTime('03:45 '), 'invalid times');
+check(R::normalizeAutoUpdateTime('15:55') === '15:55' && R::normalizeAutoUpdateTime('2026-10-19 15:55:00') === '15:55' && R::normalizeAutoUpdateTime('2026-10-19T07:05') === '07:05' && R::normalizeAutoUpdateTime('23:59:59') === '23:59' && R::normalizeAutoUpdateTime(' 08:30 ') === '08:30', 'picker time normalized');
+check(R::normalizeAutoUpdateTime('24:00') === null && R::normalizeAutoUpdateTime('2026-10-19 25:00:00') === null && R::normalizeAutoUpdateTime("15:55\nX=1") === null && R::normalizeAutoUpdateTime(null) === null && R::normalizeAutoUpdateTime('') === null && R::normalizeAutoUpdateTime('2026-10-19') === null, 'picker time rejected');
 check(R::scheduleTime('03:45:00') === '03:45' && R::scheduleTime('bogus') === '00:00' && R::scheduleTime(null) === '00:00', 'schedule time with fallback');
 
 check(R::isTemporaryUploadName('.github-0123456789ab.part') && R::isTemporaryUploadName('.modrinth-0123456789ab.part'), 'temporary upload names');

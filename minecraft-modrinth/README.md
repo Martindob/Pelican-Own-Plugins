@@ -384,6 +384,9 @@ luckperms.net publishes no checksum, so instead:
 
 ## Changes
 
+- **1.4.1** - Fix: saving the settings failed with "Enter the time as HH:MM" even for a valid time
+  (e.g. 15:55). Filament's time picker keeps the picked value as "YYYY-MM-DD HH:mm:ss", which the
+  check only accepted as "HH:MM"; the date part and seconds are now dropped and only HH:MM is stored.
 - **1.4.0** - New **LuckPerms source (luckperms.net)**: a LuckPerms page on Paper/Spigot/Folia/Purpur
   (Bukkit build) and Velocity servers with the installed and newest version, the latest changes and
   Install / Update / Remove; an existing LuckPerms jar (uploaded by hand or from Modrinth) is

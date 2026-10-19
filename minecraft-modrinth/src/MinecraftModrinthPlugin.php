@@ -86,7 +86,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                 ->native(false)
                 ->seconds(false)
                 ->required()
-                ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::isValidAutoUpdateTime($value), 'time_invalid', 'minecraft-modrinth::strings.settings.'))
+                ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::normalizeAutoUpdateTime($value) !== null, 'time_invalid', 'minecraft-modrinth::strings.settings.'))
                 ->default(fn () => config('minecraft-modrinth.auto_update_time')),
             Section::make(trans('minecraft-modrinth::strings.github.settings.section'))
                 ->description(trans('minecraft-modrinth::strings.github.settings.section_description'))
@@ -200,7 +200,8 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
     public function saveSettings(array $data): void
     {
         // Re-checked here as well: this value ends up in .env and in the schedule.
-        $time = is_string($data['auto_update_time'] ?? null) ? trim($data['auto_update_time']) : '';
+        // The picker sends "YYYY-MM-DD HH:mm:ss" once a time is picked; only HH:MM is stored.
+        $time = GitHubSourceRules::normalizeAutoUpdateTime($data['auto_update_time'] ?? null) ?? '';
 
         if (!GitHubSourceRules::isValidAutoUpdateTime($time)) {
             Notification::make()

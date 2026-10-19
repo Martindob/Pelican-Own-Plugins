@@ -8,6 +8,7 @@ use App\Models\Server;
 use App\Traits\Filament\BlockAccessInConflict;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
 use Boy132\MinecraftModrinth\Facades\MinecraftModrinth;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsSourceException;
 use Boy132\MinecraftModrinth\Modrinth\ModrinthMetadataException;
 use Exception;
 use Filament\Actions\Action;
@@ -102,9 +103,12 @@ abstract class MinecraftModrinthProjectPage extends Page implements HasTable
     /** Body of a failure notification: specific when the metadata file is the problem. */
     protected static function failureBody(Exception $exception, string $genericKey): string
     {
-        return $exception instanceof ModrinthMetadataException
-            ? trans('minecraft-modrinth::strings.notifications.metadata_unreadable_body', ['folder' => static::$modrinthProjectType?->getFolder() ?? ''])
-            : trans($genericKey);
+        return match (true) {
+            $exception instanceof ModrinthMetadataException => trans('minecraft-modrinth::strings.notifications.metadata_unreadable_body', ['folder' => static::$modrinthProjectType?->getFolder() ?? '']),
+            // A second LuckPerms jar next to one that is already in plugins/.
+            $exception instanceof LuckPermsSourceException => trans('minecraft-modrinth::strings.luckperms.errors.modrinth_second_copy'),
+            default => trans($genericKey),
+        };
     }
 
     public static function getNavigationLabel(): string

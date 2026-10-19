@@ -25,4 +25,11 @@ return [
         // The same GitHub failure is only logged once per this many minutes.
         'report_throttle_minutes' => (int) env('MINECRAFT_MODRINTH_GITHUB_REPORT_THROTTLE_MINUTES', 60),
     ],
+
+    // LuckPerms straight from luckperms.net (Paper/Spigot/Folia/Purpur and Velocity servers).
+    'luckperms' => [
+        'enabled' => (bool) env('MINECRAFT_MODRINTH_LUCKPERMS_ENABLED', false),
+        // "auto": the daily run updates LuckPerms; "notify": it only sends a notification.
+        'mode' => (string) env('MINECRAFT_MODRINTH_LUCKPERMS_MODE', 'auto'),
+    ],
 ];

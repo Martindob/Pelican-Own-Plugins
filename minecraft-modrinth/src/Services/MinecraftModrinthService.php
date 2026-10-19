@@ -5,6 +5,8 @@ namespace Boy132\MinecraftModrinth\Services;
 use App\Models\Server;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsSourceException;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsSourceRules;
 use Boy132\MinecraftModrinth\Modrinth\ModrinthMetadataException;
 use Boy132\MinecraftModrinth\Modrinth\ModrinthRules;
 use Boy132\MinecraftModrinth\Support\DaemonFileException;
@@ -955,6 +957,10 @@ class MinecraftModrinthService
         // since it couldn't be recorded without losing every other entry.
         $this->readModsMetadata($server, $modrinthProjectType);
 
+        if ($modrinthProjectType === ModrinthProjectType::Plugin) {
+            $this->assertNoOtherLuckPerms($server, $folder, $record['project_id'], $safeNewFilename, $oldFilename);
+        }
+
         $localFile = $this->downloadVerified($spec);
 
         try {
@@ -1012,6 +1018,30 @@ class MinecraftModrinthService
                 }
 
                 throw $deleteException;
+            }
+        }
+    }
+
+    /**
+     * Never a second LuckPerms jar next to one that is already there (installed by hand, or by
+     * the LuckPerms source, which takes LuckPerms over from Modrinth): Paper/Velocity would load
+     * only one of them, and which one is a matter of luck.
+     *
+     * @throws LuckPermsSourceException
+     * @throws Exception
+     */
+    protected function assertNoOtherLuckPerms(Server $server, string $folder, string $projectId, string $newFilename, ?string $oldFilename): void
+    {
+        if ($projectId !== LuckPermsSourceRules::MODRINTH_PROJECT_ID && !LuckPermsSourceRules::looksLikeLuckPermsJarName($newFilename)) {
+            return;
+        }
+
+        foreach ($this->listFolder($server, $folder) as $file) {
+            $name = $file['name'] ?? null;
+
+            if (is_string($name) && $name !== $oldFilename && $name !== $newFilename && DaemonFiles::isRegularFile($file)
+                && LuckPermsSourceRules::looksLikeLuckPermsJarName($name)) {
+                throw new LuckPermsSourceException(LuckPermsSourceException::CONFLICT, "Not installing $newFilename from Modrinth on server #{$server->id}: $folder/$name is LuckPerms already");
             }
         }
     }

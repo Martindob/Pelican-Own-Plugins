@@ -670,7 +670,7 @@ final class GitHubSourceRules
     /** Temporary name a jar is written under before it is renamed into place. */
     public static function isTemporaryUploadName(string $name): bool
     {
-        return (bool) preg_match('/^\.(github|modrinth)-[0-9a-f]{12}\.part$/', $name);
+        return (bool) preg_match('/^\.(github|modrinth|luckperms)-[0-9a-f]{12}\.part$/', $name);
     }
 
     /**

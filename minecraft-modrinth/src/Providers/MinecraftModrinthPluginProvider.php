@@ -6,6 +6,7 @@ use Boy132\MinecraftModrinth\Console\Commands\AutoUpdateModsCommand;
 use Boy132\MinecraftModrinth\Console\Commands\CheckGitHubOffersCommand;
 use Boy132\MinecraftModrinth\GitHub\GitHubOffers;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsService;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\ServiceProvider;
 
@@ -15,6 +16,8 @@ class MinecraftModrinthPluginProvider extends ServiceProvider
     {
         // One instance per request/run: caches what it looked up (e.g. whether its table exists).
         $this->app->singleton(GitHubOffers::class);
+        // Keeps a verified LuckPerms download for the whole run (one download for many servers).
+        $this->app->singleton(LuckPermsService::class);
     }
 
     public function boot(): void

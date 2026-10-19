@@ -7,9 +7,13 @@ use App\Traits\EnvironmentWriterTrait;
 use Boy132\MinecraftModrinth\GitHub\GitHubPluginService;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceException;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceRules;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsService;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsSourceException;
+use Boy132\MinecraftModrinth\LuckPerms\LuckPermsSourceRules;
 use Closure;
 use Filament\Actions\Action;
 use Filament\Contracts\Plugin;
+use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\TimePicker;
 use Filament\Forms\Components\Toggle;
@@ -53,6 +57,8 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'github_token_clear' => false,
             'github_require_green_ci' => (bool) config('minecraft-modrinth.github.require_green_ci', true),
             'github_required_workflow' => (string) config('minecraft-modrinth.github.required_workflow', ''),
+            'luckperms_enabled' => (bool) config('minecraft-modrinth.luckperms.enabled'),
+            'luckperms_mode' => LuckPermsSourceRules::mode(config('minecraft-modrinth.luckperms.mode')),
         ];
     }
 
@@ -147,6 +153,33 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                             ->action(fn () => $this->testGitHubConnection()),
                     ]),
                 ]),
+            Section::make(trans('minecraft-modrinth::strings.luckperms.settings.section'))
+                ->description(trans('minecraft-modrinth::strings.luckperms.settings.section_description'))
+                ->collapsible()
+                ->schema([
+                    Toggle::make('luckperms_enabled')
+                        ->label(trans('minecraft-modrinth::strings.luckperms.settings.enabled'))
+                        ->helperText(trans('minecraft-modrinth::strings.luckperms.settings.enabled_hint'))
+                        ->inline(false)
+                        ->default(fn () => config('minecraft-modrinth.luckperms.enabled')),
+                    Select::make('luckperms_mode')
+                        ->label(trans('minecraft-modrinth::strings.luckperms.settings.mode'))
+                        ->helperText(trans('minecraft-modrinth::strings.luckperms.settings.mode_hint'))
+                        ->options([
+                            'auto' => trans('minecraft-modrinth::strings.luckperms.settings.mode_auto'),
+                            'notify' => trans('minecraft-modrinth::strings.luckperms.settings.mode_notify'),
+                        ])
+                        ->selectablePlaceholder(false)
+                        ->in(LuckPermsSourceRules::MODES)
+                        ->default('auto'),
+                    Actions::make([
+                        Action::make('luckperms_test_connection')
+                            ->label(trans('minecraft-modrinth::strings.luckperms.settings.test_connection'))
+                            ->icon('tabler-plug-connected')
+                            ->color('gray')
+                            ->action(fn () => $this->testLuckPermsConnection()),
+                    ]),
+                ]),
         ];
     }
 
@@ -197,6 +230,23 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             }
 
             $values += $github;
+        }
+
+        if (array_key_exists('luckperms_enabled', $data)) {
+            $mode = $data['luckperms_mode'] ?? 'auto';
+
+            // Re-checked here as well: the form rules are the first line, not the only one.
+            if (!is_string($mode) || !in_array($mode, LuckPermsSourceRules::MODES, true)) {
+                Notification::make()
+                    ->title(trans('minecraft-modrinth::strings.luckperms.settings.invalid_settings'))
+                    ->danger()
+                    ->send();
+
+                return;
+            }
+
+            $values['MINECRAFT_MODRINTH_LUCKPERMS_ENABLED'] = (bool) $data['luckperms_enabled'];
+            $values['MINECRAFT_MODRINTH_LUCKPERMS_MODE'] = $mode;
         }
 
         $this->writeToEnvironment($values);
@@ -256,6 +306,29 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
         }
 
         return $values;
+    }
+
+    /** Reads the newest version from luckperms.net right now (works with the source still off). */
+    protected function testLuckPermsConnection(): void
+    {
+        try {
+            $latest = app(LuckPermsService::class)->getLatest(true);
+
+            Notification::make()
+                ->title(trans('minecraft-modrinth::strings.luckperms.settings.test_ok'))
+                ->body(trans('minecraft-modrinth::strings.luckperms.settings.test_ok_body', [
+                    'version' => e($latest['version']),
+                    'platforms' => e(implode(', ', array_map(fn (string $platform) => LuckPermsSourceRules::platformLabel($platform), array_keys($latest['downloads']))) ?: '-'),
+                ]))
+                ->success()
+                ->send();
+        } catch (LuckPermsSourceException $exception) {
+            Notification::make()
+                ->title(trans('minecraft-modrinth::strings.luckperms.settings.test_failed'))
+                ->body($exception->getUserMessage())
+                ->danger()
+                ->send();
+        }
     }
 
     /** Uses the saved settings (save first), so it tests exactly what servers will use. */

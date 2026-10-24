@@ -22,6 +22,9 @@ return [
         // Workflow file (e.g. "build.yml") that must have a successful push run on the commit
         // for CI to count as green. Empty: any successful run is enough.
         'required_workflow' => (string) env('MINECRAFT_MODRINTH_GITHUB_REQUIRED_WORKFLOW', ''),
+        // Replace a jar of a repository plugin that was put into plugins/ by hand with the
+        // repository version (install/update/"Update all"/automatic update). Off: 1.4.1 behaviour.
+        'replace_manual' => (bool) env('MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL', true),
         // The same GitHub failure is only logged once per this many minutes.
         'report_throttle_minutes' => (int) env('MINECRAFT_MODRINTH_GITHUB_REPORT_THROTTLE_MINUTES', 60),
     ],

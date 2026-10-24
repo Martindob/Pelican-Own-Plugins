@@ -446,5 +446,104 @@ foreach ([
     check(M::downloadSpec(array_merge($file, $override), $problem) === null && is_string($problem), "download spec refused: $name");
 }
 
+// 1.5.0: manual copies replaced with the repository version
+$cA = $paper('chat', 'EthoriaChat', '1.8.1');
+$cB = $paper('bags', 'EthoriaBags', '1.9.1');
+$platformPlugins = [$cA, $cB];
+
+check(R::unmanagedCopies($cA, ['EthoriaChat-1.8.0.jar', 'EthoriaBags.jar', 'LuckPerms-Bukkit-5.4.jar'], []) === ['EthoriaChat-1.8.0.jar'], 'unmanaged copy found by name');
+check(R::unmanagedCopies($cA, [$cA['filename']], [$cA['filename']]) === [], 'managed jar is not a copy');
+check(R::pluginsMatchingJar('EthoriaChat.jar', $platformPlugins) === ['chat'], 'jar matches exactly one index entry');
+check(R::pluginsMatchingJar('LuckPerms-Bukkit-5.4.jar', $platformPlugins) === [], 'foreign jar matches nothing');
+
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.0.jar', 'EthoriaBags.jar'], [], []) === ['EthoriaChat-1.8.0.jar'], 'manual copy replaceable');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaBags.jar'], [], []) === [], 'no copy, nothing to replace');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat.jar', 'EthoriaChat-1.7.0.jar'], [], []) === ['EthoriaChat.jar', 'EthoriaChat-1.7.0.jar'], 'two copies replaced together');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat.jar'], [], ['EthoriaChat.jar']) === null, 'protected copy (Modrinth / symlink / refused) not replaceable');
+check(R::replaceableCopies($cA, $platformPlugins, ['Ethoria Chat.jar'], [], []) === null, 'copy with an invalid file name not replaceable');
+check(R::replaceableCopies($cA, $platformPlugins, ['a/EthoriaChat.jar', 'EthoriaChat/EthoriaChat-1.8.0.jar'], [], []) === [], 'jar in a sub folder is not a copy (never replaced)');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat.jar', 'EthoriaChat-1.jar', 'EthoriaChat-2.jar', 'EthoriaChat-3.jar'], [], []) === null, 'more than '.R::MAX_TAKEOVER_COPIES.' copies not replaced');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.0.jar', $cA['filename']], [$cA['filename']], []) === ['EthoriaChat-1.8.0.jar'], 'copy next to an installed jar');
+
+// One jar that looks like two index entries: whose is it? Never replaced.
+$amb1 = $paper('chat-core', 'ChatPlus', '1.0.0');
+$amb2 = R::validateIndexEntry($entry(['id' => 'chatplus', 'name' => 'Other', 'version' => '2.0.0', 'path' => 'minecraft/x/chatplus-2.0.0.jar']));
+check($amb1 !== null && $amb2 !== null, 'ambiguous fixtures valid');
+$ambAll = [$amb1, $amb2];
+check(R::pluginsMatchingJar('ChatPlus.jar', $ambAll) === ['chat-core', 'chatplus'], 'ambiguous jar matches two entries');
+check(R::replaceableCopies($amb2, $ambAll, ['ChatPlus.jar'], [], []) === null, 'ambiguous copy not replaceable (entry b)');
+check(R::replaceableCopies($amb1, $ambAll, ['ChatPlus.jar'], [], []) === null, 'ambiguous copy not replaceable (entry a)');
+// The other platform's entries don't count: only the server's platform is passed.
+check(R::replaceableCopies($cA, [$cA], ['EthoriaChat.jar'], [], []) === ['EthoriaChat.jar'], 'only the platform entries are compared');
+
+check(R::versionFromJarName('EthoriaChat-1.8.0.jar') === '1.8.0' && R::versionFromJarName('EthoriaChat-v2.1-SNAPSHOT.jar') === '2.1' && R::versionFromJarName('gdprerase_paper_1.4.0+b12.jar') === '1.4.0', 'version from file name');
+check(R::versionFromJarName('EthoriaChat.jar') === null && R::versionFromJarName('EthoriaChat-1.8.0.zip') === null, 'no version in file name');
+
+check(R::pluginState($cA, null, false, true, true) === 'replace_manual', 'manual copy + replaceable = replace_manual');
+check(R::pluginState($cA, null, true, true, true) === 'manual', 'hidden plugin: manual copy is never replaced');
+check(R::pluginState($cA, null, false, true, false) === 'manual', 'not replaceable (or setting off): manual as in 1.4.1');
+check(R::pluginState($cA, null, false, false, true) === 'new', 'replaceable without a copy is just new');
+check(R::pluginState($cA, ['version' => '1.0.0', 'sha256' => $cA['sha256']], false, false, true) === 'update_available', 'installed: replaceable flag ignored');
+
+$offers = R::offers([$cA, $cB], 'paper', [], [], ['EthoriaChat-1.8.0.jar'], [], ['chat']);
+check(array_column($offers['updates'], 'id') === ['chat'] && array_column($offers['new'], 'id') === ['bags'], 'replacement counts as an update');
+$offers = R::offers([$cA, $cB], 'paper', [], [], ['EthoriaChat-1.8.0.jar']);
+check($offers['updates'] === [] && array_column($offers['new'], 'id') === ['bags'], 'setting off: manual copy neither new nor update');
+$offers = R::offers([$cA, $cB], 'paper', [], ['chat'], ['EthoriaChat-1.8.0.jar'], [], ['chat']);
+check($offers['updates'] === [], 'hidden plugin not counted as replacement');
+$offers = R::offers([$cA, $cB], 'velocity', [], [], ['EthoriaChat-1.8.0.jar'], [], ['chat']);
+check($offers['updates'] === [], 'other platform: no replacement');
+
+// Plugin descriptors inside the jar
+check(R::pluginYmlName("name: EthoriaChat\nversion: 1.8.0\n") === 'EthoriaChat', 'plugin.yml name');
+check(R::pluginYmlName("main: x.Y\nname: 'Ethoria Chat' # comment\n") === 'Ethoria Chat', 'quoted name with comment');
+check(R::pluginYmlName("commands:\n  chat:\n    name: nested\n") === null, 'nested name is not the plugin name');
+check(R::pluginYmlName("version: 1.0\n") === null && R::pluginYmlName("name:\n") === null, 'no name');
+check(R::pluginYmlName('name: '.str_repeat('x', 200)."\n") === null && R::pluginYmlName(str_repeat('#', R::MAX_DESCRIPTOR_BYTES + 1)) === null, 'too long name / descriptor');
+
+$tmpJars = [];
+$makeJar = function (array $entries) use (&$tmpJars): string {
+    $path = tempnam(sys_get_temp_dir(), 'gh-test-');
+    $zip = new ZipArchive();
+    $zip->open($path, ZipArchive::OVERWRITE);
+    foreach ($entries as $name => $content) {
+        $zip->addFromString($name, $content);
+    }
+    $zip->close();
+    $tmpJars[] = $path;
+
+    return $path;
+};
+
+$paperJar = $makeJar(['plugin.yml' => "name: EthoriaChat\nversion: 1.8.1\nmain: cz.ethoria.Chat\n", 'cz/ethoria/Chat.class' => 'x']);
+$paperPluginJar = $makeJar(['paper-plugin.yml' => "name: EthoriaChat\nversion: 1.8.1\n"]);
+$otherJar = $makeJar(['plugin.yml' => "name: EthoriaBags\nversion: 1.0.0\n"]);
+$velocityJar = $makeJar(['velocity-plugin.json' => json_encode(['id' => 'ethoriaclickproxy', 'name' => 'EthoriaClickProxy', 'version' => '1.2.0'])]);
+$emptyJar = $makeJar(['README.txt' => 'nothing']);
+$notZip = tempnam(sys_get_temp_dir(), 'gh-test-');
+file_put_contents($notZip, 'not a zip');
+$tmpJars[] = $notZip;
+
+check(R::jarDescriptorNames($paperJar, 'paper') === ['ethoriachat'], 'paper jar: plugin.yml name');
+check(R::jarDescriptorNames($paperPluginJar, 'paper') === ['ethoriachat'], 'paper jar: paper-plugin.yml name');
+check(R::jarDescriptorNames($velocityJar, 'velocity') === ['ethoriaclickproxy'], 'velocity jar: velocity-plugin.json id');
+$problem = null;
+check(R::jarDescriptorNames($velocityJar, 'paper', $problem) === null && is_string($problem), 'velocity jar has no paper descriptor');
+$problem = null;
+check(R::jarDescriptorNames($paperJar, 'velocity', $problem) === null && is_string($problem), 'paper jar has no velocity descriptor');
+$problem = null;
+check(R::jarDescriptorNames($emptyJar, 'paper', $problem) === null && str_contains((string) $problem, 'plugin.yml'), 'jar without descriptor');
+$problem = null;
+check(R::jarDescriptorNames($notZip, 'paper', $problem) === null && str_contains((string) $problem, 'zip'), 'not a zip');
+
+check(R::sameDescriptor(['ethoriachat'], ['ethoriachat']), 'same plugin name');
+check(!R::sameDescriptor(['ethoriachat'], ['ethoriabags']) && !R::sameDescriptor([], ['ethoriachat']) && !R::sameDescriptor([], []), 'different / missing plugin name');
+check(R::sameDescriptor(R::jarDescriptorNames($paperPluginJar, 'paper') ?? [], R::jarDescriptorNames($paperJar, 'paper') ?? []), 'paper-plugin.yml and plugin.yml of the same plugin');
+check(!R::sameDescriptor(R::jarDescriptorNames($otherJar, 'paper') ?? [], R::jarDescriptorNames($paperJar, 'paper') ?? []), 'another plugin by its plugin.yml');
+
+foreach ($tmpJars as $path) {
+    @unlink($path);
+}
+
 echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
 exit(Result::$failures === 0 ? 0 : 1);

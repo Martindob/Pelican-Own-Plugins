@@ -30,7 +30,8 @@ use Illuminate\Support\Facades\RateLimiter;
  * Plugins from the configured GitHub repository (see README "GitHub repository source"),
  * for the platform of this server: install, update and remove them. Plugins that aren't
  * installed yet are offered ("New") until an admin installs them or says they don't belong on
- * this server (see README "New plugins").
+ * this server (see README "New plugins"). A plugin whose jar was put into plugins/ by hand is
+ * offered for replacement with the repository version while "Replace manual copies" is on.
  *
  * @phpstan-import-type Snapshot from GitHubPluginService
  * @phpstan-import-type InstalledPlugin from GitHubPluginService
@@ -59,6 +60,9 @@ class GitHubPluginsPage extends Page implements HasTable
     /** @var array<int, string> old jars recorded for deletion */
     protected array $pendingDeletes = [];
 
+    /** @var array<int, array{filename: string, size: int, replaced_by?: string}> the same, as recorded */
+    protected array $pendingDeleteEntries = [];
+
     /** Forced GitHub refreshes: at most one per server in this many seconds ... */
     protected const REFRESH_PER_SERVER_SECONDS = 30;
 
@@ -67,10 +71,13 @@ class GitHubPluginsPage extends Page implements HasTable
 
     protected ?GitHubSourceException $installedError = null;
 
-    /** @var array<int, string>|null */
-    protected ?array $jarNames = null;
+    /** @var array<int, array<string, mixed>>|null listing of plugins/ */
+    protected ?array $files = null;
 
     protected ?GitHubSourceException $jarNamesError = null;
+
+    /** @var array<string, array<int, string>>|null manual copies to replace, by plugin id */
+    protected ?array $replacements = null;
 
     /** @var array<int, string>|null */
     protected ?array $dismissed = null;
@@ -185,10 +192,12 @@ class GitHubPluginsPage extends Page implements HasTable
             try {
                 $metadata = static::service()->readMetadata(static::server());
                 $this->installed = $metadata['installed'];
+                $this->pendingDeleteEntries = $metadata['pending_delete'];
                 $this->pendingDeletes = array_column($metadata['pending_delete'], 'filename');
             } catch (GitHubSourceException $exception) {
                 $this->installedError = $exception;
                 $this->installed = [];
+                $this->pendingDeleteEntries = [];
                 $this->pendingDeletes = [];
             }
         }
@@ -196,19 +205,25 @@ class GitHubPluginsPage extends Page implements HasTable
         return $this->installed;
     }
 
-    /** @return array<int, string> jar names in plugins/ */
-    protected function getJarNames(): array
+    /** @return array<int, array<string, mixed>> listing of plugins/ */
+    protected function getFiles(): array
     {
-        if ($this->jarNames === null) {
+        if ($this->files === null) {
             try {
-                $this->jarNames = static::service()->listJarNames(static::server());
+                $this->files = static::service()->listPluginFiles(static::server());
             } catch (GitHubSourceException $exception) {
                 $this->jarNamesError = $exception;
-                $this->jarNames = [];
+                $this->files = [];
             }
         }
 
-        return $this->jarNames;
+        return $this->files;
+    }
+
+    /** @return array<int, string> jar names in plugins/ */
+    protected function getJarNames(): array
+    {
+        return static::service()->jarNamesOf($this->getFiles());
     }
 
     /** @return array<int, string> ids of the plugins dismissed for this server */
@@ -234,8 +249,10 @@ class GitHubPluginsPage extends Page implements HasTable
         $this->installed = null;
         $this->installedError = null;
         $this->pendingDeletes = [];
-        $this->jarNames = null;
+        $this->pendingDeleteEntries = [];
+        $this->files = null;
         $this->jarNamesError = null;
+        $this->replacements = null;
         $this->dismissed = null;
         $this->dismissedError = null;
         $this->allRows = null;
@@ -282,11 +299,18 @@ class GitHubPluginsPage extends Page implements HasTable
         // Without the installed list or the directory listing we can't tell what is new.
         $knowsServerState = $this->installedError === null && $this->jarNamesError === null;
         $managedFilenames = [...array_column($installed, 'filename'), ...$this->pendingDeletes];
+        $platformPlugins = $snapshot ? static::service()->pluginsForPlatform($snapshot['plugins'], $platform) : [];
+
+        // Manual copies to replace - only when it's known what is installed and what is hidden.
+        $this->replacements = $knowsServerState && $this->dismissedError === null && $platformPlugins !== []
+            ? static::service()->manualReplacements($server, $platformPlugins, ['installed' => $installed, 'pending_delete' => $this->pendingDeleteEntries], $this->getFiles(), $dismissed)
+            : [];
 
         $rows = [];
 
-        foreach ($snapshot ? static::service()->pluginsForPlatform($snapshot['plugins'], $platform) : [] as $plugin) {
+        foreach ($platformPlugins as $plugin) {
             $entry = static::service()->findInstalled($installed, $plugin['id']);
+            $copies = $entry === null && $knowsServerState ? GitHubSourceRules::unmanagedCopies($plugin, $jarNames, $managedFilenames) : [];
 
             $state = $entry === null && !$knowsServerState
                 ? 'not_installed'
@@ -294,8 +318,11 @@ class GitHubPluginsPage extends Page implements HasTable
                     $plugin,
                     $entry,
                     in_array($plugin['id'], $dismissed, true),
-                    $entry === null && GitHubSourceRules::hasUnmanagedCopy($plugin, $jarNames, $managedFilenames),
+                    $copies !== [],
+                    isset($this->replacements[$plugin['id']]),
                 );
+
+            $manualVersions = array_values(array_unique(array_filter(array_map(fn (string $name) => GitHubSourceRules::versionFromJarName($name), $copies))));
 
             $rows[$plugin['id']] = [
                 '__key' => $plugin['id'],
@@ -304,8 +331,12 @@ class GitHubPluginsPage extends Page implements HasTable
                 'frozen' => $plugin['frozen'],
                 'repo_version' => $plugin['version'],
                 'installed_version' => $entry['version'] ?? null,
+                // A manual copy: its file name(s) and, if the name shows it, its version.
+                'manual_files' => $copies,
+                'manual_version' => $manualVersions !== [] ? implode(', ', $manualVersions) : null,
                 'filename' => $entry['filename'] ?? $plugin['filename'],
                 'state' => $state,
+                'dismissed' => in_array($plugin['id'], $dismissed, true),
             ];
         }
 
@@ -321,6 +352,9 @@ class GitHubPluginsPage extends Page implements HasTable
                 'frozen' => false,
                 'repo_version' => null,
                 'installed_version' => $entry['version'],
+                'manual_files' => [],
+                'manual_version' => null,
+                'dismissed' => false,
                 'filename' => $entry['filename'],
                 // Without a snapshot we simply don't know what the repository has.
                 'state' => $snapshot === null ? 'unknown' : 'removed',
@@ -329,7 +363,7 @@ class GitHubPluginsPage extends Page implements HasTable
 
         $priority = fn (array $row) => match ($row['state']) {
             'new' => 0,
-            'update_available' => 1,
+            'update_available', 'replace_manual' => 1,
             default => 2,
         };
 
@@ -337,7 +371,7 @@ class GitHubPluginsPage extends Page implements HasTable
 
         // Keep the navigation badge in step with what this page shows.
         if ($snapshot !== null && $platform !== null && $knowsServerState && $this->dismissedError === null) {
-            static::offers()->rememberCounts($server, GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, $this->pendingDeletes));
+            static::offers()->rememberCounts($server, GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, $this->pendingDeletes, array_keys($this->replacements)));
         }
 
         return $rows;
@@ -354,9 +388,16 @@ class GitHubPluginsPage extends Page implements HasTable
         ];
     }
 
+    /** Installed plugins with an update, plus manual copies that will be replaced. */
     protected function countUpdateAvailable(): int
     {
-        return count(array_keys(array_column($this->getAllRows(), 'state'), 'update_available', true));
+        return count(array_filter(array_column($this->getAllRows(), 'state'), fn (string $state) => in_array($state, ['update_available', 'replace_manual'], true)));
+    }
+
+    /** @return array<int, array<string, mixed>> rows whose manual copies will be replaced */
+    protected function replaceRows(): array
+    {
+        return array_values(array_filter($this->getAllRows(), fn (array $row) => $row['state'] === 'replace_manual'));
     }
 
     protected function ciAllowsInstall(): bool
@@ -381,9 +422,14 @@ class GitHubPluginsPage extends Page implements HasTable
                     ->description(fn (array $record) => $record['id']),
                 TextColumn::make('installed_version')
                     ->label(trans('minecraft-modrinth::strings.github.table.installed_version'))
+                    // A manual copy shows its version from the file name, marked as such.
+                    ->state(fn (array $record) => $record['installed_version']
+                        ?? (in_array($record['state'], ['manual', 'replace_manual'], true)
+                            ? trans('minecraft-modrinth::strings.github.table.manual_version', ['version' => $record['manual_version'] ?? '?'])
+                            : null))
                     ->placeholder('-')
                     ->badge()
-                    ->color('gray'),
+                    ->color(fn (array $record) => $record['installed_version'] === null && $record['state'] === 'replace_manual' ? 'warning' : 'gray'),
                 TextColumn::make('repo_version')
                     ->label(trans('minecraft-modrinth::strings.github.table.repo_version'))
                     ->placeholder('-')
@@ -396,14 +442,21 @@ class GitHubPluginsPage extends Page implements HasTable
                     ->icon(fn (string $state) => match ($state) {
                         'new' => 'tabler-sparkles',
                         'dismissed' => 'tabler-eye-off',
+                        'replace_manual' => 'tabler-replace',
                         default => null,
                     })
-                    ->tooltip(fn (string $state) => in_array($state, ['new', 'dismissed', 'manual'], true)
-                        ? trans('minecraft-modrinth::strings.github.state.'.$state.'_hint')
-                        : null)
+                    ->tooltip(fn (array $record) => match ($record['state']) {
+                        'new', 'dismissed' => trans('minecraft-modrinth::strings.github.state.'.$record['state'].'_hint'),
+                        'replace_manual' => trans('minecraft-modrinth::strings.github.state.replace_manual_hint', ['files' => implode(', ', $record['manual_files'])]),
+                        // With replacing on, a copy that stays "manual" is one that can't be replaced automatically.
+                        'manual' => trans(static::service()->replacesManualCopies() && !in_array($record['id'], $this->getDismissed(), true)
+                            ? 'minecraft-modrinth::strings.github.state.manual_not_replaceable_hint'
+                            : 'minecraft-modrinth::strings.github.state.manual_hint', ['files' => implode(', ', $record['manual_files'])]),
+                        default => null,
+                    })
                     ->color(fn (string $state) => match ($state) {
                         'up_to_date' => 'success',
-                        'update_available' => 'warning',
+                        'update_available', 'replace_manual' => 'warning',
                         'new' => 'info',
                         'modified', 'repo_older', 'removed' => 'danger',
                         default => 'gray',
@@ -452,12 +505,32 @@ class GitHubPluginsPage extends Page implements HasTable
                         'new_version' => $record['repo_version'],
                     ]))
                     ->action(fn (array $record) => $this->install($record['id'], true)),
+                Action::make('replace')
+                    ->iconButton()
+                    ->icon('tabler-replace')
+                    ->color('warning')
+                    ->tooltip(fn () => $this->ciAllowsInstall()
+                        ? trans('minecraft-modrinth::strings.github.actions.replace')
+                        : trans('minecraft-modrinth::strings.github.page.ci_blocks_install'))
+                    ->visible(fn (array $record) => $record['state'] === 'replace_manual')
+                    ->disabled(fn () => !$this->ciAllowsInstall())
+                    ->authorize(fn () => static::userCan(SubuserPermission::FileCreate, SubuserPermission::FileDelete))
+                    ->requiresConfirmation()
+                    ->modalHeading(trans('minecraft-modrinth::strings.github.modals.replace_heading'))
+                    ->modalDescription(fn (array $record) => trans('minecraft-modrinth::strings.github.modals.replace_description', [
+                        'name' => $record['name'],
+                        'files' => implode(', ', $record['manual_files']),
+                        'old_version' => $record['manual_version'] ?? '?',
+                        'new_version' => $record['repo_version'],
+                    ]))
+                    ->action(fn (array $record) => $this->install($record['id'], false, true)),
                 Action::make('dismiss')
                     ->iconButton()
                     ->icon('tabler-eye-off')
                     ->color('gray')
                     ->tooltip(trans('minecraft-modrinth::strings.github.offers.dismiss'))
-                    ->visible(fn (array $record) => $record['state'] === 'new')
+                    // Also for a manual copy that would be replaced: hiding it keeps the manual copy.
+                    ->visible(fn (array $record) => in_array($record['state'], ['new', 'replace_manual'], true))
                     ->authorize(fn () => static::userCan(SubuserPermission::FileCreate))
                     ->requiresConfirmation()
                     ->modalHeading(trans('minecraft-modrinth::strings.github.offers.dismiss_heading'))
@@ -468,7 +541,7 @@ class GitHubPluginsPage extends Page implements HasTable
                     ->icon('tabler-eye')
                     ->color('info')
                     ->tooltip(trans('minecraft-modrinth::strings.github.offers.restore'))
-                    ->visible(fn (array $record) => $record['state'] === 'dismissed')
+                    ->visible(fn (array $record) => $record['state'] === 'dismissed' || ($record['state'] === 'manual' && $record['dismissed']))
                     ->authorize(fn () => static::userCan(SubuserPermission::FileCreate))
                     ->action(fn (array $record) => $this->setDismissed($record['id'], $record['name'], false)),
                 Action::make('installed')
@@ -526,24 +599,34 @@ class GitHubPluginsPage extends Page implements HasTable
         );
     }
 
-    protected function install(string $id, bool $isUpdate): void
+    protected function install(string $id, bool $isUpdate, bool $replacesManual = false): void
     {
-        $result = $this->attemptInstall($id, $isUpdate);
+        $result = $this->attemptInstall($id, $isUpdate, $replacesManual);
 
         if ($result['ok']) {
+            $body = trans('minecraft-modrinth::strings.github.notifications.installed_body', [
+                'name' => e($result['name']),
+                'version' => e($result['version']),
+            ]);
+
+            if ($result['replaced'] !== []) {
+                $body .= ' '.trans('minecraft-modrinth::strings.github.notifications.replaced_body', ['files' => e(implode(', ', $result['replaced']))]);
+            }
+
             Notification::make()
-                ->title(trans($isUpdate ? 'minecraft-modrinth::strings.notifications.update_success' : 'minecraft-modrinth::strings.notifications.install_success'))
-                ->body(trans('minecraft-modrinth::strings.github.notifications.installed_body', [
-                    'name' => e($result['name']),
-                    'version' => e($result['version']),
-                ]))
+                ->title(trans($replacesManual
+                    ? 'minecraft-modrinth::strings.github.notifications.replaced_title'
+                    : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_success' : 'minecraft-modrinth::strings.notifications.install_success')))
+                ->body($body)
                 ->success()
                 ->send();
         } else {
             Notification::make()
                 ->title(trans($result['partial']
                     ? 'minecraft-modrinth::strings.github.notifications.old_jar_pending_title'
-                    : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed')))
+                    : ($replacesManual
+                        ? 'minecraft-modrinth::strings.github.notifications.replace_failed'
+                        : ($isUpdate ? 'minecraft-modrinth::strings.notifications.update_failed' : 'minecraft-modrinth::strings.notifications.install_failed'))))
                 ->body($result['message'])
                 ->status($result['partial'] ? 'warning' : 'danger')
                 ->persistent()
@@ -558,14 +641,18 @@ class GitHubPluginsPage extends Page implements HasTable
      * without sending a notification itself - install() sends one immediately, updateAll() folds
      * several of these into a single summary notification instead.
      *
-     * @return array{ok: bool, name: ?string, version: ?string, message: ?string, partial: bool}
+     * An update (and a replacement of a manual copy) also replaces manual copies of the plugin
+     * while "Replace manual copies" is on; a plain install doesn't (the user saw no copy).
+     *
+     * @return array{ok: bool, name: ?string, version: ?string, message: ?string, partial: bool, replaced: array<int, string>}
      */
-    protected function attemptInstall(string $id, bool $isUpdate): array
+    protected function attemptInstall(string $id, bool $isUpdate, bool $replacesManual = false): array
     {
         $server = static::server();
+        $deletes = $isUpdate || $replacesManual;
 
         // Also checked here: the action's own authorization is the first line, not the only one.
-        if (!static::userCan(...($isUpdate ? [SubuserPermission::FileCreate, SubuserPermission::FileDelete] : [SubuserPermission::FileCreate]))) {
+        if (!static::userCan(...($deletes ? [SubuserPermission::FileCreate, SubuserPermission::FileDelete] : [SubuserPermission::FileCreate]))) {
             abort(403);
         }
 
@@ -597,7 +684,8 @@ class GitHubPluginsPage extends Page implements HasTable
                 throw new GitHubSourceException(GitHubSourceException::INVALID_INDEX, "$id is not in the index at {$snapshot['sha']}");
             }
 
-            $entry = static::service()->installOrUpdate($server, $plugin, $snapshot, static::service()->requiresGreenCi(), $isUpdate);
+            $replaced = [];
+            $entry = static::service()->installOrUpdate($server, $plugin, $snapshot, static::service()->requiresGreenCi(), $isUpdate, $deletes, $replaced);
 
             return [
                 'ok' => true,
@@ -605,6 +693,7 @@ class GitHubPluginsPage extends Page implements HasTable
                 'version' => $entry['version'],
                 'message' => null,
                 'partial' => false,
+                'replaced' => $replaced ?? [],
             ];
         } catch (GitHubSourceException $exception) {
             static::service()->reportOncePerWindow("ui:{$server->id}:$id:{$exception->reason}", $exception);
@@ -615,12 +704,14 @@ class GitHubPluginsPage extends Page implements HasTable
                 'version' => null,
                 'message' => $exception->getUserMessage(),
                 'partial' => $exception->reason === GitHubSourceException::OLD_JAR_PENDING,
+                'replaced' => [],
             ];
         }
     }
 
     /**
-     * Updates every plugin currently showing "update_available" on this page in one action,
+     * Updates every plugin currently showing "update_available" on this page in one action (and
+     * replaces every manual copy showing "replace_manual"),
      * instead of clicking each plugin's own update button in turn. Each is still updated
      * independently through attemptInstall() - one failing (a checksum mismatch, a file
      * conflict, ...) never stops the rest - and the page ends up in exactly the state it would
@@ -634,7 +725,7 @@ class GitHubPluginsPage extends Page implements HasTable
             abort(403);
         }
 
-        $candidates = array_values(array_filter($this->getRows(), fn (array $row) => $row['state'] === 'update_available'));
+        $candidates = array_values(array_filter($this->getRows(), fn (array $row) => in_array($row['state'], ['update_available', 'replace_manual'], true)));
 
         if (empty($candidates)) {
             $this->forgetState();
@@ -646,7 +737,9 @@ class GitHubPluginsPage extends Page implements HasTable
         $failures = [];
 
         foreach ($candidates as $row) {
-            $result = $this->attemptInstall($row['id'], true);
+            $result = $row['state'] === 'replace_manual'
+                ? $this->attemptInstall($row['id'], false, true)
+                : $this->attemptInstall($row['id'], true);
 
             if ($result['ok']) {
                 $succeededCount++;
@@ -838,6 +931,15 @@ class GitHubPluginsPage extends Page implements HasTable
 
                         return !empty($this->pendingDeletes);
                     }),
+                Callout::make(fn () => trans_choice('minecraft-modrinth::strings.github.offers.replace_callout_heading', count($this->replaceRows()), ['count' => count($this->replaceRows())]))
+                    ->description(fn () => trans(config('minecraft-modrinth.auto_update_enabled')
+                        ? 'minecraft-modrinth::strings.github.offers.replace_callout_description_auto'
+                        : 'minecraft-modrinth::strings.github.offers.replace_callout_description', [
+                            'files' => implode(', ', array_merge(...array_map(fn (array $row) => array_map(fn (string $file) => "plugins/$file", $row['manual_files']), $this->replaceRows()))),
+                        ]))
+                    ->warning()
+                    ->icon('tabler-replace')
+                    ->visible(fn () => $this->replaceRows() !== []),
                 Callout::make(fn () => trans_choice('minecraft-modrinth::strings.github.offers.callout_heading', $this->countOffered()['new'], ['count' => $this->countOffered()['new']]))
                     ->description(trans('minecraft-modrinth::strings.github.offers.callout_description'))
                     ->info()

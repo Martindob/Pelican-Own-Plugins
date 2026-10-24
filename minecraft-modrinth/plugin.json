@@ -2,7 +2,7 @@
     "id": "minecraft-modrinth",
     "name": "Minecraft Modrinth & GitHub",
     "author": "Boy132 & H1ghSyst3m (fork maintained by Martindob)",
-    "version": "1.4.1",
+    "version": "1.5.0",
     "description": "Easily download, update, and manage minecraft mods & plugins from modrinth, plugins from a GitHub repository with pre-built jars, and LuckPerms straight from luckperms.net",
     "category": "plugin",
     "url": "https://github.com/Martindob/Pelican-Own-Plugins/tree/main/minecraft-modrinth",

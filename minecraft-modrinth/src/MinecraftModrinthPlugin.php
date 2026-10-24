@@ -57,6 +57,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'github_token_clear' => false,
             'github_require_green_ci' => (bool) config('minecraft-modrinth.github.require_green_ci', true),
             'github_required_workflow' => (string) config('minecraft-modrinth.github.required_workflow', ''),
+            'github_replace_manual' => (bool) config('minecraft-modrinth.github.replace_manual', true),
             'luckperms_enabled' => (bool) config('minecraft-modrinth.luckperms.enabled'),
             'luckperms_mode' => LuckPermsSourceRules::mode(config('minecraft-modrinth.luckperms.mode')),
         ];
@@ -144,6 +145,11 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                         ->placeholder('build.yml')
                         ->maxLength(100)
                         ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::isValidWorkflowFile(trim($value)), 'required_workflow_invalid')),
+                    Toggle::make('github_replace_manual')
+                        ->label(trans('minecraft-modrinth::strings.github.settings.replace_manual'))
+                        ->helperText(trans('minecraft-modrinth::strings.github.settings.replace_manual_hint'))
+                        ->inline(false)
+                        ->default(fn () => config('minecraft-modrinth.github.replace_manual', true)),
                     Actions::make([
                         Action::make('github_test_connection')
                             ->label(trans('minecraft-modrinth::strings.github.settings.test_connection'))
@@ -296,6 +302,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'MINECRAFT_MODRINTH_GITHUB_INDEX_PATH' => $indexPath,
             'MINECRAFT_MODRINTH_GITHUB_REQUIRE_GREEN_CI' => (bool) ($data['github_require_green_ci'] ?? true),
             'MINECRAFT_MODRINTH_GITHUB_REQUIRED_WORKFLOW' => $requiredWorkflow,
+            'MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL' => (bool) ($data['github_replace_manual'] ?? true),
         ];
 
         if (!empty($data['github_token_clear'])) {

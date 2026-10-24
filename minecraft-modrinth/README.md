@@ -67,7 +67,7 @@ console access doesn't see the pages at all.
 - **Seamless Installation**: Downloads to the correct server directory (mods/ or plugins/)
 - **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction (servers that are suspended, installing, being transferred or restored are skipped; one failing server never stops the run for the others)
 - **Verified Downloads**: The panel downloads every Modrinth file itself, only from `https://cdn.modrinth.com`, and checks it against the size and sha512 Modrinth publishes before it is written to the server
-- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI, individually or all pending updates at once; new plugins in the repository are offered (never installed automatically)
+- **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI, individually or all pending updates at once; new plugins in the repository are offered (never installed automatically); copies of them uploaded by hand are replaced with the repository version
 - **LuckPerms Source**: Keep LuckPerms on Paper/Spigot/Folia/Purpur and Velocity servers on the newest build from luckperms.net (usually days ahead of Modrinth), automatically or with a notification; an existing LuckPerms jar (manual or from Modrinth) is taken over
 - **Multilingual**: Supports English, German and Czech translations
 
@@ -131,6 +131,10 @@ Individual invalid entries are skipped and logged.
      `build.yml`) that must have a successful `push` run on exactly that commit and branch for CI
      to count as green. Without it, a quick workflow (e.g. a linter) that finishes before the
      build has even started could make CI green too early. **For Ethoria set `build.yml`.**
+   - **Replace manual copies** (on by default, `MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL`): a
+     jar of a repository plugin that was put into `plugins/` by hand is replaced with the
+     repository version (see [Manual copies](#manual-copies-replaced-with-the-github-version)).
+     Off: such a plugin is only shown as **Installed manually**, as in 1.4.1.
    - Automatic updates use the existing **Enable Automatic Updates** setting and time.
 3. The servers need the same egg setup as the Modrinth plugins page (`modrinth_plugins` or
    `plugins` feature, `minecraft` tag) plus a loader tag: `paper` (or `purpur`, `pufferfish`,
@@ -163,7 +167,9 @@ Individual invalid entries are skipped and logged.
   two jars of the plugin - delete the old one by hand before restarting. A jar is never left
   untracked. A pending jar is only deleted if a regular file with the recorded name and size is
   still there. If another jar that looks like the same plugin is already there (another version
-  of the same file, or a jar named after the plugin, e.g. a manual install), installing is
+  of the same file, or a jar named after the plugin, e.g. a manual install), it is replaced
+  while *Replace manual copies* is on and it passes the checks under
+  [Manual copies](#manual-copies-replaced-with-the-github-version); otherwise installing is
   refused until you remove it.
 - A full disk on the server is reported as such ("not enough disk space"), not as a conflict.
 - Temporary uploads (`.github-*.part`) left behind by an interrupted install are removed by the
@@ -181,7 +187,8 @@ Individual invalid entries are skipped and logged.
 - The running server keeps using what it loaded: **a new or updated plugin is used after the next
   server restart**.
 - **Update all**: shown on the GitHub Plugins page whenever at least one installed plugin has an
-  update available, labelled with the count. Updates every one of them, each independently through
+  update available (or a manual copy will be replaced), labelled with the count. Updates every one
+  of them (and replaces those manual copies), each independently through
   the same install/update logic a single plugin's own **Update** button uses - one plugin failing
   (a checksum mismatch, a file conflict, GitHub being briefly unreachable, ...) never stops the
   rest. Ends in a single summary notification ("Updated 5 plugins", or "Updated 4 of 6 plugins"
@@ -189,12 +196,15 @@ Individual invalid entries are skipped and logged.
   limit as a single update - and the same permissions (see below).
 - **Automatic updates** (daily, at the configured time) only update plugins that are already
   installed, only to a higher version, and only from a commit with green CI - regardless of the
-  "Require green CI" setting. Nothing new is ever installed automatically. Servers in a conflict
+  "Require green CI" setting - and, with *Replace manual copies* on, replace manual copies of
+  repository plugins (not of plugins hidden on that server). Nothing new is ever installed
+  automatically. Servers in a conflict
   state (suspended, installing, being transferred or restored, node in maintenance) and servers
   their node doesn't know are skipped; an error on one server never stops the run for the others.
 - Page access requires the subuser permission *file.read*; installing requires *file.create*,
   updating *file.create* and *file.delete*, removing *file.delete*; hiding an offer ("Doesn't
-  belong on this server") and "Offer again" require *file.create*.
+  belong on this server") and "Offer again" require *file.create*; replacing a manual copy
+  ("Replace with GitHub version") *file.create* and *file.delete*.
 
 ### New plugins
 
@@ -206,20 +216,23 @@ never installed automatically.
   the repository on that server and that nobody has hidden for that server. A server whose
   platform can't be determined (no loader tag, no plugins feature) is offered nothing. A plugin
   whose jar is already in `plugins/` without being installed from here (a manual install, a
-  Modrinth copy - recognised like the conflict check above) shows as **Installed manually** and
-  is not offered.
+  Modrinth copy - recognised like the conflict check above) is not offered as new: it shows as
+  **Manual copy - will be replaced** (counted as an update, see
+  [Manual copies](#manual-copies-replaced-with-the-github-version)) or, when it can't be
+  replaced automatically (or the setting is off), as **Installed manually**.
 - **GitHub Plugins page**: new plugins are listed first with the label **New - offered for
   installation** (then available updates), with a note above the table. Next to **Install** there
   is **Doesn't belong on this server**, which hides the offer on that server only. Hidden plugins
   can be shown with **Show hidden (n)** and brought back with **Offer again**.
 - **Menu badge**: the *GitHub Plugins* menu item shows how many plugins are offered (new plus
-  updates) - orange when there are updates, blue when there are only new plugins; the tooltip
+  updates; a manual copy that will be replaced counts as an update) - orange when there are updates, blue when there are only new plugins; the tooltip
   splits the number. The badge only reads a cached count (written by the hourly check below and by
   every visit of the page), so drawing the menu never contacts GitHub or the server's node; while
   there is no count (e.g. right after the plugin update, until the first check) there is no badge.
 - **Notifications**: an hourly check (`p:minecraft-modrinth:github-offers`, runs only while the
   GitHub source is enabled) reads the repository state once for all servers, then the metadata
-  file and the jar list of `plugins/` of every Paper/Velocity server (two Wings requests per server;
+  file and the jar list of `plugins/` of every Paper/Velocity server (two Wings requests per server,
+  a third one - Modrinth's metadata file - only when a manual copy of a repository plugin is there;
   servers in a conflict state - suspended, installing, being transferred or restored - and servers
   their node doesn't know are skipped). For every new plugin a server hasn't been
   told about yet, the panel sends a notification (the bell in the panel): *"On server {server},
@@ -239,11 +252,58 @@ never installed automatically.
   `plugins/.github-plugins.json` stays exactly as in 1.2.0. If the table is missing (migration not
   run), offers are still shown and counted, but hiding is not possible and nothing is announced.
 
-### Moving manually installed plugins over
+### Manual copies (replaced with the GitHub version)
 
-Delete the manually installed jar first (its configuration folder can stay), then install the
-plugin from the GitHub Plugins page. It is picked up at the next restart with the existing
-configuration.
+A jar of a repository plugin that was put into `plugins/` by hand (SFTP, file manager, an older
+manual install) is **replaced with the repository version** while *Replace manual copies* is on
+(the default) - no need to delete it first. Off, the plugin is only shown as **Installed
+manually**, as in 1.4.1.
+
+- **Where**: the GitHub Plugins page shows such a plugin as **Manual copy - will be replaced**
+  (installed column: the version from the file name, marked "manual"; the tooltip names the
+  file), with a note above the table and the button **Replace with GitHub version** (needs
+  *file.create* and *file.delete*). **Update all** includes it, and the **daily automatic
+  update** (with *Enable Automatic Updates* on) replaces it on every server. The hourly check
+  counts it as an update in the menu badge. *Update* of an installed plugin also replaces a manual
+  copy that lies next to it. A plain *Install* of a new plugin never deletes anything.
+- **Keeping a manual copy**: **Doesn't belong on this server** hides the plugin on that server -
+  a hidden plugin is never replaced (it shows as *Installed manually* with *Offer again*).
+- **How it is replaced** (the same safe order as an update): the panel downloads and verifies the
+  repository jar, checks the manual copy (below), writes the new jar (temporary name, then
+  rename), saves the metadata with the new entry **and** the manual copy as `pending_delete`
+  (with `replaced_by`), and only then deletes the manual copy. If the new jar or the metadata
+  can't be written, the new jar is removed again and the manual copy stays. If only the manual
+  copy can't be deleted, it stays recorded as pending and is deleted at the next installation,
+  the hourly check or the automatic update (the page warns until then). Two jars of the plugin
+  are never left behind untracked, and a manual copy is never deleted before the new jar is
+  written and recorded. If the manual copy has exactly the indexed file name, the new jar gets a
+  name with a hash suffix (an existing file is never overwritten).
+- **What counts as a manual copy** (conservative - a foreign plugin must never be deleted):
+  - recognised by file name only against the index entries **for the server's platform**:
+    another version of the indexed file name (`EthoriaChat-1.8.0.jar`) or a jar named after the
+    plugin (`EthoriaChat.jar`, `EthoriaChat-1.8.jar`);
+  - only plain jar files directly in `plugins/` - sub folders are never looked at, symlinks and
+    folders named `*.jar` are never touched, nor are jars with unusual names;
+  - never a jar that matches **more than one** index entry, never a jar the **Modrinth page
+    manages** (listed in `plugins/.modrinth-metadata.json`; nothing is replaced while that file
+    can't be read), and not more than 3 copies of one plugin at once;
+  - **checked by the plugin name inside**: before deleting it, the panel reads the manual copy
+    from the node and compares the `name` of its `plugin.yml` / `paper-plugin.yml` (Paper) or the
+    `id` of its `velocity-plugin.json` (Velocity) with the repository jar. Wings can't read a
+    single file inside a jar, so the **whole jar is downloaded** to the panel for that - but only
+    when it is about to be replaced (not for page views or the hourly check), at most 50 MB, and
+    the result is remembered for a day per file name, size and modification time. A copy that
+    declares another plugin, has no descriptor, isn't a jar or is larger than 50 MB is **kept**,
+    the replacement is refused with an explanation and the copy is no longer offered for
+    replacement (for a day, or until the file changes). If the node can't be read right now,
+    nothing happens and it is tried again later.
+- **Logged**: every deleted manual copy is written to the server's **activity log** ("Deleted
+  /plugins/<file>", with `replaced_by`, by the user who clicked or by the system for the automatic
+  update) and as one line to the panel log (`minecraft-modrinth: GitHub: deleted the manual copy
+  plugins/<file> on server #<id>, replaced with <plugin> <version> from the repository`). A
+  refused replacement is logged as an error (the same one at most once per hour).
+- The plugin's configuration folder (`plugins/<Plugin>/`) is never touched; the new version is
+  used after the next server restart.
 
 ### Security
 
@@ -269,8 +329,8 @@ configuration.
 
 - A manually installed jar is recognised only by its file name (another version of the indexed
   file name, or a jar named after the plugin). A manual copy with an unrelated file name is not
-  recognised; the `name` inside its `plugin.yml` / `paper-plugin.yml` / `velocity-plugin.json` is
-  not read (that would mean downloading every jar in `plugins/` from the node).
+  recognised (finding it would mean downloading every jar in `plugins/` from the node); the
+  `name` inside a recognised copy is only read right before it is replaced.
 - The panel keeps a jar in memory while installing it, hence the 50 MB limit.
 
 ## LuckPerms source (luckperms.net)
@@ -384,6 +444,16 @@ luckperms.net publishes no checksum, so instead:
 
 ## Changes
 
+- **1.5.0** - Manual copies are replaced with the GitHub version: a jar of a repository plugin
+  that was uploaded to `plugins/` by hand no longer blocks it ("remove it first"). New setting
+  *Replace manual copies* (on by default): the GitHub Plugins page shows it as "Manual copy - will
+  be replaced" with **Replace with GitHub version**, "Update all" and the daily automatic update
+  replace it, the badge counts it as an update; the new jar is written and recorded first, the
+  manual copy is deleted only then (or later, if deleting fails) and logged in the server's
+  activity log. Only a jar recognised by name for exactly one plugin of the server's platform,
+  directly in `plugins/`, not managed by the Modrinth page, and declaring the same plugin name
+  in its `plugin.yml` / `velocity-plugin.json` is replaced; plugins hidden on a server are left
+  alone. Off: as in 1.4.1.
 - **1.4.1** - Fix: saving the settings failed with "Enter the time as HH:MM" even for a valid time
   (e.g. 15:55). Filament's time picker keeps the picked value as "YYYY-MM-DD HH:mm:ss", which the
   check only accepted as "HH:MM"; the date part and seconds are now dropped and only HH:MM is stored.

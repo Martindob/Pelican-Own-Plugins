@@ -19,7 +19,7 @@ class AutoUpdateModsCommand extends Command
 {
     protected $signature = 'p:minecraft-modrinth:auto-update';
 
-    protected $description = 'Automatically updates installed Modrinth mods/plugins to their latest compatible version, plugins installed from the GitHub repository source to a newer version with green CI, and LuckPerms to the newest version from luckperms.net (or notifies about it).';
+    protected $description = 'Automatically updates installed Modrinth mods/plugins to their latest compatible version, plugins installed from the GitHub repository source to a newer version with green CI (replacing manual copies of them when that setting is on), and LuckPerms to the newest version from luckperms.net (or notifies about it).';
 
     public function handle(): int
     {

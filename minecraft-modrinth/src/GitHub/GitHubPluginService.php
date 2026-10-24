@@ -2,13 +2,17 @@
 
 namespace Boy132\MinecraftModrinth\GitHub;
 
+use App\Facades\Activity;
 use App\Models\Server;
 use Boy132\MinecraftModrinth\Enums\ModrinthProjectType;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthMetadataException;
+use Boy132\MinecraftModrinth\Services\MinecraftModrinthService;
 use Boy132\MinecraftModrinth\Support\DaemonFileException;
 use Boy132\MinecraftModrinth\Support\DaemonFiles;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
@@ -18,12 +22,13 @@ use Throwable;
  * The panel downloads every jar itself, checks it against the sha256/size from the index and
  * only then writes it to the server through the Wings file API - Wings never gets a GitHub URL
  * or the token. Only the jar in plugins/ and our own metadata file are ever touched; a plugin's
- * own folder (plugins/<Name>/config.yml, ...) never is.
+ * own folder (plugins/<Name>/config.yml, ...) never is. With "Replace manual copies" on, a jar of
+ * the same plugin that was put into plugins/ by hand is replaced as well (see installLocked()).
  *
  * @phpstan-type IndexPlugin array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}
  * @phpstan-type Snapshot array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, IndexPlugin>, problems: array<int, string>}
  * @phpstan-type InstalledPlugin array{id: string, name: string, platform: string, version: string, sha256: string, size: int, filename: string, repository: string, commit: string, installed_at: string, updated_at?: string}
- * @phpstan-type PendingDelete array{filename: string, size: int}
+ * @phpstan-type PendingDelete array{filename: string, size: int, replaced_by?: string}
  * @phpstan-type Metadata array{installed: array<int, InstalledPlugin>, pending_delete: array<int, PendingDelete>}
  */
 class GitHubPluginService
@@ -49,6 +54,9 @@ class GitHubPluginService
     protected const MAX_METADATA_ENTRIES = 1000;
 
     protected const MAX_PENDING_DELETES = 50;
+
+    /** How long what was read from a manual copy (and a refused replacement) is remembered. */
+    protected const MANUAL_COPY_CACHE_HOURS = 24;
 
     /** @var array<string, string> Verified jar contents of this run, by sha256 (one download for many servers). */
     protected array $jarCache = [];
@@ -92,6 +100,15 @@ class GitHubPluginService
         $workflow = trim((string) config('minecraft-modrinth.github.required_workflow'));
 
         return $workflow !== '' ? $workflow : null;
+    }
+
+    /**
+     * Whether a jar of the same plugin that was put into plugins/ by hand is replaced with the
+     * repository version (on by default; off: such a plugin is only shown as "Installed manually").
+     */
+    public function replacesManualCopies(): bool
+    {
+        return (bool) config('minecraft-modrinth.github.replace_manual', true);
     }
 
     public function hasToken(): bool
@@ -361,7 +378,9 @@ class GitHubPluginService
         $pending = [];
         foreach (is_array($data['pending_delete'] ?? null) ? array_slice($data['pending_delete'], 0, self::MAX_PENDING_DELETES) : [] as $item) {
             if (is_array($item) && is_string($item['filename'] ?? null) && GitHubSourceRules::isValidJarFilename($item['filename']) && is_int($item['size'] ?? null)) {
-                $pending[] = ['filename' => $item['filename'], 'size' => $item['size']];
+                // "replaced_by": a manual copy that was replaced (logged when it is deleted).
+                $replacedBy = is_string($item['replaced_by'] ?? null) && strlen($item['replaced_by']) <= 160 ? $item['replaced_by'] : null;
+                $pending[] = ['filename' => $item['filename'], 'size' => $item['size']] + ($replacedBy !== null ? ['replaced_by' => $replacedBy] : []);
             }
         }
 
@@ -413,15 +432,23 @@ class GitHubPluginService
      * no jar is ever left untracked. The running server keeps using what it loaded; the new
      * version is used after its next restart.
      *
+     * With $replaceManual (and the "Replace manual copies" setting on), jars of the same plugin
+     * that were put into plugins/ by hand are replaced the same way as an old jar: checked first
+     * (name rules, then the plugin name inside the jar), recorded as "to delete" together with the
+     * new entry, and only then deleted. Without it, such a jar is a conflict as before.
+     *
      * @param  IndexPlugin  $plugin
      * @param  Snapshot  $snapshot
      * @param  bool|null  $expectInstalled  true for "Update", false for "Install": refused when the state changed meanwhile
+     * @param  array<int, string>|null  $replacedCopies  set to the manual copies that were deleted
      * @return InstalledPlugin
      *
      * @throws GitHubSourceException
      */
-    public function installOrUpdate(Server $server, array $plugin, array $snapshot, bool $requireGreenCi, ?bool $expectInstalled = null): array
+    public function installOrUpdate(Server $server, array $plugin, array $snapshot, bool $requireGreenCi, ?bool $expectInstalled = null, bool $replaceManual = false, ?array &$replacedCopies = null): array
     {
+        $replacedCopies = [];
+
         if ($this->platformForServer($server) !== $plugin['platform']) {
             throw new GitHubSourceException(GitHubSourceException::INVALID_INDEX, "{$plugin['id']} is for {$plugin['platform']}, which server #{$server->id} is not");
         }
@@ -430,14 +457,15 @@ class GitHubPluginService
             throw new GitHubSourceException(GitHubSourceException::CI_NOT_GREEN, "CI of {$snapshot['sha']} is {$snapshot['ci']->value}, not green");
         }
 
-        $lock = Cache::lock("minecraft-modrinth:github:install:{$server->id}", self::DOWNLOAD_TIMEOUT + self::DAEMON_WRITE_TIMEOUT + 60);
+        // Also covers reading a manual copy from the node to check what it is.
+        $lock = Cache::lock("minecraft-modrinth:github:install:{$server->id}", self::DOWNLOAD_TIMEOUT * 2 + self::DAEMON_WRITE_TIMEOUT + 60);
 
         if (!$lock->get()) {
             throw new GitHubSourceException(GitHubSourceException::FILE_CONFLICT, "Another plugin installation is running on server #{$server->id}");
         }
 
         try {
-            return $this->installLocked($server, $plugin, $snapshot, $expectInstalled);
+            return $this->installLocked($server, $plugin, $snapshot, $expectInstalled, $replaceManual && $this->replacesManualCopies(), $replacedCopies);
         } finally {
             $lock->release();
         }
@@ -446,9 +474,10 @@ class GitHubPluginService
     /**
      * @param  IndexPlugin  $plugin
      * @param  Snapshot  $snapshot
+     * @param  array<int, string>  $replacedCopies  receives the manual copies that were deleted
      * @return InstalledPlugin
      */
-    protected function installLocked(Server $server, array $plugin, array $snapshot, ?bool $expectInstalled): array
+    protected function installLocked(Server $server, array $plugin, array $snapshot, ?bool $expectInstalled, bool $replaceManual, array &$replacedCopies): array
     {
         $metadata = $this->readMetadata($server);
         $installedList = $metadata['installed'];
@@ -471,7 +500,11 @@ class GitHubPluginService
         // Old jars still waiting for deletion are ours, not another copy of the plugin.
         $pendingNames = array_column($pending, 'filename');
         $existing = array_values(array_diff($this->jarNamesOf($files), $pendingNames));
-        $target = $this->chooseTargetFilename($plugin, $previous, $existing);
+
+        // Manual copies to replace: fully checked before anything is written (throws otherwise).
+        $takeOver = $replaceManual ? $this->copiesToTakeOver($server, $plugin, $snapshot, $installedList, $pendingNames, $files, $content) : [];
+
+        $target = $this->chooseTargetFilename($plugin, $previous, $existing, array_column($takeOver, 'filename'));
 
         $this->writeJar($server, $target, $content);
 
@@ -506,16 +539,21 @@ class GitHubPluginService
             $newList[] = $entry;
         }
 
-        $replacesOldJar = $previous !== null && $previous['filename'] !== $target;
+        // Everything this installation deletes: the plugin's old jar and the manual copies.
+        $toDelete = [];
 
-        // The old jar is recorded as "to delete" before it is deleted: whatever fails from here
-        // on, the metadata always knows about every jar of this plugin.
-        $pendingWithOld = $replacesOldJar
-            ? [...$pending, ['filename' => $previous['filename'], 'size' => $previous['size']]]
-            : $pending;
+        if ($previous !== null && $previous['filename'] !== $target) {
+            $toDelete[] = ['filename' => $previous['filename'], 'size' => $previous['size']];
+        }
 
+        foreach ($takeOver as $copy) {
+            $toDelete[] = $copy + ['replaced_by' => $plugin['name'].' '.$plugin['version']];
+        }
+
+        // Recorded as "to delete" before anything is deleted: whatever fails from here on, the
+        // metadata always knows about every jar of this plugin.
         try {
-            $this->writeMetadata($server, $newList, $pendingWithOld);
+            $this->writeMetadata($server, $newList, [...$pending, ...$toDelete]);
         } catch (GitHubSourceException $exception) {
             // A write that timed out may still have gone through: only roll back what didn't.
             if (!$this->metadataRecords($server, $entry)) {
@@ -525,25 +563,42 @@ class GitHubPluginService
             }
         }
 
-        if (!$replacesOldJar) {
+        if ($toDelete === []) {
             return $entry;
         }
 
-        try {
-            $this->deleteJar($server, $previous['filename']);
-        } catch (GitHubSourceException $exception) {
-            if (!$this->oldJarGone($server, $previous['filename'])) {
-                // Stays recorded as pending deletion (written above) and is retried later.
-                throw new GitHubSourceException(GitHubSourceException::OLD_JAR_PENDING, "Updated {$plugin['id']} to {$plugin['version']} on server #{$server->id}, but plugins/{$previous['filename']} could not be deleted yet ({$exception->getMessage()})");
+        $stillPending = [];
+        $failures = [];
+
+        foreach ($toDelete as $item) {
+            try {
+                $this->deleteJar($server, $item['filename']);
+            } catch (GitHubSourceException $exception) {
+                if (!$this->oldJarGone($server, $item['filename'])) {
+                    // Stays recorded as pending deletion (written above) and is retried later.
+                    $stillPending[] = $item;
+                    $failures[] = "plugins/{$item['filename']} ({$exception->getMessage()})";
+
+                    continue;
+                }
+            }
+
+            if (isset($item['replaced_by'])) {
+                $replacedCopies[] = $item['filename'];
+                $this->logReplacedCopy($server, $item['filename'], $item['replaced_by']);
             }
         }
 
-        // Deleted: drop it from the pending list again. If this write fails the entry only
-        // points at a file that no longer exists and is dropped at the next cleanup.
+        // Drop what was deleted from the pending list again. If this write fails the entries only
+        // point at files that no longer exist and are dropped at the next cleanup.
         try {
-            $this->writeMetadata($server, $newList, $pending);
+            $this->writeMetadata($server, $newList, [...$pending, ...$stillPending]);
         } catch (GitHubSourceException $exception) {
             $this->report($exception);
+        }
+
+        if ($failures !== []) {
+            throw new GitHubSourceException(GitHubSourceException::OLD_JAR_PENDING, ($previous ? 'Updated' : 'Installed')." {$plugin['id']} {$plugin['version']} on server #{$server->id}, but ".implode(', ', $failures).' could not be deleted yet');
         }
 
         return $entry;
@@ -603,6 +658,12 @@ class GitHubPluginService
             } catch (GitHubSourceException $exception) {
                 $this->reportOncePerWindow("server:{$server->id}:pending:{$item['filename']}", $exception);
                 $remaining[] = $item;
+
+                continue;
+            }
+
+            if (isset($item['replaced_by'])) {
+                $this->logReplacedCopy($server, $item['filename'], $item['replaced_by']);
             }
         }
 
@@ -712,22 +773,24 @@ class GitHubPluginService
 
     /**
      * Pick the file name for a new jar: the indexed name, or - if that is taken by the plugin's
-     * own current jar - an alternative one. Any other jar that looks like the same plugin
-     * (another version, a manual copy named after the plugin, a Modrinth install of it) is a
-     * conflict: installing next to it would leave two copies of the plugin in plugins/.
+     * own current jar (or a manual copy that is being replaced) - an alternative one. Any other
+     * jar that looks like the same plugin (another version, a manual copy named after the
+     * plugin, a Modrinth install of it) is a conflict: installing next to it would leave two
+     * copies of the plugin in plugins/.
      *
      * @param  IndexPlugin  $plugin
      * @param  InstalledPlugin|null  $previous
      * @param  array<int, string>  $existing  jar names currently in plugins/
+     * @param  array<int, string>  $takeOver  manual copies that are replaced (deleted after the write)
      *
      * @throws GitHubSourceException
      */
-    public function chooseTargetFilename(array $plugin, ?array $previous, array $existing): string
+    public function chooseTargetFilename(array $plugin, ?array $previous, array $existing, array $takeOver = []): string
     {
         $previousName = $previous['filename'] ?? null;
 
         foreach ($existing as $name) {
-            if ($name === $previousName) {
+            if ($name === $previousName || in_array($name, $takeOver, true)) {
                 continue;
             }
 
@@ -744,6 +807,318 @@ class GitHubPluginService
         }
 
         throw new GitHubSourceException(GitHubSourceException::FILE_CONFLICT, "No free file name for {$plugin['filename']} in plugins/");
+    }
+
+    // ------------------------------------------------------------------
+    // Manual copies (replaced with the repository version)
+    // ------------------------------------------------------------------
+
+    /**
+     * Jar names this plugin manages on a server: installed ones and old jars pending deletion.
+     *
+     * @param  Metadata  $metadata
+     * @return array<int, string>
+     */
+    public function managedFilenames(array $metadata): array
+    {
+        return [...array_column($metadata['installed'], 'filename'), ...array_column($metadata['pending_delete'], 'filename')];
+    }
+
+    /**
+     * The manual copies that would be replaced, per plugin of the server's platform that isn't
+     * installed from here and isn't hidden on this server: plugin id => jar names. Empty while
+     * "Replace manual copies" is off. Only by name and what was found out before (a copy refused
+     * earlier is left out) - the plugin name inside the jar is checked when it is replaced.
+     * Reads Modrinth's metadata file only when there is a candidate at all.
+     *
+     * @param  array<int, IndexPlugin>  $platformPlugins
+     * @param  Metadata  $metadata
+     * @param  array<int, array<string, mixed>>  $files  listing of plugins/
+     * @param  array<int, string>  $dismissedIds
+     * @return array<string, array<int, string>>
+     */
+    public function manualReplacements(Server $server, array $platformPlugins, array $metadata, array $files, array $dismissedIds): array
+    {
+        if (!$this->replacesManualCopies()) {
+            return [];
+        }
+
+        $installedIds = array_column($metadata['installed'], 'id');
+        $managed = $this->managedFilenames($metadata);
+        $jarNames = $this->jarNamesOf($files);
+
+        $candidates = array_filter($platformPlugins, fn (array $plugin) => !in_array($plugin['id'], $installedIds, true)
+            && !in_array($plugin['id'], $dismissedIds, true)
+            && GitHubSourceRules::unmanagedCopies($plugin, $jarNames, $managed) !== []);
+
+        if ($candidates === []) {
+            return [];
+        }
+
+        $protected = $this->protectedJarNames($server, $files);
+
+        if ($protected === null) {
+            return [];
+        }
+
+        $replacements = [];
+
+        foreach ($candidates as $plugin) {
+            $copies = GitHubSourceRules::replaceableCopies($plugin, $platformPlugins, $jarNames, $managed, $protected);
+
+            if (empty($copies)) {
+                continue;
+            }
+
+            foreach ($copies as $name) {
+                $file = DaemonFiles::find($files, $name);
+
+                if ($file === null || $this->takeoverRefused($server, $plugin, $file) !== null) {
+                    continue 2;
+                }
+            }
+
+            $replacements[$plugin['id']] = $copies;
+        }
+
+        return $replacements;
+    }
+
+    /**
+     * Jars in plugins/ that are never replaced: anything that isn't a regular file (symlinks,
+     * folders named *.jar) and every jar the Modrinth page manages. Null when Modrinth's
+     * metadata file can't be read (then nobody can say which jars are Modrinth's).
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @return array<int, string>|null
+     */
+    protected function protectedJarNames(Server $server, array $files): ?array
+    {
+        $protected = [];
+
+        foreach ($files as $file) {
+            if (is_string($file['name'] ?? null) && str_ends_with(strtolower($file['name']), '.jar') && !DaemonFiles::isRegularFile($file)) {
+                $protected[] = $file['name'];
+            }
+        }
+
+        try {
+            $entries = app(MinecraftModrinthService::class)->readModsMetadata($server, ModrinthProjectType::Plugin)['entries'];
+        } catch (ModrinthMetadataException $exception) {
+            $this->reportOncePerWindow("server:{$server->id}:manual:modrinth", new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "Manual copies are not replaced on server #{$server->id} while the Modrinth metadata can't be read: {$exception->getMessage()}"));
+
+            return null;
+        }
+
+        return [...$protected, ...array_column($entries, 'filename')];
+    }
+
+    /**
+     * Check the manual copies of $plugin before they are replaced: by name (replaceableCopies())
+     * and then by the plugin name declared inside both jars - only a copy that declares the same
+     * plugin as the new jar is replaced. A copy that turns out to be another plugin is remembered
+     * and no longer offered for replacement.
+     *
+     * @param  IndexPlugin  $plugin
+     * @param  Snapshot  $snapshot
+     * @param  array<int, InstalledPlugin>  $installedList
+     * @param  array<int, string>  $pendingNames
+     * @param  array<int, array<string, mixed>>  $files  listing of plugins/
+     * @return array<int, array{filename: string, size: int}>
+     *
+     * @throws GitHubSourceException MANUAL_COPY when a copy is there that can't be replaced
+     */
+    protected function copiesToTakeOver(Server $server, array $plugin, array $snapshot, array $installedList, array $pendingNames, array $files, string $content): array
+    {
+        $platformPlugins = $this->pluginsForPlatform($snapshot['plugins'], $plugin['platform']);
+        $managed = [...array_column($installedList, 'filename'), ...$pendingNames];
+        $jarNames = $this->jarNamesOf($files);
+        $unmanaged = GitHubSourceRules::unmanagedCopies($plugin, $jarNames, $managed);
+
+        if ($unmanaged === []) {
+            return [];
+        }
+
+        $listed = 'plugins/'.implode(', plugins/', $unmanaged);
+        $protected = $this->protectedJarNames($server, $files);
+
+        if ($protected === null) {
+            throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "$listed on server #{$server->id} not replaced: the Modrinth metadata can't be read");
+        }
+
+        $copies = GitHubSourceRules::replaceableCopies($plugin, $platformPlugins, $jarNames, $managed, $protected);
+
+        if ($copies === null) {
+            throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "$listed on server #{$server->id} not replaced: managed by the Modrinth page, not a regular file, matching several plugins of the index or more than ".GitHubSourceRules::MAX_TAKEOVER_COPIES.' copies - remove it by hand');
+        }
+
+        $result = [];
+        $expected = null;
+
+        foreach ($copies as $name) {
+            $file = DaemonFiles::find($files, $name) ?? [];
+
+            if (($refused = $this->takeoverRefused($server, $plugin, $file)) !== null) {
+                throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "plugins/$name on server #{$server->id} not replaced: $refused");
+            }
+
+            if ($expected === null) {
+                $problem = null;
+                $expected = $this->descriptorNamesOfContent($content, $plugin['platform'], $problem);
+
+                if ($expected === null) {
+                    throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "plugins/$name on server #{$server->id} not replaced: the jar of {$plugin['id']} from the repository can't be checked ($problem)");
+                }
+            }
+
+            $inspected = $this->inspectManualCopy($server, $file, $plugin['platform']);
+
+            if ($inspected === false) {
+                throw new GitHubSourceException(GitHubSourceException::DAEMON, "plugins/$name on server #{$server->id} not replaced: it could not be read from the node to check which plugin it is");
+            }
+
+            if ($inspected['names'] === null || !GitHubSourceRules::sameDescriptor($inspected['names'], $expected)) {
+                $reason = $inspected['names'] === null
+                    ? "it can't be checked ({$inspected['problem']})"
+                    : 'it declares '.implode('/', $inspected['names']).', the repository jar '.implode('/', $expected);
+                $this->rememberRefusal($server, $plugin, $file, $reason);
+
+                throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "plugins/$name on server #{$server->id} is not replaced with {$plugin['id']}: $reason");
+            }
+
+            $result[] = ['filename' => $name, 'size' => (int) ($file['size'] ?? 0)];
+        }
+
+        return $result;
+    }
+
+    /**
+     * What a manual copy declares itself as (see GitHubSourceRules::jarDescriptorNames()), read
+     * from the node - the whole jar has to be downloaded for that, so only when it is about to
+     * be replaced, and remembered by name, size and modification time. False when it can't be
+     * read right now.
+     *
+     * @param  array<string, mixed>  $file
+     * @return array{names: array<int, string>|null, problem: string|null}|false
+     */
+    protected function inspectManualCopy(Server $server, array $file, string $platform): array|false
+    {
+        $name = (string) ($file['name'] ?? '');
+        $key = 'minecraft-modrinth:github:copy:'.md5(implode("\0", [$server->uuid, $platform, $name, (string) ($file['size'] ?? ''), (string) ($file['modified'] ?? '')]));
+
+        $cached = Cache::get($key);
+        if (is_array($cached) && array_key_exists('names', $cached) && array_key_exists('problem', $cached)) {
+            return $cached;
+        }
+
+        $tooLarge = ['names' => null, 'problem' => 'larger than '.GitHubSourceRules::MAX_JAR_BYTES.' bytes'];
+
+        if ((int) ($file['size'] ?? 0) > GitHubSourceRules::MAX_JAR_BYTES) {
+            $result = $tooLarge;
+        } else {
+            try {
+                $content = DaemonFiles::readSmallFile($server, self::FOLDER.'/'.$name, GitHubSourceRules::MAX_JAR_BYTES);
+            } catch (DaemonFileException $exception) {
+                if ($exception->reason !== DaemonFileException::TOO_LARGE) {
+                    $this->reportOncePerWindow("server:{$server->id}:manual:read:$name", GitHubSourceException::fromDaemon($exception));
+
+                    return false;
+                }
+
+                $content = false;
+            }
+
+            if ($content === null) {
+                // Gone in the meantime.
+                return false;
+            }
+
+            if ($content === false) {
+                $result = $tooLarge;
+            } else {
+                $problem = null;
+                $result = ['names' => $this->descriptorNamesOfContent($content, $platform, $problem), 'problem' => $problem];
+                unset($content);
+            }
+        }
+
+        Cache::put($key, $result, now()->addHours(self::MANUAL_COPY_CACHE_HOURS));
+
+        return $result;
+    }
+
+    /**
+     * @return array<int, string>|null
+     */
+    protected function descriptorNamesOfContent(string $content, string $platform, ?string &$problem = null): ?array
+    {
+        $temporary = tempnam(sys_get_temp_dir(), 'minecraft-modrinth-github-');
+
+        try {
+            if ($temporary === false || file_put_contents($temporary, $content) !== strlen($content)) {
+                $problem = 'could not write a temporary file';
+
+                return null;
+            }
+
+            return GitHubSourceRules::jarDescriptorNames($temporary, $platform, $problem);
+        } finally {
+            if (is_string($temporary)) {
+                @unlink($temporary);
+            }
+        }
+    }
+
+    /**
+     * @param  IndexPlugin  $plugin
+     * @param  array<string, mixed>  $file
+     */
+    protected function refusalKey(Server $server, array $plugin, array $file): string
+    {
+        return 'minecraft-modrinth:github:copy-refused:'.md5(implode("\0", [$server->uuid, $plugin['id'], $plugin['sha256'], (string) ($file['name'] ?? ''), (string) ($file['size'] ?? ''), (string) ($file['modified'] ?? '')]));
+    }
+
+    /**
+     * Why this manual copy was not replaced with this plugin before, or null.
+     *
+     * @param  IndexPlugin  $plugin
+     * @param  array<string, mixed>  $file
+     */
+    public function takeoverRefused(Server $server, array $plugin, array $file): ?string
+    {
+        $reason = Cache::get($this->refusalKey($server, $plugin, $file));
+
+        return is_string($reason) ? $reason : null;
+    }
+
+    /**
+     * @param  IndexPlugin  $plugin
+     * @param  array<string, mixed>  $file
+     */
+    protected function rememberRefusal(Server $server, array $plugin, array $file, string $reason): void
+    {
+        Cache::put($this->refusalKey($server, $plugin, $file), $reason, now()->addHours(self::MANUAL_COPY_CACHE_HOURS));
+    }
+
+    /**
+     * A replaced manual copy was deleted: one line in the panel log and an entry in the server's
+     * activity log ("Deleted /plugins/<file>", by the user who clicked or by the system for the
+     * automatic update). Never throws.
+     */
+    protected function logReplacedCopy(Server $server, string $filename, string $replacedBy): void
+    {
+        Log::info("minecraft-modrinth: GitHub: deleted the manual copy plugins/$filename on server #{$server->id}, replaced with $replacedBy from the repository");
+
+        try {
+            Activity::event('server:file.delete')
+                ->subject($server)
+                ->property('directory', self::FOLDER)
+                ->property('files', [$filename])
+                ->property('replaced_by', "$replacedBy (GitHub)")
+                ->log();
+        } catch (Throwable $exception) {
+            $this->report($exception);
+        }
     }
 
     /**
@@ -867,10 +1242,12 @@ class GitHubPluginService
 
     /**
      * Update every plugin already installed from the repository on this server to a newer
-     * version from a commit with green CI. Never installs anything new.
+     * version from a commit with green CI, and - with "Replace manual copies" on - replace the
+     * manual copies of plugins that aren't installed from here (not of hidden ones). Never
+     * installs anything new.
      *
      * @param  Snapshot  $snapshot
-     * @return array<int, string> ids that were updated
+     * @return array<int, string> ids that were updated (replacements as "id (replaced: file, ...)")
      */
     public function autoUpdateServer(Server $server, array $snapshot): array
     {
@@ -923,6 +1300,8 @@ class GitHubPluginService
             }
         }
 
+        array_push($updated, ...$this->autoReplaceManualCopies($server, $snapshot, $platform));
+
         if (!empty($updated)) {
             // The cached offer count still includes these updates: drop it, the next offer check
             // (or a visit of the page) counts again.
@@ -930,6 +1309,64 @@ class GitHubPluginService
         }
 
         return $updated;
+    }
+
+    /**
+     * The automatic update's part for manual copies (see autoUpdateServer()).
+     *
+     * @param  Snapshot  $snapshot
+     * @return array<int, string>
+     */
+    protected function autoReplaceManualCopies(Server $server, array $snapshot, string $platform): array
+    {
+        if (!$this->replacesManualCopies()) {
+            return [];
+        }
+
+        try {
+            // Hidden plugins are never replaced: without the stored decisions nothing is.
+            $dismissed = app(GitHubOffers::class)->dismissedIds($server);
+            $metadata = $this->readMetadata($server);
+            $files = $this->listPluginFiles($server);
+        } catch (GitHubSourceException $exception) {
+            if ($exception->reason !== GitHubSourceException::UNKNOWN_SERVER) {
+                $this->reportOncePerWindow("server:{$server->id}:manual:{$exception->reason}", $exception);
+            }
+
+            return [];
+        }
+
+        $platformPlugins = $this->pluginsForPlatform($snapshot['plugins'], $platform);
+        $done = [];
+
+        foreach ($this->manualReplacements($server, $platformPlugins, $metadata, $files, $dismissed) as $id => $copies) {
+            $plugin = null;
+            foreach ($platformPlugins as $candidate) {
+                if ($candidate['id'] === $id) {
+                    $plugin = $candidate;
+                }
+            }
+
+            if ($plugin === null) {
+                continue;
+            }
+
+            $replaced = [];
+
+            try {
+                $this->installOrUpdate($server, $plugin, $snapshot, true, false, true, $replaced);
+                $done[] = "$id (replaced: ".implode(', ', $replaced).')';
+            } catch (GitHubSourceException $exception) {
+                if ($exception->reason === GitHubSourceException::OLD_JAR_PENDING) {
+                    // Installed; a copy is left for later.
+                    $done[] = "$id (replaced: ".implode(', ', $copies).')';
+                }
+
+                $this->reportOncePerWindow("server:{$server->id}:replace:{$id}:{$exception->reason}", $exception);
+            }
+        }
+
+        return $done;
     }
 
     // ------------------------------------------------------------------

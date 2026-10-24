@@ -17,7 +17,8 @@ use Throwable;
 
 /**
  * Plugins from the GitHub repository that are offered to a server (see README "New plugins"):
- * new ones (in the index for the server's platform, not installed, not dismissed) and updates.
+ * new ones (in the index for the server's platform, not installed, not dismissed) and updates
+ * (including manual copies that will be replaced with the repository version).
  *
  * - Per-server decisions ("doesn't belong on this server") and which new plugins a server was
  *   already told about live in the panel database (table minecraft_modrinth_github_offers,
@@ -217,13 +218,20 @@ class GitHubOffers
         try {
             $dismissed = $this->dismissedIds($server);
             $notified = $this->notifiedIds($server);
+            $dismissedKnown = true;
         } catch (GitHubSourceException $exception) {
             $this->service()->reportOncePerWindow("offers:store:{$exception->reason}", $exception);
             $dismissed = [];
             $notified = null;
+            $dismissedKnown = false;
         }
 
-        $offers = GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, array_column($metadata['pending_delete'], 'filename'));
+        // Manual copies that will be replaced count as updates (none while hidden offers are unknown).
+        $replacements = $dismissedKnown
+            ? $this->service()->manualReplacements($server, $this->service()->pluginsForPlatform($snapshot['plugins'], $platform), $metadata, $files, $dismissed)
+            : [];
+
+        $offers = GitHubSourceRules::offers($snapshot['plugins'], $platform, $installed, $dismissed, $jarNames, array_column($metadata['pending_delete'], 'filename'), array_keys($replacements));
         $this->rememberCounts($server, $offers);
 
         // Old jars pending deletion and temporary uploads left behind by an interrupted install.

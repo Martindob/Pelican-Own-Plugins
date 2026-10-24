@@ -58,6 +58,9 @@ class GitHubSourceException extends RuntimeException
     /** Updated, but the old jar couldn't be deleted yet: recorded and deleted later. */
     public const OLD_JAR_PENDING = 'old_jar_pending';
 
+    /** A manual copy of the plugin is in plugins/ and can't be replaced automatically. */
+    public const MANUAL_COPY = 'manual_copy';
+
     public function __construct(public readonly string $reason, string $message, public readonly ?int $retryAfter = null)
     {
         parent::__construct(GitHubSourceRules::redact($message));

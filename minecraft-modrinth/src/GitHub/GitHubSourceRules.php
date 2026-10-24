@@ -2,6 +2,8 @@
 
 namespace Boy132\MinecraftModrinth\GitHub;
 
+use ZipArchive;
+
 /**
  * Pure validation/decision logic for the GitHub repository source.
  *
@@ -28,6 +30,12 @@ final class GitHubSourceRules
     public const PAPER_LOADERS = ['paper', 'purpur', 'pufferfish', 'leaf'];
 
     public const VELOCITY_LOADERS = ['velocity'];
+
+    /** Most manual copies of one plugin that are replaced at once; more is left to a human. */
+    public const MAX_TAKEOVER_COPIES = 3;
+
+    /** plugin.yml / paper-plugin.yml / velocity-plugin.json are a few KB at most. */
+    public const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 
     public static function isValidRepository(string $repository): bool
     {
@@ -512,17 +520,216 @@ final class GitHubSourceRules
      */
     public static function hasUnmanagedCopy(array $plugin, array $jarNames, array $managedFilenames): bool
     {
+        return self::unmanagedCopies($plugin, $jarNames, $managedFilenames) !== [];
+    }
+
+    /**
+     * The jars in plugins/ that look like this plugin but aren't managed by this plugin.
+     *
+     * @param  array{filename: string, name: string}  $plugin
+     * @param  array<int, string>  $jarNames  jar names currently in plugins/
+     * @param  array<int, string>  $managedFilenames  jar names recorded in the metadata file
+     * @return array<int, string>
+     */
+    public static function unmanagedCopies(array $plugin, array $jarNames, array $managedFilenames): array
+    {
+        $copies = [];
+
         foreach ($jarNames as $name) {
             if (in_array($name, $managedFilenames, true)) {
                 continue;
             }
 
             if (self::looksLikeSamePlugin($name, $plugin['filename'], $plugin['name'])) {
-                return true;
+                $copies[] = $name;
             }
         }
 
-        return false;
+        return $copies;
+    }
+
+    /**
+     * Ids of the index entries (of one platform) that a jar in plugins/ looks like.
+     *
+     * @param  array<int, array{id: string, filename: string, name: string}>  $platformPlugins
+     * @return array<int, string>
+     */
+    public static function pluginsMatchingJar(string $jarName, array $platformPlugins): array
+    {
+        $ids = [];
+
+        foreach ($platformPlugins as $plugin) {
+            if (self::looksLikeSamePlugin($jarName, $plugin['filename'], $plugin['name'])) {
+                $ids[] = $plugin['id'];
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * The manual copies of $plugin that installing it from the repository may delete ("take
+     * over"), or null when there are copies that must not be touched automatically:
+     *
+     * - a copy that matches more than one index entry of the platform (whose is it?),
+     * - a copy that isn't a plain jar name directly in plugins/ (sub folders are never looked at),
+     * - a protected copy ($protectedNames: managed by the Modrinth page, not a regular file,
+     *   or refused earlier because its plugin.yml names another plugin),
+     * - more than MAX_TAKEOVER_COPIES copies at once.
+     *
+     * An empty list means there is no copy at all. Recognition is by name only - the caller still
+     * has to compare the plugin descriptors before deleting anything.
+     *
+     * @param  array{id: string, filename: string, name: string}  $plugin
+     * @param  array<int, array{id: string, filename: string, name: string}>  $platformPlugins  the index entries of the server's platform
+     * @param  array<int, string>  $jarNames  jar names currently in plugins/
+     * @param  array<int, string>  $managedFilenames  jar names this plugin manages (installed and pending deletion)
+     * @param  array<int, string>  $protectedNames  jar names that are never taken over
+     * @return array<int, string>|null
+     */
+    public static function replaceableCopies(array $plugin, array $platformPlugins, array $jarNames, array $managedFilenames, array $protectedNames): ?array
+    {
+        $copies = self::unmanagedCopies($plugin, $jarNames, $managedFilenames);
+
+        if ($copies === []) {
+            return [];
+        }
+
+        if (count($copies) > self::MAX_TAKEOVER_COPIES) {
+            return null;
+        }
+
+        foreach ($copies as $name) {
+            if (!self::isValidJarFilename($name) || in_array($name, $protectedNames, true)
+                || self::pluginsMatchingJar($name, $platformPlugins) !== [$plugin['id']]) {
+                return null;
+            }
+        }
+
+        return $copies;
+    }
+
+    /** The version in a jar's file name ("EthoriaChat-1.8.0.jar" -> "1.8.0"), or null. */
+    public static function versionFromJarName(string $filename): ?string
+    {
+        if (!preg_match('/[-_]v?(\d+(?:\.\d+)*)(?:[-+][A-Za-z0-9.]+)*\.jar$/i', $filename, $match)) {
+            return null;
+        }
+
+        return strlen($match[1]) <= 32 ? $match[1] : null;
+    }
+
+    /**
+     * The plugin name declared at the top level of a plugin.yml / paper-plugin.yml ("name: X",
+     * optionally quoted), or null. No YAML parser: only that one key is read.
+     */
+    public static function pluginYmlName(string $yaml): ?string
+    {
+        if (strlen($yaml) > self::MAX_DESCRIPTOR_BYTES) {
+            return null;
+        }
+
+        foreach (preg_split('/\r\n|\r|\n/', $yaml) ?: [] as $line) {
+            if (!preg_match('/^name:[ \t]*(.*?)[ \t]*$/', $line, $match)) {
+                continue;
+            }
+
+            $value = preg_replace('/[ \t]+#.*$/', '', $match[1]) ?? $match[1];
+
+            if (preg_match('/^([\'"])(.*)\1$/', $value, $quoted)) {
+                $value = $quoted[2];
+            }
+
+            $value = trim($value);
+
+            return $value !== '' && strlen($value) <= 128 && preg_match('/^[\x21-\x7E][\x20-\x7E]*$/', $value) ? $value : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * The names a jar declares itself under, lower case: for "paper" the `name` of plugin.yml
+     * and paper-plugin.yml, for "velocity" the `id` of velocity-plugin.json. Paper/Velocity
+     * refuse to load two jars with the same name, so the same name means the same plugin.
+     * Null (with $problem) when the jar can't be read or declares nothing.
+     *
+     * @return array<int, string>|null
+     */
+    public static function jarDescriptorNames(string $path, string $platform, ?string &$problem = null): ?array
+    {
+        if (!class_exists(ZipArchive::class)) {
+            $problem = 'the PHP zip extension is missing';
+
+            return null;
+        }
+
+        $zip = new ZipArchive();
+
+        if ($zip->open($path, ZipArchive::RDONLY) !== true) {
+            $problem = 'not a valid jar (zip) file';
+
+            return null;
+        }
+
+        $names = [];
+
+        try {
+            if ($platform === 'velocity') {
+                $json = self::readZipEntry($zip, 'velocity-plugin.json');
+                $data = $json !== null ? json_decode($json, true) : null;
+                $id = is_array($data) ? ($data['id'] ?? null) : null;
+
+                if (is_string($id) && preg_match('/^[a-z][a-z0-9_-]{0,63}$/', $id)) {
+                    $names[] = $id;
+                }
+            } elseif ($platform === 'paper') {
+                foreach (['paper-plugin.yml', 'plugin.yml'] as $descriptor) {
+                    $yaml = self::readZipEntry($zip, $descriptor);
+                    $name = $yaml !== null ? self::pluginYmlName($yaml) : null;
+
+                    if ($name !== null) {
+                        $names[] = strtolower($name);
+                    }
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+
+        $names = array_values(array_unique($names));
+
+        if ($names === []) {
+            $problem = $platform === 'velocity' ? 'no velocity-plugin.json with an id' : 'no plugin.yml / paper-plugin.yml with a name';
+
+            return null;
+        }
+
+        return $names;
+    }
+
+    /**
+     * Whether two jars declare the same plugin (see jarDescriptorNames()).
+     *
+     * @param  array<int, string>  $a
+     * @param  array<int, string>  $b
+     */
+    public static function sameDescriptor(array $a, array $b): bool
+    {
+        return $a !== [] && $b !== [] && array_intersect($a, $b) !== [];
+    }
+
+    protected static function readZipEntry(ZipArchive $zip, string $name): ?string
+    {
+        $stat = $zip->statName($name);
+
+        if ($stat === false || $stat['size'] > self::MAX_DESCRIPTOR_BYTES) {
+            return null;
+        }
+
+        $content = $zip->getFromName($name, self::MAX_DESCRIPTOR_BYTES);
+
+        return is_string($content) ? $content : null;
     }
 
     /**
@@ -530,16 +737,19 @@ final class GitHubSourceRules
      *
      * - new: not installed, not dismissed for this server, no unmanaged copy -> offered
      * - dismissed: not installed, an admin said it doesn't belong on this server -> hidden
+     * - replace_manual: not installed from here, a jar of it is already in plugins/ and may be
+     *   replaced with the repository version (setting on, copies replaceable, not dismissed)
      * - manual: not installed from here, but a jar of it is already in plugins/
      * - update_available / up_to_date / repo_older / modified: installed from here
      *
      * @param  array{version: string, sha256: string}  $plugin
      * @param  array{version: string, sha256: string}|null  $installed
      */
-    public static function pluginState(array $plugin, ?array $installed, bool $dismissed, bool $unmanagedCopy): string
+    public static function pluginState(array $plugin, ?array $installed, bool $dismissed, bool $unmanagedCopy, bool $replaceable = false): string
     {
         if ($installed === null) {
             return match (true) {
+                $unmanagedCopy && $replaceable && !$dismissed => 'replace_manual',
                 $unmanagedCopy => 'manual',
                 $dismissed => 'dismissed',
                 default => 'new',
@@ -558,7 +768,9 @@ final class GitHubSourceRules
     }
 
     /**
-     * What the repository offers one server: plugins to install (new) and to update.
+     * What the repository offers one server: plugins to install (new) and to update. A manual
+     * copy that will be replaced with the repository version (see replaceableCopies()) counts as
+     * an update.
      *
      * @template T of array{id: string, name: string, platform: string, version: string, filename: string, sha256: string}
      *
@@ -567,9 +779,10 @@ final class GitHubSourceRules
      * @param  array<int, string>  $dismissedIds
      * @param  array<int, string>  $jarNames
      * @param  array<int, string>  $alsoManaged  further jar names of this plugin (old jars waiting to be deleted)
+     * @param  array<int, string>  $replaceIds  plugins whose manual copies will be replaced
      * @return array{new: array<int, T>, updates: array<int, T>}
      */
-    public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames, array $alsoManaged = []): array
+    public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames, array $alsoManaged = [], array $replaceIds = []): array
     {
         $byId = [];
         foreach ($installed as $entry) {
@@ -585,11 +798,12 @@ final class GitHubSourceRules
                 $byId[$plugin['id']] ?? null,
                 in_array($plugin['id'], $dismissedIds, true),
                 !isset($byId[$plugin['id']]) && self::hasUnmanagedCopy($plugin, $jarNames, $managed),
+                in_array($plugin['id'], $replaceIds, true),
             );
 
             if ($state === 'new') {
                 $offers['new'][] = $plugin;
-            } elseif ($state === 'update_available') {
+            } elseif ($state === 'update_available' || $state === 'replace_manual') {
                 $offers['updates'][] = $plugin;
             }
         }

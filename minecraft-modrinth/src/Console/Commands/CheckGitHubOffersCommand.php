@@ -64,6 +64,10 @@ class CheckGitHubOffersCommand extends Command
                 if ($result !== null && ($result['new'] > 0 || $result['updates'] > 0)) {
                     $this->line("Server #{$server->id}: {$result['new']} new, {$result['updates']} update(s)".(empty($result['announced']) ? '' : '; announced '.implode(', ', $result['announced'])).'.');
                 }
+
+                if (!empty($result['renamed'])) {
+                    $this->line("Server #{$server->id}: now recorded under the current id: ".implode(', ', array_map(fn (string $old, string $new) => "$old -> $new", array_keys($result['renamed']), $result['renamed'])).'.');
+                }
             }
         });
 

@@ -57,7 +57,7 @@ class AutoUpdateModsCommand extends Command
     }
 
     /**
-     * @param  array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}>, problems: array<int, string>}|null  $githubSnapshot
+     * @param  array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}>, problems: array<int, string>}|null  $githubSnapshot
      * @param  array{version: string, timestamp: int|null, downloads: array<string, string>, changelog: array<int, array{version: string, timestamp: int|null, title: string, commit: string|null}>}|null  $luckPermsLatest
      */
     protected function updateServerFromAllSources(Server $server, bool $modsEnabled, GitHubPluginService $github, ?array $githubSnapshot, LuckPermsService $luckPerms, ?array $luckPermsLatest): void
@@ -107,7 +107,7 @@ class AutoUpdateModsCommand extends Command
      * the source is off, unreachable, or its head commit hasn't passed CI. Automatic updates
      * always require green CI, whatever the manual "require green CI" setting says.
      *
-     * @return array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}>, problems: array<int, string>}|null
+     * @return array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}>, problems: array<int, string>}|null
      */
     protected function getGitHubSnapshot(GitHubPluginService $github): ?array
     {

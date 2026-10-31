@@ -307,9 +307,17 @@ class GitHubPluginsPage extends Page implements HasTable
             : [];
 
         $rows = [];
+        // Installed entries that belong to a row of the index (under its id or an earlier one).
+        $matched = [];
 
         foreach ($platformPlugins as $plugin) {
-            $entry = static::service()->findInstalled($installed, $plugin['id']);
+            $entry = GitHubSourceRules::installedEntryFor($installed, $plugin);
+            $dismissedHere = GitHubSourceRules::isListed($plugin, $dismissed);
+
+            if ($entry !== null) {
+                $matched[$entry['id']] = true;
+            }
+
             $copies = $entry === null && $knowsServerState ? GitHubSourceRules::unmanagedCopies($plugin, $jarNames, $managedFilenames) : [];
 
             $state = $entry === null && !$knowsServerState
@@ -317,7 +325,7 @@ class GitHubPluginsPage extends Page implements HasTable
                 : GitHubSourceRules::pluginState(
                     $plugin,
                     $entry,
-                    in_array($plugin['id'], $dismissed, true),
+                    $dismissedHere,
                     $copies !== [],
                     isset($this->replacements[$plugin['id']]),
                 );
@@ -327,6 +335,9 @@ class GitHubPluginsPage extends Page implements HasTable
             $rows[$plugin['id']] = [
                 '__key' => $plugin['id'],
                 'id' => $plugin['id'],
+                // The id it is recorded under on this server (an earlier one until it is converted).
+                'installed_id' => $entry['id'] ?? null,
+                'previous_ids' => $plugin['previous_ids'] ?? [],
                 'name' => $plugin['name'],
                 'frozen' => $plugin['frozen'],
                 'repo_version' => $plugin['version'],
@@ -336,18 +347,22 @@ class GitHubPluginsPage extends Page implements HasTable
                 'manual_version' => $manualVersions !== [] ? implode(', ', $manualVersions) : null,
                 'filename' => $entry['filename'] ?? $plugin['filename'],
                 'state' => $state,
-                'dismissed' => in_array($plugin['id'], $dismissed, true),
+                'dismissed' => $dismissedHere,
             ];
         }
 
         foreach ($installed as $entry) {
-            if (isset($rows[$entry['id']]) || ($snapshot === null && $entry['platform'] !== $platform)) {
+            if (isset($matched[$entry['id']]) || ($snapshot === null && $entry['platform'] !== $platform)) {
                 continue;
             }
 
-            $rows[$entry['id']] = [
-                '__key' => $entry['id'],
+            // Own key: the id of an installed entry may be the id of an index entry as well
+            // (recorded for another platform), and must not replace that row.
+            $rows['installed:'.$entry['id']] = [
+                '__key' => 'installed:'.$entry['id'],
                 'id' => $entry['id'],
+                'installed_id' => $entry['id'],
+                'previous_ids' => [],
                 'name' => $entry['name'],
                 'frozen' => false,
                 'repo_version' => null,
@@ -449,7 +464,7 @@ class GitHubPluginsPage extends Page implements HasTable
                         'new', 'dismissed' => trans('minecraft-modrinth::strings.github.state.'.$record['state'].'_hint'),
                         'replace_manual' => trans('minecraft-modrinth::strings.github.state.replace_manual_hint', ['files' => implode(', ', $record['manual_files'])]),
                         // With replacing on, a copy that stays "manual" is one that can't be replaced automatically.
-                        'manual' => trans(static::service()->replacesManualCopies() && !in_array($record['id'], $this->getDismissed(), true)
+                        'manual' => trans(static::service()->replacesManualCopies() && !$record['dismissed']
                             ? 'minecraft-modrinth::strings.github.state.manual_not_replaceable_hint'
                             : 'minecraft-modrinth::strings.github.state.manual_hint', ['files' => implode(', ', $record['manual_files'])]),
                         default => null,
@@ -543,7 +558,7 @@ class GitHubPluginsPage extends Page implements HasTable
                     ->tooltip(trans('minecraft-modrinth::strings.github.offers.restore'))
                     ->visible(fn (array $record) => $record['state'] === 'dismissed' || ($record['state'] === 'manual' && $record['dismissed']))
                     ->authorize(fn () => static::userCan(SubuserPermission::FileCreate))
-                    ->action(fn (array $record) => $this->setDismissed($record['id'], $record['name'], false)),
+                    ->action(fn (array $record) => $this->setDismissed($record['id'], $record['name'], false, $record['previous_ids'])),
                 Action::make('installed')
                     ->iconButton()
                     ->icon('tabler-check')
@@ -564,7 +579,7 @@ class GitHubPluginsPage extends Page implements HasTable
                         'name' => $record['name'],
                         'filename' => $record['filename'],
                     ]))
-                    ->action(fn (array $record) => $this->uninstall($record['id'], $record['name'])),
+                    ->action(fn (array $record) => $this->uninstall($record['installed_id'] ?? $record['id'], $record['name'], $record['installed_id'] !== null && $record['installed_id'] !== $record['id'] ? [$record['id']] : [])),
             ]);
     }
 
@@ -673,8 +688,9 @@ class GitHubPluginsPage extends Page implements HasTable
                 throw $this->snapshotError ?? new GitHubSourceException(GitHubSourceException::NOT_CONFIGURED, 'No repository state');
             }
 
+            // Ids are only unique per platform: look in this server's platform only.
             $plugin = null;
-            foreach ($snapshot['plugins'] as $candidate) {
+            foreach (static::service()->pluginsForPlatform($snapshot['plugins'], static::service()->platformForServer($server)) as $candidate) {
                 if ($candidate['id'] === $id) {
                     $plugin = $candidate;
                 }
@@ -768,8 +784,13 @@ class GitHubPluginsPage extends Page implements HasTable
         $this->forgetState();
     }
 
-    /** "Doesn't belong on this server" (hide the offer) or "Offer again". */
-    protected function setDismissed(string $id, string $name, bool $dismissed): void
+    /**
+     * "Doesn't belong on this server" (hide the offer) or "Offer again" (also when it was hidden
+     * under an earlier id of the plugin).
+     *
+     * @param  array<int, string>  $previousIds
+     */
+    protected function setDismissed(string $id, string $name, bool $dismissed, array $previousIds = []): void
     {
         $server = static::server();
 
@@ -778,7 +799,7 @@ class GitHubPluginsPage extends Page implements HasTable
         }
 
         try {
-            $dismissed ? static::offers()->dismiss($server, $id) : static::offers()->restore($server, $id);
+            $dismissed ? static::offers()->dismiss($server, $id) : static::offers()->restore($server, $id, $previousIds);
 
             Notification::make()
                 ->title(trans($dismissed ? 'minecraft-modrinth::strings.github.offers.dismissed_title' : 'minecraft-modrinth::strings.github.offers.restored_title'))
@@ -798,7 +819,8 @@ class GitHubPluginsPage extends Page implements HasTable
         $this->forgetState();
     }
 
-    protected function uninstall(string $id, string $name): void
+    /** @param  array<int, string>  $otherIds  see GitHubPluginService::uninstall() */
+    protected function uninstall(string $id, string $name, array $otherIds = []): void
     {
         $server = static::server();
 
@@ -807,7 +829,7 @@ class GitHubPluginsPage extends Page implements HasTable
         }
 
         try {
-            static::service()->uninstall($server, $id);
+            static::service()->uninstall($server, $id, $otherIds);
 
             Notification::make()
                 ->title(trans('minecraft-modrinth::strings.notifications.uninstall_success'))

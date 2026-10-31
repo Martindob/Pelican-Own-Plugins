@@ -37,6 +37,12 @@ final class GitHubSourceRules
     /** plugin.yml / paper-plugin.yml / velocity-plugin.json are a few KB at most. */
     public const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 
+    /** A plugin id in the index and in the metadata file (also every entry of "previous_ids"). */
+    public const ID_PATTERN = '/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/';
+
+    /** Most earlier ids one index entry may name in "previous_ids". */
+    public const MAX_PREVIOUS_IDS = 16;
+
     public static function isValidRepository(string $repository): bool
     {
         if (!preg_match('/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/', $repository)) {
@@ -230,7 +236,7 @@ final class GitHubSourceRules
      * Returns the valid plugin entries plus a list of problems for entries that were skipped.
      * Throws when the index as a whole can't be trusted (not JSON, unknown schema, ...).
      *
-     * @return array{plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}>, problems: array<int, string>}
+     * @return array{plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}>, problems: array<int, string>}
      *
      * @throws GitHubSourceException
      */
@@ -271,8 +277,11 @@ final class GitHubSourceRules
                 continue;
             }
 
-            if (isset($seenIds[$plugin['id']])) {
-                $problems[] = "plugins[$position]: duplicate id {$plugin['id']}";
+            // An id only has to be unique per platform: a server only ever sees the entries of its
+            // own platform, so "myplugin" for paper and "myplugin" for velocity are two plugins.
+            $idKey = $plugin['platform'].':'.$plugin['id'];
+            if (isset($seenIds[$idKey])) {
+                $problems[] = "plugins[$position]: duplicate id {$plugin['id']} for {$plugin['platform']}";
 
                 continue;
             }
@@ -284,16 +293,62 @@ final class GitHubSourceRules
                 continue;
             }
 
-            $seenIds[$plugin['id']] = true;
+            $seenIds[$idKey] = true;
             $seenFilenames[$filenameKey] = $plugin['id'];
             $plugins[] = $plugin;
         }
 
-        return ['plugins' => $plugins, 'problems' => $problems];
+        return ['plugins' => self::resolvePreviousIds($plugins, $problems), 'problems' => $problems];
     }
 
     /**
-     * @return array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}|null
+     * Drop the earlier ids ("previous_ids") that can't be told apart: one that is the current id
+     * of another entry of the same platform (that plugin keeps it), or one that several entries
+     * of the same platform claim (whose was it?). The entries themselves stay.
+     *
+     * @template T of array{id: string, platform: string, previous_ids: array<int, string>}
+     *
+     * @param  array<int, T>  $plugins
+     * @param  array<int, string>  $problems
+     * @return array<int, T>
+     */
+    protected static function resolvePreviousIds(array $plugins, array &$problems): array
+    {
+        $current = [];
+        $claims = [];
+
+        foreach ($plugins as $position => $plugin) {
+            $current[$plugin['platform'].':'.$plugin['id']] = true;
+
+            foreach ($plugin['previous_ids'] as $previous) {
+                $claims[$plugin['platform'].':'.$previous][] = $position;
+            }
+        }
+
+        foreach ($claims as $key => $owners) {
+            [$platform, $previous] = explode(':', $key, 2);
+
+            $reason = match (true) {
+                isset($current[$key]) => "it is the id of another $platform plugin",
+                count($owners) > 1 => "several $platform plugins name it",
+                default => null,
+            };
+
+            if ($reason === null) {
+                continue;
+            }
+
+            foreach ($owners as $position) {
+                $plugins[$position]['previous_ids'] = array_values(array_diff($plugins[$position]['previous_ids'], [$previous]));
+                $problems[] = "previous id $previous of {$plugins[$position]['id']} ($platform) ignored: $reason";
+            }
+        }
+
+        return $plugins;
+    }
+
+    /**
+     * @return array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}|null
      */
     public static function validateIndexEntry(mixed $entry, ?string &$problem = null): ?array
     {
@@ -304,7 +359,7 @@ final class GitHubSourceRules
         }
 
         $id = $entry['id'] ?? null;
-        if (!is_string($id) || !preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/', $id)) {
+        if (!is_string($id) || !preg_match(self::ID_PATTERN, $id)) {
             $problem = 'invalid id';
 
             return null;
@@ -361,6 +416,23 @@ final class GitHubSourceRules
 
         $frozen = $entry['frozen'] ?? false;
 
+        // Optional (since 1.6.0): ids this plugin had earlier on the same platform. A plugin
+        // installed under one of them is this plugin (see installedEntryFor()).
+        $previousIds = $entry['previous_ids'] ?? [];
+        if (!is_array($previousIds) || !array_is_list($previousIds) || count($previousIds) > self::MAX_PREVIOUS_IDS) {
+            $problem = "invalid previous_ids ($id)";
+
+            return null;
+        }
+
+        foreach ($previousIds as $previous) {
+            if (!is_string($previous) || !preg_match(self::ID_PATTERN, $previous) || $previous === $id) {
+                $problem = "invalid previous_ids ($id)";
+
+                return null;
+            }
+        }
+
         return [
             'id' => $id,
             'name' => $name,
@@ -371,6 +443,7 @@ final class GitHubSourceRules
             'sha256' => strtolower($sha256),
             'size' => $size,
             'frozen' => $frozen === true,
+            'previous_ids' => array_values(array_unique($previousIds)),
         ];
     }
 
@@ -508,6 +581,127 @@ final class GitHubSourceRules
         }
 
         return array_values(array_filter($plugins, fn (array $plugin) => $plugin['platform'] === $platform));
+    }
+
+    /**
+     * Every id an index entry is known under: its id and its earlier ids ("previous_ids").
+     *
+     * @param  array{id: string, previous_ids?: array<int, string>}  $plugin
+     * @return array<int, string>
+     */
+    public static function idsOf(array $plugin): array
+    {
+        return [$plugin['id'], ...($plugin['previous_ids'] ?? [])];
+    }
+
+    /**
+     * Whether a list of stored ids (hidden offers, announced plugins) names this index entry -
+     * under its id or an earlier one.
+     *
+     * @param  array{id: string, previous_ids?: array<int, string>}  $plugin
+     * @param  array<int, string>  $ids
+     */
+    public static function isListed(array $plugin, array $ids): bool
+    {
+        return array_intersect(self::idsOf($plugin), $ids) !== [];
+    }
+
+    /**
+     * The entry of the metadata file that is this index entry: the one with its id, otherwise one
+     * with one of its earlier ids ("previous_ids", in their order) - so a plugin installed before
+     * its id changed keeps being updated instead of turning into a new plugin. An entry recorded
+     * for another platform is never this plugin (ids are only unique per platform).
+     *
+     * @template E of array{id: string, platform?: string}
+     *
+     * @param  array<int, E>  $installed
+     * @param  array{id: string, platform: string, previous_ids?: array<int, string>}  $plugin
+     * @return E|null
+     */
+    public static function installedEntryFor(array $installed, array $plugin): ?array
+    {
+        foreach (self::idsOf($plugin) as $id) {
+            foreach ($installed as $entry) {
+                if ($entry['id'] === $id && in_array($entry['platform'] ?? '', ['', $plugin['platform']], true)) {
+                    return $entry;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Rename the entries of the metadata file that are still recorded under an earlier id of an
+     * index entry of the server's platform to the current id (nothing else changes). An entry is
+     * left alone while its new id is taken by another entry of the file.
+     *
+     * @template E of array{id: string, platform?: string}
+     *
+     * @param  array<int, E>  $installed
+     * @param  array<int, array{id: string, platform: string, previous_ids?: array<int, string>}>  $platformPlugins
+     * @return array{installed: array<int, E>, renamed: array<string, string>} renamed: old id => new id
+     */
+    public static function migrateInstalledIds(array $installed, array $platformPlugins): array
+    {
+        $renamed = [];
+
+        foreach ($platformPlugins as $plugin) {
+            if (empty($plugin['previous_ids'])) {
+                continue;
+            }
+
+            $entry = self::installedEntryFor($installed, $plugin);
+
+            if ($entry === null || $entry['id'] === $plugin['id'] || in_array($plugin['id'], array_column($installed, 'id'), true)) {
+                continue;
+            }
+
+            foreach ($installed as $position => $item) {
+                if ($item['id'] === $entry['id']) {
+                    $installed[$position]['id'] = $plugin['id'];
+                }
+            }
+
+            $renamed[$entry['id']] = $plugin['id'];
+        }
+
+        return ['installed' => $installed, 'renamed' => $renamed];
+    }
+
+    /**
+     * Stored per-server ids (hidden offers, announced plugins) that are an earlier id of an index
+     * entry of the server's platform: old id => current id.
+     *
+     * @param  array<int, string>  $storedIds
+     * @param  array<int, array{id: string, previous_ids?: array<int, string>}>  $platformPlugins
+     * @return array<string, string>
+     */
+    public static function storedIdRenames(array $storedIds, array $platformPlugins): array
+    {
+        $renames = [];
+
+        foreach ($platformPlugins as $plugin) {
+            foreach ($plugin['previous_ids'] ?? [] as $previous) {
+                if (in_array($previous, $storedIds, true)) {
+                    $renames[$previous] = $plugin['id'];
+                }
+            }
+        }
+
+        return $renames;
+    }
+
+    /** @param  array<int, array{previous_ids?: array<int, string>}>  $plugins */
+    public static function hasPreviousIds(array $plugins): bool
+    {
+        foreach ($plugins as $plugin) {
+            if (!empty($plugin['previous_ids'])) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -775,8 +969,8 @@ final class GitHubSourceRules
      * @template T of array{id: string, name: string, platform: string, version: string, filename: string, sha256: string}
      *
      * @param  array<int, T>  $plugins  the whole index
-     * @param  array<int, array{id: string, version: string, sha256: string, filename: string}>  $installed
-     * @param  array<int, string>  $dismissedIds
+     * @param  array<int, array{id: string, platform: string, version: string, sha256: string, filename: string}>  $installed
+     * @param  array<int, string>  $dismissedIds  ids hidden on this server (an earlier id of a plugin counts too)
      * @param  array<int, string>  $jarNames
      * @param  array<int, string>  $alsoManaged  further jar names of this plugin (old jars waiting to be deleted)
      * @param  array<int, string>  $replaceIds  plugins whose manual copies will be replaced
@@ -784,20 +978,18 @@ final class GitHubSourceRules
      */
     public static function offers(array $plugins, ?string $platform, array $installed, array $dismissedIds, array $jarNames, array $alsoManaged = [], array $replaceIds = []): array
     {
-        $byId = [];
-        foreach ($installed as $entry) {
-            $byId[$entry['id']] = $entry;
-        }
         $managed = array_merge(array_column($installed, 'filename'), $alsoManaged);
 
         $offers = ['new' => [], 'updates' => []];
 
         foreach (self::pluginsForPlatform($plugins, $platform) as $plugin) {
+            $entry = self::installedEntryFor($installed, $plugin);
+
             $state = self::pluginState(
                 $plugin,
-                $byId[$plugin['id']] ?? null,
-                in_array($plugin['id'], $dismissedIds, true),
-                !isset($byId[$plugin['id']]) && self::hasUnmanagedCopy($plugin, $jarNames, $managed),
+                $entry,
+                self::isListed($plugin, $dismissedIds),
+                $entry === null && self::hasUnmanagedCopy($plugin, $jarNames, $managed),
                 in_array($plugin['id'], $replaceIds, true),
             );
 
@@ -813,7 +1005,7 @@ final class GitHubSourceRules
 
     /**
      * The new plugins a server hasn't been told about yet (each plugin is announced once per
-     * server, whatever its version).
+     * server, whatever its version - and whatever id it was announced under).
      *
      * @template T of array{id: string}
      *
@@ -823,7 +1015,7 @@ final class GitHubSourceRules
      */
     public static function pluginsToAnnounce(array $new, array $notifiedIds): array
     {
-        return array_values(array_filter($new, fn (array $plugin) => !in_array($plugin['id'], $notifiedIds, true)));
+        return array_values(array_filter($new, fn (array $plugin) => !self::isListed($plugin, $notifiedIds)));
     }
 
     /**

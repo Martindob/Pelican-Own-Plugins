@@ -545,5 +545,104 @@ foreach ($tmpJars as $path) {
     @unlink($path);
 }
 
+// ------------------------------------------------------------------
+// 1.6.0: ids unique per platform, earlier ids (previous_ids)
+// ------------------------------------------------------------------
+
+// The same id on both platforms is two plugins; twice on one platform is still a duplicate.
+$votePaper = $entry(['id' => 'ethoriavote', 'name' => 'EthoriaVote', 'path' => 'minecraft/EthoriaVote/paper/releases/EthoriaVote-1.0.1.jar', 'previous_ids' => ['ethoriavote-paper']]);
+$voteVelocity = $entry(['id' => 'ethoriavote', 'name' => 'EthoriaVote', 'platform' => 'velocity', 'path' => 'minecraft/EthoriaVote/velocity/releases/EthoriaVote-1.0.1.jar', 'previous_ids' => ['ethoriavote-velocity']]);
+$result = R::parseIndex($index([$votePaper, $voteVelocity]));
+check(count($result['plugins']) === 2 && $result['problems'] === [], 'same id on paper and velocity: both kept');
+check($result['plugins'][0]['previous_ids'] === ['ethoriavote-paper'] && $result['plugins'][1]['previous_ids'] === ['ethoriavote-velocity'], 'previous_ids kept per entry');
+check(array_column(R::pluginsForPlatform($result['plugins'], 'velocity'), 'platform') === ['velocity'], 'velocity server sees only the velocity entry of the shared id');
+$result = R::parseIndex($index([$votePaper, $entry(['id' => 'ethoriavote', 'name' => 'EthoriaVote', 'path' => 'x/Other-1.0.0.jar'])]));
+check(count($result['plugins']) === 1 && str_contains($result['problems'][0], 'duplicate id ethoriavote for paper'), 'same id twice on one platform: second skipped');
+
+// Old index without previous_ids: unchanged, entries get an empty list.
+$result = R::parseIndex($index([$entry()]));
+check($result['plugins'][0]['previous_ids'] === [] && $result['problems'] === [], 'no previous_ids: empty list, no problem');
+
+$invalidPrevious = [
+    'not a list' => ['previous_ids' => 'gdprerase-old'],
+    'object' => ['previous_ids' => ['a' => 'gdprerase-old']],
+    'not a string' => ['previous_ids' => [1]],
+    'bad id' => ['previous_ids' => ['../x']],
+    'own id' => ['previous_ids' => ['gdprerase-paper']],
+    'too many' => ['previous_ids' => array_map(fn ($i) => "old$i", range(1, R::MAX_PREVIOUS_IDS + 1))],
+];
+foreach ($invalidPrevious as $name => $override) {
+    $result = R::parseIndex($index([$entry($override)]));
+    check($result['plugins'] === [] && str_contains($result['problems'][0] ?? '', 'invalid previous_ids'), "invalid previous_ids skipped: $name");
+}
+$result = R::parseIndex($index([$entry(['previous_ids' => ['old', 'old']])]));
+check($result['plugins'][0]['previous_ids'] === ['old'], 'duplicate previous id listed once');
+
+// An earlier id that is the current id of another entry of the same platform: ignored (that plugin keeps it).
+$result = R::parseIndex($index([
+    $entry(['id' => 'a', 'previous_ids' => ['b', 'a-old']]),
+    $entry(['id' => 'b', 'path' => 'x/B-1.0.0.jar']),
+]));
+check(count($result['plugins']) === 2 && $result['plugins'][0]['previous_ids'] === ['a-old'] && count($result['problems']) === 1 && str_contains($result['problems'][0], 'previous id b of a'), 'previous id = current id of another plugin: ignored');
+// ... but the current id of a plugin of the other platform doesn't matter.
+$result = R::parseIndex($index([
+    $entry(['id' => 'a', 'previous_ids' => ['b']]),
+    $entry(['id' => 'b', 'platform' => 'velocity', 'path' => 'x/B-1.0.0.jar']),
+]));
+check($result['plugins'][0]['previous_ids'] === ['b'] && $result['problems'] === [], 'previous id = id on the other platform: kept');
+// Claimed by two entries of one platform: ignored for both.
+$result = R::parseIndex($index([
+    $entry(['id' => 'a', 'previous_ids' => ['old']]),
+    $entry(['id' => 'b', 'path' => 'x/B-1.0.0.jar', 'previous_ids' => ['old', 'b-old']]),
+    $entry(['id' => 'c', 'platform' => 'velocity', 'path' => 'x/C-1.0.0.jar', 'previous_ids' => ['old']]),
+]));
+check($result['plugins'][0]['previous_ids'] === [] && $result['plugins'][1]['previous_ids'] === ['b-old'] && $result['plugins'][2]['previous_ids'] === ['old'] && count($result['problems']) === 2, 'previous id claimed twice on one platform: ignored there only');
+
+// Which installed entry is the plugin
+$vp = R::parseIndex($index([$votePaper]))['plugins'][0];
+$old = ['id' => 'ethoriavote-paper', 'platform' => 'paper', 'version' => '1.0.0', 'sha256' => $vp['sha256'], 'filename' => 'ethoriavote-paper-1.0.0.jar'];
+$cur = ['id' => 'ethoriavote', 'platform' => 'paper', 'version' => '1.0.1', 'sha256' => $vp['sha256'], 'filename' => 'EthoriaVote-1.0.1.jar'];
+check(R::installedEntryFor([$old], $vp) === $old, 'installed under the earlier id = this plugin');
+check(R::installedEntryFor([$old, $cur], $vp) === $cur && R::installedEntryFor([$cur, $old], $vp) === $cur, 'the current id wins over an earlier one');
+check(R::installedEntryFor([$old], $entry(['id' => 'ethoriavote'])) === null, 'without previous_ids the old id is another plugin (as before 1.6.0)');
+check(R::installedEntryFor([['platform' => 'velocity'] + $old], $vp) === null, 'an entry recorded for the other platform is never this plugin');
+check(R::installedEntryFor([['platform' => ''] + $old], $vp) !== null, 'an entry without a recorded platform still matches');
+check(R::installedEntryFor([['platform' => 'velocity'] + $cur], $vp) === null, 'same id, other platform: not this plugin');
+
+check(R::isListed($vp, ['ethoriavote-paper']) && R::isListed($vp, ['ethoriavote']) && !R::isListed($vp, ['ethoriavote-velocity']), 'stored ids: current and earlier id count');
+check(R::idsOf($vp) === ['ethoriavote', 'ethoriavote-paper'] && R::idsOf(['id' => 'x']) === ['x'], 'ids of an entry');
+
+// States and offers with an earlier id: up to date / update, never "new" next to the old install
+$vpNewer = ['version' => '1.1.0'] + $vp;
+check(R::pluginState($vp, R::installedEntryFor([$old], $vp), false, false) === 'update_available', 'old id, older version: update available');
+check(R::pluginState($vp, R::installedEntryFor([['version' => '1.4.0'] + $old], $vp), false, false) === 'up_to_date', 'old id, same version and jar: up to date');
+$offers = R::offers([$vpNewer], 'paper', [$old], [], [$old['filename']]);
+check($offers['new'] === [] && array_column($offers['updates'], 'id') === ['ethoriavote'], 'offers: installed under the old id counts as an update, not new');
+$offers = R::offers([['version' => '1.0.0'] + $vp], 'paper', [$old], [], [$old['filename']]);
+check($offers === ['new' => [], 'updates' => []], 'offers: installed under the old id and current: nothing offered');
+$offers = R::offers([$vp], 'paper', [], ['ethoriavote-paper'], []);
+check($offers['new'] === [], 'offers: hidden under the old id stays hidden');
+check(R::pluginsToAnnounce([$vp], ['ethoriavote-paper']) === [], 'announced under the old id: not announced again');
+$voteV = R::parseIndex($index([$voteVelocity]))['plugins'][0];
+$offers = R::offers([$vp, $voteV], 'velocity', [['id' => 'ethoriavote-velocity', 'platform' => 'velocity', 'version' => '1.0.0', 'sha256' => $jarSha, 'filename' => 'ethoriavote-velocity-1.0.0.jar']], [], ['ethoriavote-velocity-1.0.0.jar']);
+check($offers['new'] === [] && count($offers['updates']) === 1 && $offers['updates'][0]['platform'] === 'velocity', 'velocity server: its own entry of the shared id');
+// Old index (no previous_ids) with the old ids: exactly as before.
+$offers = R::offers([$entry(['id' => 'ethoriavote-paper', 'version' => '1.0.1'])], 'paper', [$old], [], [$old['filename']]);
+check($offers['new'] === [] && count($offers['updates']) === 1, 'old index: installed plugin updated as before');
+
+// Converting the metadata to the current ids
+$other = ['id' => 'ethoriachat', 'platform' => 'paper', 'version' => '1.0.0', 'sha256' => $jarSha, 'filename' => 'EthoriaChat-1.0.0.jar'];
+$migration = R::migrateInstalledIds([$other, $old], [$vp]);
+check($migration['renamed'] === ['ethoriavote-paper' => 'ethoriavote'] && array_column($migration['installed'], 'id') === ['ethoriachat', 'ethoriavote'], 'old id converted, order kept');
+check(array_diff_key($migration['installed'][1], ['id' => 1]) === array_diff_key($old, ['id' => 1]), 'only the id changes');
+check(R::migrateInstalledIds([$cur, $old], [$vp])['renamed'] === [], 'current id already recorded: earlier entry left alone');
+check(R::migrateInstalledIds([['platform' => 'velocity'] + $cur, $old], [$vp])['renamed'] === [], 'new id taken by an entry of another platform: left alone');
+check(R::migrateInstalledIds([$old], [$entry(['id' => 'ethoriavote'])])['renamed'] === [], 'no previous_ids: nothing converted');
+check(R::migrateInstalledIds([$cur], [$vp])['renamed'] === [], 'already current: nothing to do');
+
+check(R::storedIdRenames(['ethoriavote-paper', 'other'], [$vp]) === ['ethoriavote-paper' => 'ethoriavote'], 'stored offers: old id mapped');
+check(R::storedIdRenames(['ethoriavote'], [$vp]) === [] && R::storedIdRenames([], [$vp]) === [], 'stored offers: nothing to map');
+check(R::hasPreviousIds([$vp]) && !R::hasPreviousIds([$entry()]) && !R::hasPreviousIds([]), 'has previous ids');
+
 echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
 exit(Result::$failures === 0 ? 0 : 1);

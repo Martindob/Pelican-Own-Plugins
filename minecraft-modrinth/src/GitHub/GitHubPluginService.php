@@ -25,7 +25,7 @@ use Throwable;
  * own folder (plugins/<Name>/config.yml, ...) never is. With "Replace manual copies" on, a jar of
  * the same plugin that was put into plugins/ by hand is replaced as well (see installLocked()).
  *
- * @phpstan-type IndexPlugin array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool}
+ * @phpstan-type IndexPlugin array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}
  * @phpstan-type Snapshot array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, IndexPlugin>, problems: array<int, string>}
  * @phpstan-type InstalledPlugin array{id: string, name: string, platform: string, version: string, sha256: string, size: int, filename: string, repository: string, commit: string, installed_at: string, updated_at?: string}
  * @phpstan-type PendingDelete array{filename: string, size: int, replaced_by?: string}
@@ -208,7 +208,9 @@ class GitHubPluginService
      */
     public function getIndex(string $sha): array
     {
-        $key = $this->cacheKey('index', $this->indexPath(), $sha);
+        // "index-v2": entries parsed by 1.6.0 (previous_ids, ids unique per platform) - an index
+        // cached by an older version of this plugin is parsed again.
+        $key = $this->cacheKey('index-v2', $this->indexPath(), $sha);
 
         $cached = Cache::get($key);
         if (is_array($cached) && isset($cached['plugins'], $cached['problems'])) {
@@ -352,7 +354,7 @@ class GitHubPluginService
         $installed = [];
         foreach (array_slice($data['installed'], 0, self::MAX_METADATA_ENTRIES) as $entry) {
             if (!is_array($entry)
-                || !is_string($entry['id'] ?? null) || !preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/', $entry['id'])
+                || !is_string($entry['id'] ?? null) || !preg_match(GitHubSourceRules::ID_PATTERN, $entry['id'])
                 || !is_string($entry['filename'] ?? null) || !GitHubSourceRules::isValidJarFilename($entry['filename'])
                 || !is_string($entry['version'] ?? null) || strlen($entry['version']) > 64
                 || isset($installed[$entry['id']])) {
@@ -388,6 +390,10 @@ class GitHubPluginService
     }
 
     /**
+     * The entry with exactly this id (the metadata file holds each id once). To find the entry of
+     * an index entry, which may still be recorded under an earlier id, use
+     * GitHubSourceRules::installedEntryFor().
+     *
      * @param  array<int, InstalledPlugin>  $installed
      * @return InstalledPlugin|null
      */
@@ -481,7 +487,32 @@ class GitHubPluginService
     {
         $metadata = $this->readMetadata($server);
         $installedList = $metadata['installed'];
-        $previous = $this->findInstalled($installedList, $plugin['id']);
+
+        // Entries still recorded under an earlier id of a plugin get their current id with this
+        // write - only from a commit with green CI, whose index is the one servers update from.
+        if ($snapshot['ci'] === CiStatus::Green) {
+            $installedList = GitHubSourceRules::migrateInstalledIds($installedList, $this->pluginsForPlatform($snapshot['plugins'], $plugin['platform']))['installed'];
+        }
+
+        // The plugin as installed - under its id or an earlier one ("previous_ids").
+        $previous = GitHubSourceRules::installedEntryFor($installedList, $plugin);
+
+        if ($previous === null && $this->findInstalled($installedList, $plugin['id']) !== null) {
+            // The file already has this id for another platform (e.g. the egg was changed): one
+            // id can be recorded only once, so that entry has to be removed first.
+            throw new GitHubSourceException(GitHubSourceException::FILE_CONFLICT, 'plugins/'.self::METADATA_FILE." on server #{$server->id} already lists {$plugin['id']} for another platform - remove it on the GitHub Plugins page first");
+        }
+
+        if ($previous === null) {
+            foreach ($installedList as $item) {
+                // The same plugin (Paper/Velocity load only one plugin of a name) recorded under an
+                // id the index doesn't name for it, e.g. a changed id without "previous_ids":
+                // installing it again would leave two jars of it in plugins/.
+                if (strcasecmp($item['name'], $plugin['name']) === 0 && in_array($item['platform'], ['', $plugin['platform']], true)) {
+                    throw new GitHubSourceException(GitHubSourceException::FILE_CONFLICT, "{$plugin['name']} is already installed on server #{$server->id} as {$item['id']}, which the index doesn't list as an earlier id of {$plugin['id']} (previous_ids) - remove it on the GitHub Plugins page first");
+                }
+            }
+        }
 
         if ($expectInstalled === false && $previous !== null) {
             throw new GitHubSourceException(GitHubSourceException::STATE_CHANGED, "{$plugin['id']} was installed on server #{$server->id} in the meantime");
@@ -528,7 +559,8 @@ class GitHubPluginService
         $newList = [];
         $replaced = false;
         foreach ($installedList as $item) {
-            if ($item['id'] === $plugin['id']) {
+            // Also replaces an entry recorded under an earlier id: it gets the current one.
+            if ($previous !== null && $item['id'] === $previous['id']) {
                 $newList[] = $entry;
                 $replaced = true;
             } else {
@@ -716,9 +748,12 @@ class GitHubPluginService
     /**
      * Remove a plugin's jar and its metadata entry. Its folder (config, data) stays untouched.
      *
+     * @param  array<int, string>  $otherIds  further ids of the same plugin, tried when $id isn't recorded (it
+     *                                        may have been converted to the current id since the page was loaded)
+     *
      * @throws GitHubSourceException
      */
-    public function uninstall(Server $server, string $id): void
+    public function uninstall(Server $server, string $id, array $otherIds = []): void
     {
         $lock = Cache::lock("minecraft-modrinth:github:install:{$server->id}", 60);
 
@@ -729,14 +764,17 @@ class GitHubPluginService
         try {
             $metadata = $this->readMetadata($server);
             $installedList = $metadata['installed'];
-            $entry = $this->findInstalled($installedList, $id);
+            $entry = null;
+            foreach ([$id, ...$otherIds] as $candidate) {
+                $entry ??= $this->findInstalled($installedList, $candidate);
+            }
 
             if (!$entry) {
                 return;
             }
 
             $this->deleteJar($server, $entry['filename']);
-            $this->writeMetadata($server, array_values(array_filter($installedList, fn (array $item) => $item['id'] !== $id)), $metadata['pending_delete']);
+            $this->writeMetadata($server, array_values(array_filter($installedList, fn (array $item) => $item['id'] !== $entry['id'])), $metadata['pending_delete']);
         } finally {
             $lock->release();
         }
@@ -843,12 +881,12 @@ class GitHubPluginService
             return [];
         }
 
-        $installedIds = array_column($metadata['installed'], 'id');
         $managed = $this->managedFilenames($metadata);
         $jarNames = $this->jarNamesOf($files);
 
-        $candidates = array_filter($platformPlugins, fn (array $plugin) => !in_array($plugin['id'], $installedIds, true)
-            && !in_array($plugin['id'], $dismissedIds, true)
+        // Installed (under its id or an earlier one) or hidden (likewise): not a candidate.
+        $candidates = array_filter($platformPlugins, fn (array $plugin) => GitHubSourceRules::installedEntryFor($metadata['installed'], $plugin) === null
+            && !GitHubSourceRules::isListed($plugin, $dismissedIds)
             && GitHubSourceRules::unmanagedCopies($plugin, $jarNames, $managed) !== []);
 
         if ($candidates === []) {
@@ -1271,19 +1309,16 @@ class GitHubPluginService
             $this->cleanupServer($server);
         }
 
+        // Plugins still recorded under an earlier id get their current one (metadata and stored offers).
+        $this->migrateIds($server, $snapshot, $metadata);
+
         $updated = [];
 
-        foreach ($metadata['installed'] as $entry) {
-            $plugin = null;
-            foreach ($this->pluginsForPlatform($snapshot['plugins'], $platform) as $candidate) {
-                if ($candidate['id'] === $entry['id']) {
-                    $plugin = $candidate;
+        // An installed plugin is found under its id or an earlier one (previous_ids).
+        foreach ($this->pluginsForPlatform($snapshot['plugins'], $platform) as $plugin) {
+            $entry = GitHubSourceRules::installedEntryFor($metadata['installed'], $plugin);
 
-                    break;
-                }
-            }
-
-            if ($plugin === null || !GitHubSourceRules::isNewerVersion($plugin['version'], $entry['version'])) {
+            if ($entry === null || !GitHubSourceRules::isNewerVersion($plugin['version'], $entry['version'])) {
                 continue;
             }
 
@@ -1367,6 +1402,79 @@ class GitHubPluginService
         }
 
         return $done;
+    }
+
+    // ------------------------------------------------------------------
+    // Changed ids (previous_ids)
+    // ------------------------------------------------------------------
+
+    /**
+     * Give everything this server still records under an earlier id of a plugin ("previous_ids"
+     * in the index) the plugin's current id: the entries of plugins/.github-plugins.json (only
+     * the id changes) and the hidden offers / announcements in the panel database. Until then
+     * the earlier id is simply recognised everywhere, so this only makes it permanent - after it
+     * the earlier id can leave the index without anything turning into a new plugin.
+     *
+     * Only from a commit with green CI (the one servers update from) and only when an entry of
+     * the server's platform has previous_ids at all. Never throws; failures are reported and
+     * it is tried again at the next check.
+     *
+     * @param  Snapshot  $snapshot
+     * @param  Metadata|null  $metadata  already read: nothing is read again when it has no earlier id
+     * @return array<string, string> old id => new id (metadata file and stored offers)
+     */
+    public function migrateIds(Server $server, array $snapshot, ?array $metadata = null): array
+    {
+        $platform = $this->platformForServer($server);
+
+        if ($platform === null || $snapshot['ci'] !== CiStatus::Green) {
+            return [];
+        }
+
+        $platformPlugins = $this->pluginsForPlatform($snapshot['plugins'], $platform);
+
+        if (!GitHubSourceRules::hasPreviousIds($platformPlugins)) {
+            return [];
+        }
+
+        $renamed = [];
+
+        try {
+            $renamed = app(GitHubOffers::class)->migrateIds($server, $platformPlugins);
+        } catch (GitHubSourceException $exception) {
+            $this->reportOncePerWindow("server:{$server->id}:migrate-offers:{$exception->reason}", $exception);
+        }
+
+        if ($metadata !== null && GitHubSourceRules::migrateInstalledIds($metadata['installed'], $platformPlugins)['renamed'] === []) {
+            return $renamed;
+        }
+
+        $lock = Cache::lock("minecraft-modrinth:github:install:{$server->id}", 60);
+
+        if (!$lock->get()) {
+            // An installation is running: it converts the ids itself, or the next check does.
+            return $renamed;
+        }
+
+        try {
+            $metadata = $this->readMetadata($server);
+            $migration = GitHubSourceRules::migrateInstalledIds($metadata['installed'], $platformPlugins);
+
+            if ($migration['renamed'] !== []) {
+                $this->writeMetadata($server, $migration['installed'], $metadata['pending_delete']);
+                $renamed += $migration['renamed'];
+
+                Log::info("minecraft-modrinth: GitHub: server #{$server->id}: plugins/".self::METADATA_FILE.' now records '.implode(', ', array_map(fn (string $old, string $new) => "$old as $new", array_keys($migration['renamed']), $migration['renamed'])));
+            }
+        } catch (GitHubSourceException $exception) {
+            if ($exception->reason !== GitHubSourceException::UNKNOWN_SERVER) {
+                $this->reportOncePerWindow("server:{$server->id}:migrate:{$exception->reason}", $exception);
+            }
+        } finally {
+            $lock->release();
+        }
+
+        return $renamed;
     }
 
     // ------------------------------------------------------------------

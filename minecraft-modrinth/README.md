@@ -87,20 +87,34 @@ A JSON file in the repository (default `minecraft/releases.json`), for example:
   "schema": 1,
   "plugins": [
     {
-      "id": "myplugin-paper",
+      "id": "myplugin",
       "name": "MyPlugin",
       "platform": "paper",
       "version": "1.4.0",
-      "path": "minecraft/MyPlugin/releases/myplugin-paper-1.4.0.jar",
+      "path": "minecraft/MyPlugin/paper/releases/MyPlugin-1.4.0.jar",
       "sha256": "<64 hex characters>",
       "size": 123456,
+      "frozen": false,
+      "previous_ids": ["myplugin-paper"]
+    },
+    {
+      "id": "myplugin",
+      "name": "MyPlugin",
+      "platform": "velocity",
+      "version": "1.2.0",
+      "path": "minecraft/MyPlugin/velocity/releases/MyPlugin-1.2.0.jar",
+      "sha256": "<64 hex characters>",
+      "size": 23456,
       "frozen": false
     }
   ]
 }
 ```
 
-- `id` - stable identifier, used to recognise an installed plugin across versions.
+- `id` - stable identifier, used to recognise an installed plugin across versions. It only has
+  to be unique **per platform** (since 1.6.0): a server only ever sees the entries of its own
+  platform, so the Paper and the Velocity part of a plugin can share one id (`myplugin`). The
+  same id twice on one platform: the second entry is skipped (and logged).
 - `name` - the plugin's name (as in its `plugin.yml` / Velocity `@Plugin`).
 - `platform` - `paper` or `velocity`.
 - `version` - `x.y.z`; an update is only offered/applied for a *higher* version.
@@ -108,7 +122,13 @@ A JSON file in the repository (default `minecraft/releases.json`), for example:
   `plugins/` is the last part of it.
 - `sha256` and `size` - of the jar; the download is checked against both before anything is written.
 - `frozen` - shown as information only.
+- `previous_ids` (optional, since 1.6.0) - earlier ids of this plugin **on the same platform**,
+  for when its id changes (see [Changing an id](#changing-an-id-previous_ids)). Up to 16 ids in
+  the same format as `id`, not the entry's own id. An earlier id that is the current id of another
+  entry of the same platform, or that several entries of the same platform list, is ignored
+  (logged); the entry itself stays.
 
+An index without `previous_ids` (as before 1.6.0) works exactly as before.
 An index with an unknown `schema`, or that isn't valid JSON, installs nothing (and is logged).
 Individual invalid entries are skipped and logged.
 
@@ -205,6 +225,41 @@ Individual invalid entries are skipped and logged.
   updating *file.create* and *file.delete*, removing *file.delete*; hiding an offer ("Doesn't
   belong on this server") and "Offer again" require *file.create*; replacing a manual copy
   ("Replace with GitHub version") *file.create* and *file.delete*.
+
+### Changing an id (previous_ids)
+
+A server records its installed plugins (and the plugins hidden or announced on it) by `id`. A new
+`id` alone would make the plugin a **new** plugin: offered again, while the installed one would show
+as *No longer in repository* and never be updated. To change an id, the entry keeps the old one
+in `previous_ids`:
+
+```json
+{ "id": "myplugin", "platform": "velocity", "previous_ids": ["myplugin-velocity"], ... }
+```
+
+- A plugin installed under an id from `previous_ids` **is** that plugin: the page shows its
+  normal state (*Up to date*, *Update available*, ...), *Update*, *Update all*, the daily
+  automatic update and the hourly offer check treat it as installed - nothing has to be reinstalled
+  by hand. Hiding ("Doesn't belong on this server") and announcements stored under the old id count
+  for the new id too (a plugin hidden under the old id stays hidden, one announced under the old id
+  is not announced again; *Offer again* clears both).
+- **Converted to the new id**: the next time the panel writes `plugins/.github-plugins.json` for
+  the plugin (*Install*/*Update* of any plugin, the daily automatic update), and at the hourly offer
+  check, entries recorded under an earlier id get the current id (only the `id` changes - version,
+  file, install date stay) and the stored hidden/announced offers move to it (merged if both
+  exist). This only happens from a commit with **green CI**, and only on servers whose platform has
+  an entry with `previous_ids` at all; on such a server the hourly check writes the metadata file
+  once (a line in the panel log: `... now records <old> as <new>`). Once every server has been
+  converted, the old id can be removed from `previous_ids`.
+- Only within one platform, and never an entry recorded for the other platform (e.g. after the egg
+  of a server was changed): ids are unique per platform only.
+- **Safety net**: installing a plugin while the same plugin (same `name`) is already recorded on the
+  server under an id the index doesn't list in `previous_ids` is refused ("already installed as
+  ...") instead of putting a second jar of it into `plugins/`.
+- **Order when switching an index to new ids**: update this plugin in the panel to 1.6.0 **first**,
+  then publish the index. Versions before 1.6.0 skip the second entry of an id that is used on both
+  platforms and know nothing about `previous_ids` - with them, installed plugins would show as
+  removed and the new ids as new plugins.
 
 ### New plugins
 
@@ -444,6 +499,17 @@ luckperms.net publishes no checksum, so instead:
 
 ## Changes
 
+- **1.6.0** - Plugin ids only have to be unique **per platform**: the Paper and the Velocity part of
+  a plugin can share one id (an index with `myplugin` for both is no longer cut down to one of
+  them), and every lookup by id (page, install/update, *Update all*, daily update, hourly check,
+  manual copies) stays within the server's platform. New optional index field **`previous_ids`**
+  for changing an id: a plugin installed under an earlier id is recognised as installed and keeps
+  being updated (no manual reinstall), hidden/announced offers under the earlier id still count,
+  and the server's `plugins/.github-plugins.json` and stored offers are converted to the new id
+  (at the next write and the hourly check, from a commit with green CI). Installing a plugin that
+  is already recorded under an unknown id with the same name is refused instead of leaving two
+  jars. An index without `previous_ids` works as before. Update the panel plugin before
+  publishing an index with changed ids.
 - **1.5.0** - Manual copies are replaced with the GitHub version: a jar of a repository plugin
   that was uploaded to `plugins/` by hand no longer blocks it ("remove it first"). New setting
   *Replace manual copies* (on by default): the GitHub Plugins page shows it as "Manual copy - will

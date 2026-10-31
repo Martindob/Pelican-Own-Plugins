@@ -299,10 +299,24 @@ namespace Boy132\MinecraftModrinth\GitHub {
         /** @var array<int, string> */
         public static array $dismissed = [];
 
+        /** @var array<int, array<int, string>> ids of the platform entries passed to migrateIds() */
+        public static array $migrateCalls = [];
+
         /** @return array<int, string> */
         public function dismissedIds(Server $server): array
         {
             return self::$dismissed;
+        }
+
+        /**
+         * @param  array<int, array{id: string, previous_ids?: array<int, string>}>  $platformPlugins
+         * @return array<string, string>
+         */
+        public function migrateIds(Server $server, array $platformPlugins): array
+        {
+            self::$migrateCalls[] = array_column($platformPlugins, 'id');
+
+            return GitHubSourceRules::storedIdRenames(self::$dismissed, $platformPlugins);
         }
 
         public function forgetCounts(Server $server): void {}
@@ -446,16 +460,23 @@ namespace {
     }
 
     /** @return array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool} */
-    function indexEntry(TestService $service, string $id, string $name, string $version, string $content, string $platform = 'paper'): array
+    function indexEntry(TestService $service, string $id, string $name, string $version, string $content, string $platform = 'paper', array $previousIds = []): array
     {
         $entry = R::validateIndexEntry([
             'id' => $id, 'name' => $name, 'platform' => $platform, 'version' => $version,
             'path' => "minecraft/$name/releases/$name-$version.jar", 'sha256' => hash('sha256', $content), 'size' => strlen($content),
+            'previous_ids' => $previousIds,
         ]);
         assert($entry !== null);
         $service->jars[$entry['sha256']] = $content;
 
         return $entry;
+    }
+
+    /** @param  array<int, array<string, mixed>>  $installed */
+    function putMetadata(array $installed): void
+    {
+        DaemonFiles::$fs['plugins/.github-plugins.json'] = ['content' => json_encode(['schema' => 1, 'installed' => $installed]), 'modified' => '2026-10-01T00:00:00+00:00'];
     }
 
     /** @return array<string, mixed> */
@@ -500,6 +521,7 @@ namespace {
         MinecraftModrinthService::$filenames = [];
         MinecraftModrinthService::$reads = 0;
         GitHubOffers::$dismissed = [];
+        GitHubOffers::$migrateCalls = [];
         // The configuration folder of the plugin: never touched.
         DaemonFiles::$fs['plugins/EthoriaChat'] = ['content' => '', 'modified' => '2026-10-01T00:00:00+00:00', 'dir' => true];
         DaemonFiles::$fs['plugins/EthoriaChat/config.yml'] = ['content' => 'keep: true', 'modified' => '2026-10-01T00:00:00+00:00'];
@@ -737,6 +759,120 @@ namespace {
     [, $chat] = [null, indexEntry($service, 'chat', 'EthoriaChat', '1.8.1', $newChat)];
     putFile('EthoriaChat-1.8.0.jar', $oldChat);
     check(throwsReason(fn () => $service->installOrUpdate($server, $chat, $snapshot, true, false, true), GitHubSourceException::INVALID_INDEX) && jarsOnServer() === ['EthoriaChat-1.8.0.jar'], 'wrong platform: nothing touched');
+
+    // ------------------------------------------------------------------
+    // 11. 1.6.0: an id without the platform + previous_ids (EthoriaVote: ethoriavote-velocity -> ethoriavote)
+    // ------------------------------------------------------------------
+    $voteOld = $velocityJar('ethoriavote', '1.0.0');
+    $voteNew = $velocityJar('ethoriavote', '1.0.1');
+    $installedOld = fn (string $id = 'ethoriavote-velocity', string $platform = 'velocity') => [
+        'id' => $id, 'name' => 'EthoriaVote', 'platform' => $platform, 'version' => '1.0.0', 'sha256' => hash('sha256', $voteOld), 'size' => strlen($voteOld),
+        'filename' => 'ethoriavote-velocity-1.0.0.jar', 'repository' => 'Martindob/Ethoria.cz', 'commit' => str_repeat('b', 40), 'installed_at' => '2026-10-01T00:00:00+00:00',
+    ];
+    $motdInstalled = [
+        'id' => 'ethoriamotd', 'name' => 'EthoriaMotd', 'platform' => 'velocity', 'version' => '1.2.0', 'sha256' => str_repeat('d', 64), 'size' => 10,
+        'filename' => 'EthoriaMotd-1.2.0.jar', 'repository' => 'Martindob/Ethoria.cz', 'commit' => str_repeat('b', 40), 'installed_at' => '2026-10-01T00:00:00+00:00',
+    ];
+    $voteSetup = function (bool $withPrevious = true, string $version = '1.0.1') use ($voteOld, $voteNew, $installedOld, $motdInstalled): array {
+        $service = resetAll();
+        $service->platform = 'velocity';
+        $content = $version === '1.0.0' ? $voteOld : $voteNew;
+        $vote = indexEntry($service, $withPrevious ? 'ethoriavote' : 'ethoriavote-velocity', 'EthoriaVote', $version, $content, 'velocity', $withPrevious ? ['ethoriavote-velocity'] : []);
+        $votePaper = indexEntry($service, $withPrevious ? 'ethoriavote' : 'ethoriavote-paper', 'EthoriaVote', $version, paperJar('EthoriaVote', $version), 'paper', $withPrevious ? ['ethoriavote-paper'] : []);
+        $snapshot = ['repository' => 'Martindob/Ethoria.cz', 'branch' => 'main', 'sha' => str_repeat('e', 40), 'ci' => CiStatus::Green, 'plugins' => [$votePaper, $vote], 'problems' => []];
+        putFile('ethoriavote-velocity-1.0.0.jar', $voteOld);
+        putFile('EthoriaMotd-1.2.0.jar', str_repeat('m', 10));
+        putMetadata([$installedOld(), $motdInstalled]);
+
+        return [$service, $vote, $votePaper, $snapshot];
+    };
+
+    // Update from the page: the plugin installed under the old id is updated (not "already installed" / new).
+    [$service, $vote, , $snapshot] = $voteSetup();
+    $entry = $service->installOrUpdate($server, $vote, $snapshot, true, true);
+    $meta = metadata();
+    check($entry['id'] === 'ethoriavote' && $entry['filename'] === 'EthoriaVote-1.0.1.jar' && $entry['installed_at'] === '2026-10-01T00:00:00+00:00' && isset($entry['updated_at']), 'update under the old id: new jar, current id, install date kept');
+    check(array_column($meta['installed'], 'id') === ['ethoriavote', 'ethoriamotd'] && !isset($meta['pending_delete']), 'metadata: entry converted in place, other entries kept, nothing pending');
+    check(jarsOnServer() === ['EthoriaMotd-1.2.0.jar', 'EthoriaVote-1.0.1.jar'], 'old jar of the old id deleted, new one written');
+    $atDelete = json_decode((string) DaemonFiles::$metadataAtDelete['ethoriavote-velocity-1.0.0.jar'], true);
+    check(array_column($atDelete['installed'], 'id') === ['ethoriavote', 'ethoriamotd'] && ($atDelete['pending_delete'][0]['filename'] ?? null) === 'ethoriavote-velocity-1.0.0.jar', 'old jar recorded as pending before it is deleted');
+    check(throwsReason(fn () => $service->installOrUpdate($server, $vote, $snapshot, true, false), GitHubSourceException::STATE_CHANGED), 'install of the converted plugin: refused as already installed');
+
+    // "Install" while it is installed under the old id: refused like any installed plugin.
+    [$service, $vote, , $snapshot] = $voteSetup();
+    check(throwsReason(fn () => $service->installOrUpdate($server, $vote, $snapshot, true, false), GitHubSourceException::STATE_CHANGED) && jarsOnServer() === ['EthoriaMotd-1.2.0.jar', 'ethoriavote-velocity-1.0.0.jar'], 'install while installed under the old id: refused, nothing changed');
+
+    // Daily automatic update: updates it (and the metadata gets the current id).
+    [$service, , , $snapshot] = $voteSetup();
+    check($service->autoUpdateServer($server, $snapshot) === ['ethoriavote'], 'auto update: plugin under the old id updated');
+    check(array_column(metadata()['installed'], 'id') === ['ethoriavote', 'ethoriamotd'] && jarsOnServer() === ['EthoriaMotd-1.2.0.jar', 'EthoriaVote-1.0.1.jar'], 'auto update: converted and replaced');
+    check(GitHubOffers::$migrateCalls === [['ethoriavote']], 'auto update: stored offers converted for the velocity entries only');
+
+    // Same version in the new index: nothing to update, only the id is converted (one write, no jar touched).
+    [$service, , , $snapshot] = $voteSetup(true, '1.0.0');
+    DaemonFiles::$ops = [];
+    check($service->autoUpdateServer($server, $snapshot) === [], 'same version: nothing updated');
+    check(array_column(metadata()['installed'], 'id') === ['ethoriavote', 'ethoriamotd'] && DaemonFiles::$ops === ['metadata'], 'same version: only the metadata written, with the current id');
+    check(metadata()['installed'][0] === ['id' => 'ethoriavote'] + $installedOld(), 'same version: everything but the id unchanged');
+    check(count(array_filter(Log::$lines, fn (string $line) => str_contains($line, 'ethoriavote-velocity as ethoriavote'))) === 1, 'conversion logged once');
+    DaemonFiles::$ops = [];
+    check($service->migrateIds($server, $snapshot, $service->readMetadata($server)) === [] && DaemonFiles::$ops === [], 'second time: nothing to convert, nothing written');
+
+    // Hourly check / auto update with CI not green: nothing converted.
+    [$service, , , $snapshot] = $voteSetup(true, '1.0.0');
+    $snapshot['ci'] = CiStatus::Pending;
+    check($service->migrateIds($server, $snapshot) === [] && metadata()['installed'][0]['id'] === 'ethoriavote-velocity' && GitHubOffers::$migrateCalls === [], 'CI not green: ids not converted');
+
+    // Hidden under the old id: the stored offer is converted too.
+    [$service, , , $snapshot] = $voteSetup(true, '1.0.0');
+    GitHubOffers::$dismissed = ['ethoriavote-velocity'];
+    check($service->migrateIds($server, $snapshot) === ['ethoriavote-velocity' => 'ethoriavote'], 'stored offers and metadata converted');
+
+    // Manual install with "Require green CI" off from a commit that isn't green: the plugin itself
+    // gets its current id (it is replaced anyway), other entries stay as they are.
+    [$service, $vote, , $snapshot] = $voteSetup();
+    $motdOld = ['id' => 'motd-old'] + $motdInstalled;
+    putMetadata([$installedOld(), $motdOld]);
+    $snapshot['plugins'][] = indexEntry($service, 'ethoriamotd', 'EthoriaMotd', '1.2.0', str_repeat('m', 10), 'velocity', ['motd-old']);
+    $snapshot['ci'] = CiStatus::Pending;
+    $service->installOrUpdate($server, $vote, $snapshot, false, true);
+    check(array_column(metadata()['installed'], 'id') === ['ethoriavote', 'motd-old'], 'CI not green: only the updated plugin converted');
+    $snapshot['ci'] = CiStatus::Green;
+    check($service->migrateIds($server, $snapshot) === ['motd-old' => 'ethoriamotd'] && array_column(metadata()['installed'], 'id') === ['ethoriavote', 'ethoriamotd'], 'green CI: the rest converted');
+
+    // Old index (no previous_ids, ids with the platform): exactly as before 1.6.0.
+    [$service, $vote, , $snapshot] = $voteSetup(false);
+    $entry = $service->installOrUpdate($server, $vote, $snapshot, true, true);
+    check($entry['id'] === 'ethoriavote-velocity' && array_column(metadata()['installed'], 'id') === ['ethoriavote-velocity', 'ethoriamotd'], 'old index: updated under its id as before');
+    check($service->migrateIds($server, $snapshot) === [] && GitHubOffers::$migrateCalls === [], 'old index: nothing converted, offers not touched');
+
+    // New id without previous_ids: the old install is not recognised - installing it again (two jars of one plugin) is refused.
+    [$service, , , $snapshot] = $voteSetup();
+    $bare = indexEntry($service, 'ethoriavote', 'EthoriaVote', '1.0.1', $voteNew, 'velocity');
+    $snapshot['plugins'] = [$bare];
+    check(throwsReason(fn () => $service->installOrUpdate($server, $bare, $snapshot, true, false), GitHubSourceException::FILE_CONFLICT, $message) && jarsOnServer() === ['EthoriaMotd-1.2.0.jar', 'ethoriavote-velocity-1.0.0.jar'], 'new id without previous_ids: conflict, nothing changed');
+    check(str_contains((string) $message, 'as ethoriavote-velocity') && str_contains((string) $message, 'previous_ids'), 'conflict names the recorded id');
+
+    // The id is recorded for the other platform (egg changed): never taken as this plugin, install refused.
+    [$service, $vote, , $snapshot] = $voteSetup();
+    putMetadata([$installedOld('ethoriavote', 'paper')]);
+    check(throwsReason(fn () => $service->installOrUpdate($server, $vote, $snapshot, true, null, true), GitHubSourceException::FILE_CONFLICT, $message) && str_contains((string) $message, 'another platform'), 'id recorded for another platform: refused');
+    check(metadata()['installed'][0]['platform'] === 'paper' && jarsOnServer() === ['EthoriaMotd-1.2.0.jar', 'ethoriavote-velocity-1.0.0.jar'], 'id recorded for another platform: nothing changed');
+
+    // Removing: the page passes the recorded id and the current one (it may have been converted meanwhile).
+    [$service, , , $snapshot] = $voteSetup(true, '1.0.0');
+    $service->migrateIds($server, $snapshot);
+    $service->uninstall($server, 'ethoriavote-velocity', ['ethoriavote']);
+    check(array_column(metadata()['installed'], 'id') === ['ethoriamotd'] && jarsOnServer() === ['EthoriaMotd-1.2.0.jar'], 'uninstall after conversion: removed by its current id');
+
+    // A paper server sees the paper entry of the shared id and its own old id.
+    [$service, , $votePaper, $snapshot] = $voteSetup();
+    $service->platform = 'paper';
+    DaemonFiles::reset();
+    putFile('ethoriavote-paper-1.0.0.jar', paperJar('EthoriaVote', '1.0.0'));
+    putMetadata([['id' => 'ethoriavote-paper', 'platform' => 'paper', 'filename' => 'ethoriavote-paper-1.0.0.jar', 'size' => 1] + $installedOld()]);
+    check($service->autoUpdateServer($server, $snapshot) === ['ethoriavote'] && jarsOnServer() === ['EthoriaVote-1.0.1.jar'], 'paper server: its entry updated');
+    check(metadata()['installed'][0]['platform'] === 'paper' && metadata()['installed'][0]['id'] === 'ethoriavote' && metadata()['installed'][0]['sha256'] === $votePaper['sha256'], 'paper server: paper jar, current id');
 
     echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
     exit(Result::$failures === 0 ? 0 : 1);

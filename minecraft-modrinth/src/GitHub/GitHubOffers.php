@@ -93,11 +93,81 @@ class GitHubOffers
         $this->forgetCounts($server);
     }
 
-    /** @throws GitHubSourceException */
-    public function restore(Server $server, string $pluginId): void
+    /**
+     * "Offer again" - also for a plugin that was hidden under an earlier id ($previousIds).
+     *
+     * @param  array<int, string>  $previousIds
+     *
+     * @throws GitHubSourceException
+     */
+    public function restore(Server $server, string $pluginId, array $previousIds = []): void
     {
         $this->write($server, $pluginId, ['dismissed_at' => null]);
+
+        if ($previousIds !== []) {
+            try {
+                DB::table(self::TABLE)
+                    ->where('server_id', $server->id)
+                    ->whereIn('plugin_id', $previousIds)
+                    ->whereNotNull('dismissed_at')
+                    ->update(['dismissed_at' => null, 'updated_at' => now()]);
+            } catch (QueryException) {
+                throw new GitHubSourceException(GitHubSourceException::OFFER_STORE, "Could not store the plugin offer $pluginId of server #{$server->id}");
+            }
+        }
+
         $this->forgetCounts($server);
+    }
+
+    /**
+     * Move what is stored under an earlier id of a plugin (hidden, announced - see
+     * GitHubSourceRules::storedIdRenames()) to its current id. When both ids have a row, they
+     * are merged (hidden / announced if either was) and the old row removed.
+     *
+     * @param  array<int, IndexPlugin>  $platformPlugins  the index entries of the server's platform
+     * @return array<string, string> old id => new id
+     *
+     * @throws GitHubSourceException
+     */
+    public function migrateIds(Server $server, array $platformPlugins): array
+    {
+        if (!$this->isStoreAvailable() || !GitHubSourceRules::hasPreviousIds($platformPlugins)) {
+            return [];
+        }
+
+        try {
+            $rows = DB::table(self::TABLE)->where('server_id', $server->id)->get()->keyBy('plugin_id');
+            $renames = GitHubSourceRules::storedIdRenames($rows->keys()->map(fn ($id) => (string) $id)->all(), $platformPlugins);
+
+            foreach ($renames as $old => $new) {
+                DB::transaction(function () use ($server, $rows, $old, $new) {
+                    $oldRow = $rows->get($old);
+                    $newRow = $rows->get($new);
+
+                    if ($newRow === null) {
+                        DB::table(self::TABLE)->where('server_id', $server->id)->where('plugin_id', $old)->update(['plugin_id' => $new, 'updated_at' => now()]);
+
+                        return;
+                    }
+
+                    DB::table(self::TABLE)->where('server_id', $server->id)->where('plugin_id', $new)->update([
+                        'dismissed_at' => $newRow->dismissed_at ?? $oldRow->dismissed_at,
+                        'notified_at' => $newRow->notified_at ?? $oldRow->notified_at,
+                        'notified_version' => $newRow->notified_version ?? $oldRow->notified_version,
+                        'updated_at' => now(),
+                    ]);
+                    DB::table(self::TABLE)->where('server_id', $server->id)->where('plugin_id', $old)->delete();
+                });
+            }
+        } catch (QueryException) {
+            throw new GitHubSourceException(GitHubSourceException::OFFER_STORE, "Could not move the stored plugin offers of server #{$server->id} to the plugins' new ids");
+        }
+
+        if ($renames !== []) {
+            $this->forgetCounts($server);
+        }
+
+        return $renames;
     }
 
     /**
@@ -185,7 +255,7 @@ class GitHubOffers
      * $announce - tell the server's users once about every new plugin.
      *
      * @param  Snapshot  $snapshot
-     * @return array{new: int, updates: int, announced: array<int, string>}|null null when the server has no platform or can't be checked now
+     * @return array{new: int, updates: int, announced: array<int, string>, renamed: array<string, string>}|null null when the server has no platform or can't be checked now
      */
     public function checkServer(Server $server, array $snapshot, bool $announce): ?array
     {
@@ -237,6 +307,10 @@ class GitHubOffers
         // Old jars pending deletion and temporary uploads left behind by an interrupted install.
         $this->service()->cleanupServer($server, $files);
 
+        // Plugins still recorded under an earlier id (previous_ids) get their current one. Until
+        // then the earlier ids are recognised anyway (offers, announcements, hidden plugins).
+        $renamed = $this->service()->migrateIds($server, $snapshot, $metadata);
+
         $announced = [];
 
         // Only with a working store: without the record of what was announced, every check
@@ -250,7 +324,7 @@ class GitHubOffers
             }
         }
 
-        return ['new' => count($offers['new']), 'updates' => count($offers['updates']), 'announced' => $announced];
+        return ['new' => count($offers['new']), 'updates' => count($offers['updates']), 'announced' => $announced, 'renamed' => $renamed];
     }
 
     /**

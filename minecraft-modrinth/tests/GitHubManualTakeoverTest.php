@@ -548,7 +548,7 @@ namespace {
     // ------------------------------------------------------------------
     [$service, $chat, , $snapshot] = $setup();
     putFile('EthoriaChat-1.8.0.jar', $oldChat);
-    putFile('LuckPerms-Bukkit-5.5.87.jar', 'foreign');
+    putFile('Vault-1.7.3.jar', 'foreign');
 
     check($service->manualReplacements($server, [$chat], ['installed' => [], 'pending_delete' => []], DaemonFiles::listDirectory($server, 'plugins') ?? [], []) === ['chat' => ['EthoriaChat-1.8.0.jar']], 'offered for replacement');
 
@@ -556,7 +556,7 @@ namespace {
     $entry = $service->installOrUpdate($server, $chat, $snapshot, true, false, true, $replaced);
     check($entry['filename'] === 'EthoriaChat-1.8.1.jar' && $entry['version'] === '1.8.1', 'new jar installed under the indexed name');
     check($replaced === ['EthoriaChat-1.8.0.jar'], 'replaced copies reported');
-    check(jarsOnServer() === ['EthoriaChat-1.8.1.jar', 'LuckPerms-Bukkit-5.5.87.jar'], 'only one jar of the plugin left, foreign jar untouched');
+    check(jarsOnServer() === ['EthoriaChat-1.8.1.jar', 'Vault-1.7.3.jar'], 'only one jar of the plugin left, foreign jar untouched');
     check((DaemonFiles::$fs['plugins/EthoriaChat-1.8.1.jar']['content'] ?? null) === $newChat, 'new jar content written');
     check(isset(DaemonFiles::$fs['plugins/EthoriaChat/config.yml']), 'configuration folder untouched');
 

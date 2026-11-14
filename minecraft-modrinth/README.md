@@ -1,15 +1,15 @@
 # Minecraft Modrinth & GitHub (by Boy132 & H1ghSyst3m, fork maintained by Martindob)
 
-Easily download, update, and manage Minecraft mods and plugins directly from Modrinth within the server panel - and, optionally, plugins from a GitHub repository that ships pre-built jars (see [GitHub repository source](#github-repository-source)) and LuckPerms straight from luckperms.net (see [LuckPerms source](#luckperms-source-luckpermsnet)).
+Easily download, update, and manage Minecraft mods and plugins directly from Modrinth within the server panel - and, optionally, plugins from a GitHub repository that ships pre-built jars (see [GitHub repository source](#github-repository-source)).
 
-> Originally created by [Boy132](https://github.com/Boy132) & [H1ghSyst3m](https://github.com/H1ghSyst3m) as part of [pelican-dev/plugins](https://github.com/pelican-dev/plugins), licensed under GPLv3 (see [LICENSE](LICENSE)). Modified by Martindob since September 2026 (search/filter fixes, Czech translation, "Always Use Latest Version" setting, automatic daily updates, the GitHub repository source with offers of new plugins, the LuckPerms source, and various fixes — see the commit history for full details).
+> Originally created by [Boy132](https://github.com/Boy132) & [H1ghSyst3m](https://github.com/H1ghSyst3m) as part of [pelican-dev/plugins](https://github.com/pelican-dev/plugins), licensed under GPLv3 (see [LICENSE](LICENSE)). Modified by Martindob since September 2026 (search/filter fixes, Czech translation, "Always Use Latest Version" setting, automatic daily updates, the GitHub repository source with offers of new plugins, and various fixes — see the commit history for full details).
 
 ## Setup
 
 Add `modrinth_mods` and/or `modrinth_plugins` to the _features_ of your egg to enable the mod/plugins page.
 Also make sure your egg has the `minecraft` _tag_ and a tag matching a Modrinth loader name. (e.g. `paper` or `neoforge`)
 
-Subuser permissions (the same for the Modrinth pages, the GitHub Plugins page and the LuckPerms page): seeing the page
+Subuser permissions (the same for the Modrinth pages and the GitHub Plugins page): seeing the page
 needs *file.read*, installing *file.create*, updating (or installing another version over an
 installed one) *file.create* and *file.delete*, uninstalling *file.delete*. A subuser with only
 console access doesn't see the pages at all.
@@ -32,8 +32,7 @@ console access doesn't see the pages at all.
 
 - **Always Use Latest Version**: skip the Minecraft version compatibility check entirely when searching for and installing mods/plugins, always using the newest available version for the detected loader. Useful for updating mods/plugins ahead of upgrading a server to a newer Minecraft version.
 - **Enable Automatic Updates**: once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually - and plugins installed from the GitHub repository source (see below). A failed automatic update is logged (the same failure at most once a day); a successful one is not.
-- **Automatic Update Time**: what time of day that runs, in your own account's time zone (captured when you save the settings page), not the panel's. Handy for scheduling it a few minutes ahead of a server's own restart schedule. Only `HH:MM` is accepted; an unusable value in `.env` falls back to midnight instead of breaking the panel's schedule. The [LuckPerms source](#luckperms-source-luckpermsnet) runs at the same time.
-- **LuckPerms (luckperms.net)**: see [LuckPerms source](#luckperms-source-luckpermsnet).
+- **Automatic Update Time**: what time of day that runs, in your own account's time zone (captured when you save the settings page), not the panel's. Handy for scheduling it a few minutes ahead of a server's own restart schedule. Only `HH:MM` is accepted; an unusable value in `.env` falls back to midnight instead of breaking the panel's schedule.
 
 ### Modrinth installs
 
@@ -50,9 +49,6 @@ console access doesn't see the pages at all.
   updated or removed** until it can - writing it would replace every entry with a single one. To
   recover a damaged file, fix the JSON by hand, or delete it (the mods/plugins stay installed but
   are no longer listed as installed from Modrinth; install them again from the page to track them).
-- **Never a second LuckPerms**: installing LuckPerms from Modrinth (or any jar named like LuckPerms)
-  is refused while `plugins/` already has another LuckPerms jar - e.g. one kept up to date from
-  luckperms.net by the [LuckPerms source](#luckperms-source-luckpermsnet), or one uploaded by hand.
 - **GitHub repository source**: see below.
 
 ## Features
@@ -68,7 +64,6 @@ console access doesn't see the pages at all.
 - **Automatic Updates**: Optionally update every installed mod/plugin on every server once a day, without manual interaction (servers that are suspended, installing, being transferred or restored are skipped; one failing server never stops the run for the others)
 - **Verified Downloads**: The panel downloads every Modrinth file itself, only from `https://cdn.modrinth.com`, and checks it against the size and sha512 Modrinth publishes before it is written to the server
 - **GitHub Repository Source**: Install and update your own pre-built plugins from a (private) GitHub repository, gated on green CI, individually or all pending updates at once; new plugins in the repository are offered (never installed automatically); copies of them uploaded by hand are replaced with the repository version
-- **LuckPerms Source**: Keep LuckPerms on Paper/Spigot/Folia/Purpur and Velocity servers on the newest build from luckperms.net (usually days ahead of Modrinth), automatically or with a notification; an existing LuckPerms jar (manual or from Modrinth) is taken over
 - **Multilingual**: Supports English, German and Czech translations
 
 ## GitHub repository source
@@ -388,117 +383,18 @@ manually**, as in 1.4.1.
   `name` inside a recognised copy is only read right before it is replaced.
 - The panel keeps a jar in memory while installing it, hence the 50 MB limit.
 
-## LuckPerms source (luckperms.net)
-
-New LuckPerms builds appear on [luckperms.net](https://luckperms.net/download) right away, on
-Modrinth often only much later. With this source the panel keeps LuckPerms up to date straight from
-luckperms.net, on **Paper** (and Spigot, Bukkit, Folia, Purpur, Pufferfish, Leaf - the *Bukkit*
-build of LuckPerms) and **Velocity** servers (the *Velocity* build).
-
-### Setup
-
-1. *Admin → Plugins → Minecraft Modrinth & GitHub → Settings → LuckPerms (luckperms.net)*:
-   - **Enable LuckPerms source** (off by default).
-   - **When a newer LuckPerms is out**: **Update automatically** (default) or **Only notify (bell)**.
-   - **Check luckperms.net** reads the newest version right away (also with the source still off).
-2. The servers need the same egg setup as the Modrinth plugins page (`modrinth_plugins` or `plugins`
-   feature, `minecraft` tag) plus a loader tag: `paper`, `spigot`, `bukkit`, `folia`, `purpur`,
-   `pufferfish` or `leaf` → Bukkit build; `velocity` → Velocity build (wins if both are present).
-   Other servers (Fabric, Forge, BungeeCord, ...) get nothing.
-
-### LuckPerms page
-
-Every such server gets a **LuckPerms** page (*file.read*): the installed version and jar, the newest
-version on luckperms.net, the state (*Up to date*, *Update available*, *Not installed*, *Newer than
-luckperms.net*, *Needs attention*) and the latest changes from luckperms.net (each linked to its
-commit on GitHub). Actions: **Install** (*file.create*; only when there is no LuckPerms at all),
-**Update** (*file.create* + *file.delete*), **Remove** (*file.delete*; the jar only -
-`plugins/LuckPerms/` with the configuration and data stays), **Check luckperms.net again** (at most
-every 10 seconds per server) and **Open plugins folder**. A new or updated LuckPerms is used after
-the **next server restart**.
-
-### Which jar is LuckPerms (taking over an existing install)
-
-There is no metadata file of its own: whatever LuckPerms jar is in `plugins/` is LuckPerms on that
-server, however it got there.
-
-- A jar named like a LuckPerms build (`LuckPerms-Bukkit-<x.y.z>.jar`, `LuckPerms-Velocity-<x.y.z>.jar`,
-  in any letter case - this is also the name Modrinth uses) is recognised by its name.
-- Any other `.jar` with `luckperms` in its name (`LuckPerms.jar`, `luckperms-5.4.jar`,
-  `LuckPerms-Bukkit-Legacy-...jar`, add-ons like `LuckPermsChat.jar`, ...) is read from the node
-  once (at most 30 MB; the result is remembered for a day per name/size/time) and recognised by its
-  `plugin.yml` (`name: LuckPerms`) or `velocity-plugin.json` (`"id": "luckperms"`) and the version
-  declared there. Add-ons are not LuckPerms and are left alone.
-- **Taking over**: an update replaces that jar, whether it was uploaded by hand or installed from
-  Modrinth: the new jar `LuckPerms-<Platform>-<version>.jar` is written first (temporary name
-  `.luckperms-*.part`, then renamed; never over an existing file), then - if the old jar is listed
-  in `plugins/.modrinth-metadata.json` - its **Modrinth entry is removed** (so the Modrinth page
-  neither manages nor updates it any more), and only then is the old jar deleted. If removing the
-  Modrinth entry or deleting the old jar fails, the new jar is deleted again (and the Modrinth entry
-  restored): **there are never two LuckPerms jars** because of this plugin. While the source is in
-  *Only notify* mode, a Modrinth install of LuckPerms stays managed by Modrinth until someone clicks
-  **Update** on the LuckPerms page.
-- **Needs attention** - nothing is installed or updated (also not automatically) until it is fixed
-  by hand: more than one LuckPerms jar in `plugins/`, a LuckPerms jar for the other platform
-  (Velocity build on a Paper server or vice versa), or a jar with `luckperms` in its name that
-  couldn't be read right now. The page lists the files. Nothing is changed either while
-  `plugins/.modrinth-metadata.json` can't be read (it would be unknown whether Modrinth manages the
-  jar); the page shows a warning then.
-- A newer version than the one on luckperms.net (e.g. a dev build) is never "updated" down.
-- The Modrinth pages refuse to install LuckPerms (or any jar named like LuckPerms) next to another
-  LuckPerms jar, so Modrinth can't put a second copy back.
-
-### Automatic updates
-
-- Part of the daily run `p:minecraft-modrinth:auto-update`, at the same **Automatic Update Time** -
-  also when *Enable Automatic Updates* (Modrinth/GitHub) is off: the LuckPerms source has its own
-  switch. LuckPerms is handled before Modrinth on each server.
-- luckperms.net is asked once per run; each jar is downloaded and checked once and then written to
-  every server that needs it.
-- Only servers that **already have LuckPerms** (exactly one LuckPerms jar of their platform) and only
-  to a **higher** version (x.y.z compared numerically). LuckPerms is never installed automatically.
-  Servers in a conflict state (suspended, installing, being transferred or restored) and servers
-  their node doesn't know are skipped; one failing server never stops the run.
-- **Update automatically**: the jar is replaced as described above; the new version is used after
-  the next restart (schedule the update time a few minutes before the servers' own restart).
-- **Only notify (bell)**: nothing is changed; the server owner and every subuser with *file.create* +
-  *file.delete* get one panel notification per server and version (*"On server X, LuckPerms 5.5.71
-  can be updated to 5.5.87"*) with a button to the LuckPerms page. Sent directly, not through the
-  queue.
-
-### Security
-
-luckperms.net publishes no checksum, so instead:
-
-- Only `https://metadata.luckperms.net/data/all` is read (at most 256 KB, cached for 10 minutes) and
-  jars are only downloaded from **`https://download.luckperms.net`** - host exactly that, no
-  credentials/port/query, **no redirects followed**, and the path must be exactly the one of that
-  platform and version (`/<build>/bukkit/loader/LuckPerms-Bukkit-<version>.jar`,
-  `/<build>/velocity/LuckPerms-Velocity-<version>.jar`). The version must be `x.y.z`.
-- The panel downloads the jar itself into a temporary file (at most **30 MB**; connect timeout 5 s,
-  60 s in total), checks that it is a valid jar (zip) whose `plugin.yml` says `name: LuckPerms` resp.
-  whose `velocity-plugin.json` says `"id": "luckperms"`, **with exactly the version from the
-  metadata** and the right platform, and only then writes it to the server through Wings. Wings never
-  gets a URL.
-- Only the LuckPerms jar in `plugins/` and (when taking over) its entry in
-  `plugins/.modrinth-metadata.json` are ever changed; `plugins/LuckPerms/` never.
-- If luckperms.net is down, the page shows it and nothing waits for it: after a failed request the
-  panel doesn't ask again for 1 minute (doubling up to 10 minutes); the daily run asks once. Failures
-  are logged as a single line (`minecraft-modrinth: LuckPerms: ...`), the same problem at most once a
-  day; the first success afterwards logs one "works again" line (info).
-- Changelog titles are shown as plain text; names and versions in notifications are escaped.
-
-### Limitations
-
-- A LuckPerms jar whose file name doesn't contain `luckperms` at all is not recognised (that would
-  mean downloading every jar in `plugins/` from the node). Rename it, or remove it and install
-  LuckPerms from the page.
-- The authenticity of the jar rests on HTTPS to `download.luckperms.net` (there is no published
-  checksum or signature to compare against).
-- BungeeCord/Waterfall, Fabric, Forge, NeoForge, Sponge and Nukkit builds are not offered.
-
 ## Changes
 
+- **1.7.0** - The LuckPerms source (luckperms.net) is removed completely: no more LuckPerms page,
+  no LuckPerms settings section, no LuckPerms step in the daily automatic update and no
+  notifications about new LuckPerms builds; the Modrinth pages no longer check for a second
+  LuckPerms jar. A LuckPerms jar already on a server is left alone (it is not deleted, and from
+  now on it is just a plugin like any other - updated by hand, from Modrinth or not at all).
+  The old settings `MINECRAFT_MODRINTH_LUCKPERMS_ENABLED` / `MINECRAFT_MODRINTH_LUCKPERMS_MODE`
+  in the panel's `.env` are ignored and can be deleted; bell notifications sent earlier still
+  link to the removed page. Temporary `.luckperms-*.part` files from an interrupted LuckPerms
+  update are no longer cleaned up automatically (delete them by hand if there are any). The
+  Modrinth and GitHub sources work as in 1.6.0.
 - **1.6.0** - Plugin ids only have to be unique **per platform**: the Paper and the Velocity part of
   a plugin can share one id (an index with `myplugin` for both is no longer cut down to one of
   them), and every lookup by id (page, install/update, *Update all*, daily update, hourly check,

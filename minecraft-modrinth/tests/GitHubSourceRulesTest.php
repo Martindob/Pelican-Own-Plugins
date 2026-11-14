@@ -191,7 +191,7 @@ check(!R::belongsToSamePlugin('gdprerase-paper-1.3.0.jar.part', 'gdprerase-paper
 check(R::looksLikeSamePlugin('GdprErase.jar', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'manual jar named after the plugin');
 check(R::looksLikeSamePlugin('GdprErase-1.3.jar', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'manual versioned jar named after the plugin');
 check(R::looksLikeSamePlugin('gdprerase-paper-1.3.0.jar', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'other version of the file');
-check(!R::looksLikeSamePlugin('LuckPerms-Bukkit-5.4.jar', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'unrelated jar');
+check(!R::looksLikeSamePlugin('Vault-1.7.3.jar', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'unrelated jar');
 check(!R::looksLikeSamePlugin('GdprErase', 'gdprerase-paper-1.4.0.jar', 'GdprErase'), 'folder of the plugin is not a jar');
 check(R::alternativeFilename('a-1.0.0.jar', $jarSha) === 'a-1.0.0-'.substr($jarSha, 0, 12).'.jar', 'alternative file name');
 check(R::isValidJarFilename('gdprerase-paper-1.4.0.jar'), 'valid jar name');
@@ -248,7 +248,7 @@ $pSame = $paper('samepaper', 'SamePaper');
 $vNew = $velocity('newvelo', 'NewVelo');
 $all = [$pNew, $pUpd, $pManual, $pSame, $vNew];
 $installedList = [$installedEntry($pUpd, '1.0.0', 'updpaper-1.0.0.jar'), $installedEntry($pSame, '1.0.0')];
-$jars = ['updpaper-1.0.0.jar', $pSame['filename'], 'ManualPaper.jar', 'LuckPerms-Bukkit-5.4.jar'];
+$jars = ['updpaper-1.0.0.jar', $pSame['filename'], 'ManualPaper.jar', 'Vault-1.7.3.jar'];
 
 check(R::pluginsForPlatform($all, 'paper') === [$pNew, $pUpd, $pManual, $pSame], 'paper server sees only paper plugins');
 check(R::pluginsForPlatform($all, 'velocity') === [$vNew], 'velocity server sees only velocity plugins');
@@ -451,10 +451,10 @@ $cA = $paper('chat', 'EthoriaChat', '1.8.1');
 $cB = $paper('bags', 'EthoriaBags', '1.9.1');
 $platformPlugins = [$cA, $cB];
 
-check(R::unmanagedCopies($cA, ['EthoriaChat-1.8.0.jar', 'EthoriaBags.jar', 'LuckPerms-Bukkit-5.4.jar'], []) === ['EthoriaChat-1.8.0.jar'], 'unmanaged copy found by name');
+check(R::unmanagedCopies($cA, ['EthoriaChat-1.8.0.jar', 'EthoriaBags.jar', 'Vault-1.7.3.jar'], []) === ['EthoriaChat-1.8.0.jar'], 'unmanaged copy found by name');
 check(R::unmanagedCopies($cA, [$cA['filename']], [$cA['filename']]) === [], 'managed jar is not a copy');
 check(R::pluginsMatchingJar('EthoriaChat.jar', $platformPlugins) === ['chat'], 'jar matches exactly one index entry');
-check(R::pluginsMatchingJar('LuckPerms-Bukkit-5.4.jar', $platformPlugins) === [], 'foreign jar matches nothing');
+check(R::pluginsMatchingJar('Vault-1.7.3.jar', $platformPlugins) === [], 'foreign jar matches nothing');
 
 check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.0.jar', 'EthoriaBags.jar'], [], []) === ['EthoriaChat-1.8.0.jar'], 'manual copy replaceable');
 check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaBags.jar'], [], []) === [], 'no copy, nothing to replace');

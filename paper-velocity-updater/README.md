@@ -76,8 +76,8 @@ happened to fire before a slow download finished.
 
 5. When a `start` or `restart` power action is sent to a server through the panel's own API - a
    Schedule's "Power Action" task, or the client API - the plugin intercepts it before it reaches
-   Wings and checks whether anything is staged for it. **Not** the Console page's own buttons - see
-   the note on this under Limitations below.
+   Wings and checks whether anything is staged for it. **Not** the Console page's own buttons, and
+   not the power buttons in the server list - see the notes on these under Limitations below.
 6. If so, the existing jar is renamed to `<jarfile>.old` (best-effort, mirroring what the official
    install scripts themselves do before installing a new jar - an easy manual recovery path if a
    downloaded jar ever turns out to be bad; only a single rolling `.old` backup is ever kept, so
@@ -177,6 +177,12 @@ CDN is, since that download already happened, on its own schedule, before the re
   `socket.send({'event': 'set state', ...})`) - there is no panel-side PHP code in that path at all
   for this plugin (or any plugin) to hook into. This is a hard protocol limitation Wings itself would
   have to address, not something a Pelican plugin can intercept.
+- **The Start/Restart/Stop/Kill buttons in the server list (the page listing all your servers) do NOT
+  trigger a swap either.** These do go through the panel, but the page creates its own
+  `new DaemonServerRepository()` instead of taking it from the container
+  (`app/Filament/App/Resources/Servers/Pages/ListServers.php`, the same in every panel version from
+  v1.0.0-rc.1 to at least v1.0.0-rc.4), so the decorated repository this plugin registers is never
+  used there - a plugin can't change that without patching the panel itself.
   A restart **does** go through this plugin, and does swap in a staged update, when it's sent through
   a panel API instead of the browser's console - which is exactly how the two ways you'd realistically
   automate a restart already work:
@@ -187,7 +193,7 @@ CDN is, since that download already happened, on its own schedule, before the re
   - The **client API** (`POST /api/client/servers/{id}/power` with an API key) - what an external
     script or the "restart my server" button in some third-party integrations would use.
   To manually verify a swap without waiting for a scheduled restart, use one of these two instead of
-  the Console page's buttons - e.g. a one-off Schedule task set to run in a minute, or a client API
+  the Console page's or the server list's buttons - e.g. a one-off Schedule task set to run in a minute, or a client API
   call with `curl`.
 - Only `STABLE` channel builds are used for automatic updates. If a pinned version only has
   `BETA`/`ALPHA` builds, the newest available build is used instead.

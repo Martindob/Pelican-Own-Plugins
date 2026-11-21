@@ -21,6 +21,10 @@ use Martindob\PaperVelocityUpdater\Services\PaperVelocityUpdateService;
  * straight to Wings (server-console.blade.php's `socket.send({'event': 'set
  * state', ...})`), with no panel-side PHP code in that path at all - there is
  * nothing here to hook for that specific interaction.
+ *
+ * Doesn't cover the server list's power buttons either: ListServers builds
+ * its own `new DaemonServerRepository()` instead of resolving it from the
+ * container, so this decorator is never used there.
  */
 class UpdateCheckingDaemonServerRepository extends DaemonServerRepository
 {

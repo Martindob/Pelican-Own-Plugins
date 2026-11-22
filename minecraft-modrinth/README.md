@@ -143,8 +143,8 @@ Individual invalid entries are skipped and logged.
    - **Require green CI** (on by default): installing and updating is only possible from a commit
      whose GitHub Actions runs all finished successfully.
    - **Required workflow** (optional, empty by default): the file name of a workflow (e.g.
-     `build.yml`) that must have a successful `push` run on exactly that commit and branch for CI
-     to count as green. Without it, a quick workflow (e.g. a linter) that finishes before the
+     `build.yml`) that must have a successful run on exactly that commit (push or manual run on the
+     branch, or the pull request CI of that commit) for CI to count as green. Without it, a quick workflow (e.g. a linter) that finishes before the
      build has even started could make CI green too early. **For Ethoria set `build.yml`.**
    - **Replace manual copies** (on by default, `MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL`): a
      jar of a repository plugin that was put into `plugins/` by hand is replaced with the
@@ -158,9 +158,14 @@ Individual invalid entries are skipped and logged.
 
 ### How it works
 
-- The panel reads the head commit of the branch, the GitHub Actions runs of that commit
-  (`push` event on that branch - the run's `head_sha` and `head_branch` are checked too) and the
-  index file at exactly that commit. CI counts as **green** only when every run has finished as
+- The panel reads the head commit of the branch, the GitHub Actions runs of exactly that commit
+  (`head_sha` checked) and the index file at exactly that commit. A run counts when it is a push or
+  a manual run (`workflow_dispatch`) on that branch (`head_branch` checked), or the pull request CI
+  of that very commit: a pull request merged by fast-forwarding the branch to its tested head keeps
+  the same SHA, so its pull request run is the commit's CI and the repository doesn't need to run
+  CI a second time (a branch can only be fast-forwarded to a head that already contains it, so the
+  pull request run tested exactly this tree). Of several runs of one workflow only the newest
+  counts (a re-run, or a run that replaced a cancelled one). CI counts as **green** only when every run has finished as
   success/skipped/neutral and at least one succeeded (and, with a *Required workflow*, that one
   succeeded); any failed run makes it **red**, running ones **pending**, and a commit without runs
   stays **not verified** (not installable while green CI is required). Results are cached briefly
@@ -388,6 +393,11 @@ manually**, as in 1.4.1.
 
 ## Changes
 
+- **1.8.0** - CI of a pull request merged by fast-forward counts: besides a push, a manual run
+  (`workflow_dispatch`) on the branch and the pull request CI of exactly the same commit make it
+  green, so a repository that merges pull requests by fast-forwarding the branch to the tested
+  commit doesn't need a second CI run (half the GitHub Actions minutes). Only the newest run of
+  each workflow counts (a cancelled or failed run replaced by a newer one no longer turns CI red).
 - **1.7.2** - Refusals the GitHub Plugins page explains on its own (the newest commit's CI isn't
   green yet, or the page was out of date) are no longer written to the panel's error log with a
   stack trace. *Update all* stops at the first "CI not green" - typically a commit pushed after the

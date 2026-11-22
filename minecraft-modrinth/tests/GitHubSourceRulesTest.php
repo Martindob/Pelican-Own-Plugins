@@ -166,7 +166,23 @@ foreach (['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failu
     check(R::evaluateWorkflowRuns([$run('completed', 'success'), $run('completed', $conclusion)], $sha) === CiStatus::Failed, 'conclusion '.var_export($conclusion, true).' = failed');
 }
 check(R::evaluateWorkflowRuns([$run('completed', 'success', ['head_sha' => str_repeat('b', 40)])], $sha) === CiStatus::Unverified, 'runs of other commits ignored');
-check(R::evaluateWorkflowRuns([$run('completed', 'success', ['event' => 'pull_request'])], $sha) === CiStatus::Unverified, 'non-push runs ignored');
+check(R::evaluateWorkflowRuns([$run('completed', 'success', ['event' => 'pull_request', 'head_branch' => 'claude/x'])], $sha, 'main') === CiStatus::Green, 'pull request CI of the same commit counts (fast-forward merge)');
+check(R::evaluateWorkflowRuns([$run('completed', 'failure', ['event' => 'pull_request', 'head_branch' => 'claude/x'])], $sha, 'main') === CiStatus::Failed, 'failed pull request CI of the same commit = failed');
+check(R::evaluateWorkflowRuns([$run('completed', 'success', ['event' => 'workflow_dispatch', 'head_branch' => 'main'])], $sha, 'main') === CiStatus::Green, 'manual run on the branch counts');
+check(R::evaluateWorkflowRuns([$run('completed', 'success', ['event' => 'workflow_dispatch', 'head_branch' => 'dev'])], $sha, 'main') === CiStatus::Unverified, 'manual run on another branch ignored');
+check(R::evaluateWorkflowRuns([$run('completed', 'success', ['event' => 'push', 'head_branch' => 'dev'])], $sha, 'main') === CiStatus::Unverified, 'push to another branch ignored');
+check(R::evaluateWorkflowRuns([
+    $run('completed', 'cancelled', ['event' => 'pull_request', 'workflow_id' => 7, 'run_number' => 10]),
+    $run('completed', 'success', ['event' => 'pull_request', 'workflow_id' => 7, 'run_number' => 11]),
+], $sha, 'main') === CiStatus::Green, 'cancelled run replaced by a newer run of the same workflow');
+check(R::evaluateWorkflowRuns([
+    $run('completed', 'failure', ['workflow_id' => 7, 'run_number' => 10, 'run_attempt' => 1]),
+    $run('completed', 'success', ['workflow_id' => 7, 'run_number' => 10, 'run_attempt' => 2]),
+], $sha) === CiStatus::Green, 'successful re-run replaces the failed attempt');
+check(R::evaluateWorkflowRuns([
+    $run('completed', 'success', ['workflow_id' => 7, 'run_number' => 11]),
+    $run('completed', 'failure', ['workflow_id' => 8, 'run_number' => 3]),
+], $sha) === CiStatus::Failed, 'failure of another workflow still fails');
 check(R::evaluateWorkflowRuns([$run('completed', 'failure', ['event' => 'schedule']), $run('completed', 'success')], $sha) === CiStatus::Green, 'failed non-push run ignored');
 
 // Versions

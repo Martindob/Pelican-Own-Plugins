@@ -449,9 +449,14 @@ final class GitHubSourceRules
 
     /**
      * Decide the CI state of a commit from its GitHub Actions workflow runs
-     * (GET /repos/{repo}/actions/runs?head_sha=...&event=push&branch=...).
+     * (GET /repos/{repo}/actions/runs?head_sha=...).
      *
-     * Only runs of a push of exactly $sha (and, when given, to exactly $branch) count:
+     * Only runs of exactly $sha count: a push or a manual run (workflow_dispatch) on $branch (when given), or the
+     * pull request CI of that very commit. A pull request merged by fast-forwarding the branch to its tested head
+     * commit keeps the same SHA, so its pull request run is the commit's CI and no second run is needed; a branch
+     * can only be fast-forwarded to a head that already contains it, so the pull request run (head merged into the
+     * base) tested exactly this tree. Of several runs of one workflow only the newest counts (a re-run or a run that
+     * replaced a cancelled one):
      *
      * - any finished run that didn't succeed -> failed (definitive, even if others still run)
      * - anything still queued/running        -> pending
@@ -467,10 +472,9 @@ final class GitHubSourceRules
      */
     public static function evaluateWorkflowRuns(array $runs, string $sha, ?string $branch = null, ?string $requiredWorkflow = null): CiStatus
     {
-        $relevant = array_values(array_filter($runs, fn ($run) => is_array($run)
+        $relevant = self::newestPerWorkflow(array_values(array_filter($runs, fn ($run) => is_array($run)
             && ($run['head_sha'] ?? null) === $sha
-            && ($run['event'] ?? null) === 'push'
-            && ($branch === null || ($run['head_branch'] ?? null) === $branch)));
+            && self::runCountsForBranch($run, $branch))));
 
         if (empty($relevant)) {
             return CiStatus::Unverified;
@@ -510,6 +514,57 @@ final class GitHubSourceRules
         }
 
         return $succeeded ? CiStatus::Green : CiStatus::Unverified;
+    }
+
+    /**
+     * Push or manual run (workflow_dispatch) on $branch, or the pull request CI of the commit.
+     *
+     * @param  array<mixed>  $run
+     */
+    public static function runCountsForBranch(array $run, ?string $branch): bool
+    {
+        $event = $run['event'] ?? null;
+
+        if ($event === 'push' || $event === 'workflow_dispatch') {
+            return $branch === null || ($run['head_branch'] ?? null) === $branch;
+        }
+
+        return $event === 'pull_request';
+    }
+
+    /**
+     * Only the newest run (run number, then attempt) of each workflow; runs without a workflow id or run number
+     * are all kept.
+     *
+     * @param  array<int, array<mixed>>  $runs
+     * @return array<int, array<mixed>>
+     */
+    public static function newestPerWorkflow(array $runs): array
+    {
+        $newest = [];
+        $kept = [];
+
+        foreach ($runs as $run) {
+            $workflow = $run['workflow_id'] ?? null;
+            $number = $run['run_number'] ?? null;
+
+            if (!is_int($workflow) && !is_string($workflow) || !is_int($number)) {
+                $kept[] = $run;
+
+                continue;
+            }
+
+            $order = [$number, (int) ($run['run_attempt'] ?? 1)];
+            if (!isset($newest[$workflow]) || $order > $newest[$workflow]['order']) {
+                $newest[$workflow] = ['order' => $order, 'run' => $run];
+            }
+        }
+
+        foreach ($newest as $item) {
+            $kept[] = $item['run'];
+        }
+
+        return $kept;
     }
 
     /**

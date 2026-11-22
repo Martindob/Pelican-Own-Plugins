@@ -54,7 +54,8 @@ class GitHubClient
     }
 
     /**
-     * Every GitHub Actions workflow run of a push of $sha to $branch.
+     * Every GitHub Actions workflow run of exactly $sha (any event - GitHubSourceRules::evaluateWorkflowRuns
+     * decides which of them count for $branch).
      *
      * @return array<int, mixed>
      */
@@ -65,8 +66,7 @@ class GitHubClient
         for ($page = 1; $page <= 3; $page++) {
             $response = $this->get('/actions/runs', 'application/vnd.github+json', [
                 'head_sha' => $sha,
-                'event' => 'push',
-                'branch' => $branch,
+                'exclude_pull_requests' => 'true',
                 'per_page' => 100,
                 'page' => $page,
             ]);

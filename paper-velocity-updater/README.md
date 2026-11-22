@@ -95,7 +95,9 @@ the proxy is still running, right up to the moment the restart actually happens.
 
 ## Configuration
 
-Under **Admin → Plugins → Paper & Velocity Updater → Settings** in the panel:
+Under **Admin → Plugins → Paper & Velocity Updater → Settings** in the panel (in English or
+Czech, following the admin's panel language - the **Recent activity** entries too; texts live in
+`lang/<language>/`):
 
 - **Enabled** - turn the whole plugin on/off.
 - **Version/build cache (minutes)** - how long a resolved "latest version"/"latest build" lookup

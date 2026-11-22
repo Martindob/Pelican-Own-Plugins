@@ -509,6 +509,27 @@ namespace {
         return new $class();
     }
 
+    final class Lang
+    {
+        public static string $locale = 'en';
+    }
+
+    /** Laravel's trans() for this plugin's own lang files: "paper-velocity-updater::file.key". */
+    function trans(string $key, array $replace = []): string
+    {
+        [, $rest] = explode('::', $key, 2);
+        [$file, $item] = explode('.', $rest, 2);
+        $lines = require __DIR__.'/../lang/'.Lang::$locale."/$file.php";
+        $line = $lines[$item] ?? $key;
+
+        $map = [];
+        foreach ($replace as $name => $value) {
+            $map[':'.$name] = (string) $value;
+        }
+
+        return strtr($line, $map);
+    }
+
     function report(Throwable $exception): void
     {
         Reported::$exceptions[] = $exception;
@@ -651,7 +672,7 @@ namespace {
     function log_contains(PaperVelocityUpdateService $service, string $needle, ?string $level = null): bool
     {
         foreach ($service->getActivityLog() as $entry) {
-            if (str_contains($entry['message'], $needle) && ($level === null || $entry['level'] === $level)) {
+            if (str_contains($service->describeActivity($entry), $needle) && ($level === null || $entry['level'] === $level)) {
                 return true;
             }
         }
@@ -715,7 +736,7 @@ namespace {
     $server = paper_server(['MINECRAFT_VERSION' => '26.4']);
     $service->checkForUpdates();
     check(!isset(state($server)['pending']) && Wings::$pulls === [], 'a pinned version PaperMC doesn\'t list stages nothing');
-    check(log_contains($service, 'Pinned version "26.4"'), 'and says why');
+    check(log_contains($service, 'pinned version "26.4"'), 'and says why');
 
     reset_world();
     PendingRequest::$routes['/projects/paper'] = 503;
@@ -776,7 +797,7 @@ namespace {
     $server = paper_server(['MINECRAFT_VERSION' => '26.2']);
     set_state($server, ['installed' => installed('paper', '26.2', 130)]);
     $service->checkForUpdates();
-    check(Wings::$pulls === [] && log_contains($service, 'Already up to date'), 'the installed target is not downloaded again');
+    check(Wings::$pulls === [] && log_contains($service, 'already up to date'), 'the installed target is not downloaded again');
 
     reset_world();
     $service = new PaperVelocityUpdateService();
@@ -978,9 +999,48 @@ namespace {
     $server = paper_server(['BUILD_NUMBER' => '129']);
     $service->checkForUpdates();
     $service->checkForUpdates();
-    $count = count(array_filter($service->getActivityLog(), fn ($e) => str_contains($e['message'], 'BUILD_NUMBER')));
+    $count = count(array_filter($service->getActivityLog(), fn ($e) => str_contains($service->describeActivity($e), 'BUILD_NUMBER')));
     check($count === 1, 'a permanent skip reason is logged once a day, not every check');
     check($service->getLastCheckAt() !== null, 'the last check time is recorded');
+
+    // --- Translations -------------------------------------------------------------------------
+
+    $en = require __DIR__.'/../lang/en/activity.php';
+    $cs = require __DIR__.'/../lang/cs/activity.php';
+    preg_match_all('/logSkipOncePerDay\(\$server, \'(\w+)\'|logActivity\(\'\w+\', \'(\w+)\'/', file_get_contents(__DIR__.'/../src/Services/PaperVelocityUpdateService.php'), $used);
+    $usedKeys = array_values(array_unique(array_filter(array_merge($used[1], $used[2]))));
+    check(count($usedKeys) === count($en) && array_diff(array_keys($en), $usedKeys) === [], 'every activity key is used by the service, and every used key is translated');
+    foreach ($usedKeys as $key) {
+        check(isset($en[$key], $cs[$key]), "activity.$key exists in en and cs");
+    }
+    foreach ($en as $key => $line) {
+        preg_match_all('/:[a-z_]+/', $line, $a);
+        preg_match_all('/:[a-z_]+/', $cs[$key] ?? '', $b);
+        $a = array_unique($a[0]);
+        $b = array_unique($b[0]);
+        sort($a);
+        sort($b);
+        check($a === $b, "activity.$key: cs uses the same placeholders as en");
+    }
+    foreach (['en', 'cs'] as $locale) {
+        $settingsKeys = array_keys(require __DIR__."/../lang/$locale/settings.php");
+        preg_match_all('/settings\.(\w+)\'/', file_get_contents(__DIR__.'/../src/PaperVelocityUpdaterPlugin.php'), $m);
+        foreach (array_unique($m[1]) as $key) {
+            check(in_array($key, $settingsKeys, true), "settings.$key exists in $locale");
+        }
+    }
+
+    // Every message the scenarios above can produce, rendered in Czech, with all placeholders filled.
+    reset_world();
+    Lang::$locale = 'cs';
+    $service = new PaperVelocityUpdateService();
+    $server = paper_server(['MINECRAFT_VERSION' => '26.2']);
+    set_state($server, ['installed' => installed('paper', '26.3', 257)]);
+    $service->checkForUpdates();
+    $text = $service->describeActivity($service->getActivityLog()[0]);
+    check(str_contains($text, 'na starší verzi se automaticky nepřechází') && str_contains($text, 'server.jar.old') && !preg_match('/:[a-z_]+/', $text), 'Czech downgrade warning with every placeholder filled');
+    check($service->describeActivity(['at' => 'x', 'level' => 'info', 'message' => 'Old English entry']) === 'Old English entry', 'entries from before 1.4.1 still show');
+    Lang::$locale = 'en';
 
     echo Result::$failures === 0
         ? 'OK ('.Result::$checks." checks, 0 failed)\n"

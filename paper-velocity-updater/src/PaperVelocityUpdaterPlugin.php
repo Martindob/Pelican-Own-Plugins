@@ -45,51 +45,52 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
     {
         return [
             Toggle::make('enabled')
-                ->label('Enabled')
-                ->helperText('Automatically stage and install the newest Paper/Velocity build. Checked hourly in the background; applied on the next server start/restart.')
+                ->label(trans('paper-velocity-updater::settings.enabled'))
+                ->helperText(trans('paper-velocity-updater::settings.enabled_helper'))
                 ->inline(false)
                 ->default(fn () => config('paper-velocity-updater.enabled')),
             TextInput::make('cache_minutes')
-                ->label('Version/build cache (minutes)')
-                ->helperText('How long a resolved "latest version"/"latest build" lookup is cached before PaperMC is asked again.')
+                ->label(trans('paper-velocity-updater::settings.cache_minutes'))
+                ->helperText(trans('paper-velocity-updater::settings.cache_minutes_helper'))
                 ->numeric()
                 ->minValue(1)
                 ->required()
                 ->default(fn () => config('paper-velocity-updater.cache_minutes')),
             TextInput::make('download_timeout_seconds')
-                ->label('Download timeout (seconds)')
-                ->helperText('How long the hourly background check waits for the daemon to download and stage a new jar. Raise this if your nodes have a slow link to PaperMC\'s CDN. Kept well above the daemon client\'s own 15 second default on purpose - a ~50-60MB jar realistically needs more than that. Never affects a server start/restart itself, which only ever swaps in what was already staged.')
+                ->label(trans('paper-velocity-updater::settings.download_timeout'))
+                ->helperText(trans('paper-velocity-updater::settings.download_timeout_helper'))
                 ->numeric()
                 ->minValue(60)
                 ->required()
                 ->default(fn () => config('paper-velocity-updater.download_timeout_seconds')),
             TextInput::make('report_throttle_minutes')
-                ->label('Failure log throttle (minutes)')
-                ->helperText('The same failure for a given server is only logged once per this many minutes, no matter how many times the hourly check hits it in the meantime. Set to 0 to log every occurrence.')
+                ->label(trans('paper-velocity-updater::settings.report_throttle'))
+                ->helperText(trans('paper-velocity-updater::settings.report_throttle_helper'))
                 ->numeric()
                 ->minValue(0)
                 ->required()
                 ->default(fn () => config('paper-velocity-updater.report_throttle_minutes')),
             Actions::make([
                 Action::make('check_now')
-                    ->label('Run check now')
+                    ->label(trans('paper-velocity-updater::settings.check_now'))
+                    ->button()
                     ->icon('tabler-refresh')
                     ->color('gray')
                     ->action(function () {
                         app(PaperVelocityUpdateService::class)->checkForUpdates();
 
                         Notification::make()
-                            ->title('Check complete')
-                            ->body('Close and reopen this settings dialog to see the result below.')
+                            ->title(trans('paper-velocity-updater::settings.check_complete'))
+                            ->body(trans('paper-velocity-updater::settings.check_complete_body'))
                             ->success()
                             ->send();
                     }),
             ]),
             TextEntry::make('last_check_at')
-                ->label('Last check')
+                ->label(trans('paper-velocity-updater::settings.last_check'))
                 ->state(fn () => $this->formatLastCheckAt()),
             TextEntry::make('recent_activity')
-                ->label('Recent activity')
+                ->label(trans('paper-velocity-updater::settings.recent_activity'))
                 ->state(fn () => new HtmlString($this->formatActivityLog()))
                 ->columnSpanFull(),
         ];
@@ -108,11 +109,11 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
         $lastCheckAt = app(PaperVelocityUpdateService::class)->getLastCheckAt();
 
         if (!$lastCheckAt) {
-            return 'Never run yet. Use "Run check now" above, then reopen this dialog - if it still says this afterwards, the hourly scheduler likely isn\'t running (verify `php artisan schedule:run` is wired into cron on the panel host).';
+            return trans('paper-velocity-updater::settings.last_check_never');
         }
 
         $suffix = $lastCheckAt->lt(now()->subHours(2))
-            ? ' - this is more than 2 hours ago, which usually means the hourly scheduled check has stopped running (verify `php artisan schedule:run` is wired into cron on the panel host).'
+            ? trans('paper-velocity-updater::settings.last_check_stale')
             : '';
 
         return $lastCheckAt->diffForHumans() . $suffix;
@@ -120,15 +121,16 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
 
     private function formatActivityLog(): string
     {
-        $entries = app(PaperVelocityUpdateService::class)->getActivityLog();
+        $service = app(PaperVelocityUpdateService::class);
+        $entries = $service->getActivityLog();
 
         if (empty($entries)) {
-            return '<p>No activity recorded yet.</p>';
+            return '<p>'.e(trans('paper-velocity-updater::settings.no_activity')).'</p>';
         }
 
-        $rows = array_map(function (array $entry) {
+        $rows = array_map(function (array $entry) use ($service) {
             $time = e(Carbon::parse($entry['at'])->diffForHumans());
-            $message = e($entry['message']);
+            $message = e($service->describeActivity($entry));
             $color = match ($entry['level'] ?? 'info') {
                 'error' => 'rgb(220 38 38)',
                 'success' => 'rgb(22 163 74)',
@@ -152,7 +154,7 @@ class PaperVelocityUpdaterPlugin implements HasPluginSettings, Plugin
         ]);
 
         Notification::make()
-            ->title('Settings saved')
+            ->title(trans('paper-velocity-updater::settings.saved'))
             ->success()
             ->send();
     }

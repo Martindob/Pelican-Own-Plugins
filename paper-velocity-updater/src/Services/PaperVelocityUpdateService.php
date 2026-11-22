@@ -98,13 +98,28 @@ class PaperVelocityUpdateService
      * Paper/Velocity servers) simply has its feed age out and empty on its
      * own within that window.
      *
-     * @return array<int, array{at: string, level: string, message: string}>
+     * @return array<int, array{at: string, level: string, key?: string, params?: array<string, string>, message?: string}>
      */
     public function getActivityLog(): array
     {
         $entries = Cache::get(self::ACTIVITY_LOG_CACHE_KEY, []);
 
         return is_array($entries) ? array_reverse($entries) : [];
+    }
+
+    /**
+     * One feed entry as text in the current language. Entries written before 1.4.1 were
+     * stored as finished English sentences and are shown as they are until they age out.
+     *
+     * @param  array{key?: string, params?: array<string, string>, message?: string}  $entry
+     */
+    public function describeActivity(array $entry): string
+    {
+        if (is_string($entry['key'] ?? null)) {
+            return (string) trans('paper-velocity-updater::activity.'.$entry['key'], is_array($entry['params'] ?? null) ? $entry['params'] : []);
+        }
+
+        return is_string($entry['message'] ?? null) ? $entry['message'] : '';
     }
 
     /**
@@ -117,7 +132,13 @@ class PaperVelocityUpdateService
      * exactly the repeated failures an admin most needs to see on this page -
      * so every call here is recorded, and only count/age bound the feed.
      */
-    private function logActivity(string $level, string $message): void
+    /**
+     * $key is a translation key under "paper-velocity-updater::activity.", stored with its
+     * parameters (not as a finished sentence) so the feed shows in each viewer's language.
+     *
+     * @param  array<string, string|int|null>  $params
+     */
+    private function logActivity(string $level, string $key, array $params = []): void
     {
         $entries = Cache::get(self::ACTIVITY_LOG_CACHE_KEY, []);
         if (!is_array($entries)) {
@@ -127,7 +148,8 @@ class PaperVelocityUpdateService
         $entries[] = [
             'at' => now()->toIso8601String(),
             'level' => $level,
-            'message' => $message,
+            'key' => $key,
+            'params' => array_map(fn ($value) => (string) ($value ?? '?'), $params),
         ];
 
         $cutoff = now()->subDays(self::ACTIVITY_LOG_MAX_AGE_DAYS);
@@ -155,12 +177,14 @@ class PaperVelocityUpdateService
      * actual exceptions) since a permanent condition like a pinned build
      * would otherwise repeat this every single hourly check forever.
      */
-    private function logSkipOncePerDay(Server $server, string $reason, string $level = 'info'): void
+    /** @param  array<string, string|int|null>  $params */
+    private function logSkipOncePerDay(Server $server, string $key, array $params = [], string $level = 'info'): void
     {
-        $key = 'paper-velocity-updater:skip-logged:'.$server->id.':'.md5($reason);
+        $params = ['server' => $server->id, 'name' => $server->name] + $params;
+        $cacheKey = 'paper-velocity-updater:skip-logged:'.$server->id.':'.md5($key.json_encode($params));
 
-        if (Cache::add($key, true, now()->addDay())) {
-            $this->logActivity($level, "Server #{$server->id} ({$server->name}): $reason");
+        if (Cache::add($cacheKey, true, now()->addDay())) {
+            $this->logActivity($level, $key, $params);
         }
     }
 
@@ -225,7 +249,7 @@ class PaperVelocityUpdateService
         } catch (Exception $exception) {
             $this->reportOncePerWindow("server:{$server->id}:swap", $exception);
 
-            $this->logActivity('error', "Swap failed for server #{$server->id} ({$server->name}): {$exception->getMessage()}");
+            $this->logActivity('error', 'swap_failed', ['server' => $server->id, 'name' => $server->name, 'error' => $exception->getMessage()]);
         }
     }
 
@@ -264,7 +288,7 @@ class PaperVelocityUpdateService
                     }
 
                     if ($this->matchesTarget($state['installed'] ?? null, $target)) {
-                        $this->logSkipOncePerDay($server, "Already up to date on {$target['project']} build {$target['build']} ({$target['version']}) - nothing to stage.");
+                        $this->logSkipOncePerDay($server, 'up_to_date', ['project' => $target['project'], 'build' => $target['build'], 'version' => $target['version']]);
 
                         return;
                     }
@@ -277,7 +301,11 @@ class PaperVelocityUpdateService
                     // human decision - restoring a backup, or raising the pin.
                     $installed = $state['installed'] ?? null;
                     if ($this->isOlderThanInstalled($target, $installed)) {
-                        $this->logSkipOncePerDay($server, "Target is {$target['project']} {$target['version']} build {$target['build']}, but {$installed['version']} build ".($installed['build'] ?? '?')." is already installed - not downgrading automatically. Either set the version variable to {$installed['version']}, or restore a world backup together with {$target['jar']}.old (the jar from before the last update) and delete ".self::STATE_FILE.'.', 'warning');
+                        $this->logSkipOncePerDay($server, 'no_downgrade_installed', [
+                            'project' => $target['project'], 'version' => $target['version'], 'build' => $target['build'],
+                            'installed_version' => $installed['version'], 'installed_build' => $installed['build'] ?? null,
+                            'jar' => $target['jar'], 'state_file' => self::STATE_FILE,
+                        ], 'warning');
 
                         return;
                     }
@@ -287,7 +315,7 @@ class PaperVelocityUpdateService
                     // only visible in what Paper itself records on startup.
                     $running = $target['project'] === 'paper' ? $this->runningMinecraftVersion($fileRepository) : null;
                     if ($running !== null && $this->compareVersions($target['project'], $target['version'], $running) < 0) {
-                        $this->logSkipOncePerDay($server, "Target is paper {$target['version']}, but the server last ran Minecraft $running - not downgrading automatically. Either set the version variable to $running, or restore a world backup that was made on {$target['version']} together with a {$target['version']} jar.", 'warning');
+                        $this->logSkipOncePerDay($server, 'no_downgrade_running', ['version' => $target['version'], 'running' => $running], 'warning');
 
                         return;
                     }
@@ -341,7 +369,7 @@ class PaperVelocityUpdateService
 
                     $this->writeState($fileRepository, $state);
 
-                    $this->logActivity('success', "Staged {$target['project']} build {$target['build']} ({$target['version']}) for server #{$server->id} ({$server->name}) - applied on its next start/restart.");
+                    $this->logActivity('success', 'staged', ['server' => $server->id, 'name' => $server->name, 'project' => $target['project'], 'build' => $target['build'], 'version' => $target['version']]);
                 });
         } catch (Exception $exception) {
             // A server that's failing this check every hour (e.g. PaperMC
@@ -350,7 +378,7 @@ class PaperVelocityUpdateService
             // window is enough to notice a real, persistent problem.
             $this->reportOncePerWindow("server:{$server->id}:" . $exception::class, $exception);
 
-            $this->logActivity('error', "Check failed for server #{$server->id} ({$server->name}): {$exception->getMessage()}");
+            $this->logActivity('error', 'check_failed', ['server' => $server->id, 'name' => $server->name, 'error' => $exception->getMessage()]);
         }
     }
 
@@ -397,7 +425,7 @@ class PaperVelocityUpdateService
         $requestedVersion = $this->getRequestedVersion($server, $project);
         if (($buildVariable !== null && !$this->isLatest($buildVariable))
             || (!$this->isLatest($requestedVersion) && trim((string) $requestedVersion) !== ($pending['version'] ?? null))) {
-            $this->logSkipOncePerDay($server, "Not applying the staged {$pending['project']} build ".($pending['build'] ?? '?').' ('.($pending['version'] ?? '?').") - it no longer matches this server's BUILD_NUMBER/version settings.", 'warning');
+            $this->logSkipOncePerDay($server, 'staged_mismatch', ['project' => $pending['project'], 'build' => $pending['build'] ?? null, 'version' => $pending['version'] ?? null], 'warning');
 
             return;
         }
@@ -413,7 +441,7 @@ class PaperVelocityUpdateService
             $this->writeState($fileRepository, $state);
 
             if ($stagedSize !== null) {
-                $this->logActivity('warning', "Server #{$server->id} ({$server->name}): staged {$pending['staged_jar']} is $stagedSize bytes instead of $expectedSize - not swapping it in; it will be downloaded again.");
+                $this->logActivity('warning', 'staged_incomplete', ['server' => $server->id, 'name' => $server->name, 'file' => $pending['staged_jar'], 'size' => $stagedSize, 'expected' => $expectedSize]);
             }
 
             return;
@@ -451,7 +479,7 @@ class PaperVelocityUpdateService
 
         $this->writeState($fileRepository, $state);
 
-        $this->logActivity('success', "Updated server #{$server->id} ({$server->name}) to {$pending['project']} build {$pending['build']} ({$pending['version']}).");
+        $this->logActivity('success', 'updated', ['server' => $server->id, 'name' => $server->name, 'project' => $pending['project'], 'build' => $pending['build'] ?? null, 'version' => $pending['version'] ?? null]);
     }
 
     /**
@@ -475,7 +503,7 @@ class PaperVelocityUpdateService
         // shown in the startup variables) triggers an automatic update.
         $buildVariable = $this->getVariable($server, 'BUILD_NUMBER');
         if ($buildVariable !== null && !$this->isLatest($buildVariable)) {
-            $this->logSkipOncePerDay($server, "BUILD_NUMBER is set to \"$buildVariable\", not \"latest\" - leave it at \"latest\" if you want this server to auto-update.");
+            $this->logSkipOncePerDay($server, 'build_pinned', ['value' => $buildVariable]);
 
             return null;
         }
@@ -489,7 +517,7 @@ class PaperVelocityUpdateService
         // stock PaperMC jar would silently undo that choice on the next
         // restart.
         if ($this->getVariable($server, 'DL_PATH') !== null) {
-            $this->logSkipOncePerDay($server, 'DL_PATH is set - this server has opted out of PaperMC-based updates.');
+            $this->logSkipOncePerDay($server, 'dl_path');
 
             return null;
         }
@@ -503,7 +531,7 @@ class PaperVelocityUpdateService
         // file operation - reject anything that isn't a plain filename
         // ending in .jar before it's used for anything.
         if (!$this->isPlainJarName($jarFile)) {
-            $this->logSkipOncePerDay($server, "SERVER_JARFILE (\"$jarFile\") isn't a plain .jar filename - refusing to touch it.");
+            $this->logSkipOncePerDay($server, 'invalid_jarfile', ['value' => $jarFile]);
 
             return null;
         }
@@ -521,7 +549,7 @@ class PaperVelocityUpdateService
         if ($this->isLatest($requestedVersion)) {
             $resolved = $this->resolveLatestStable($project);
             if ($resolved === null) {
-                $this->logSkipOncePerDay($server, 'Could not resolve a "latest" stable build right now (PaperMC unreachable, or no stable build found in the newest '.self::MAX_LATEST_VERSION_CANDIDATES.' versions) - will retry on the next check.');
+                $this->logSkipOncePerDay($server, 'latest_unresolved', ['count' => self::MAX_LATEST_VERSION_CANDIDATES]);
 
                 return null;
             }
@@ -532,14 +560,14 @@ class PaperVelocityUpdateService
             $version = trim((string) $requestedVersion);
 
             if (!$this->versionExists($project, $version)) {
-                $this->logSkipOncePerDay($server, "Pinned version \"$version\" doesn't match any version PaperMC lists for $project - check for a typo.");
+                $this->logSkipOncePerDay($server, 'pinned_unknown', ['version' => $version, 'project' => $project]);
 
                 return null;
             }
 
             $build = $this->resolveBuildForPinnedVersion($project, $version);
             if ($build === null) {
-                $this->logSkipOncePerDay($server, "No build found for pinned version \"$version\".");
+                $this->logSkipOncePerDay($server, 'pinned_no_build', ['version' => $version]);
 
                 return null;
             }
@@ -547,7 +575,7 @@ class PaperVelocityUpdateService
 
         $download = $build['downloads']['server:default'] ?? null;
         if (!is_array($download) || !isset($download['url'])) {
-            $this->logSkipOncePerDay($server, "PaperMC's build {$build['id']} for $project $version has no downloadable file.");
+            $this->logSkipOncePerDay($server, 'no_download', ['build' => $build['id'], 'project' => $project, 'version' => $version]);
 
             return null;
         }
@@ -573,7 +601,7 @@ class PaperVelocityUpdateService
         $downloadHost = strtolower((string) parse_url((string) $download['url'], PHP_URL_HOST));
         $downloadScheme = strtolower((string) parse_url((string) $download['url'], PHP_URL_SCHEME));
         if ($downloadScheme !== 'https' || !in_array($downloadHost, ['fill.papermc.io', 'fill-data.papermc.io'], true)) {
-            $this->logSkipOncePerDay($server, "The resolved download URL failed validation (host \"$downloadHost\", scheme \"$downloadScheme\") - refusing it for safety.");
+            $this->logSkipOncePerDay($server, 'bad_download_url', ['host' => $downloadHost, 'scheme' => $downloadScheme]);
 
             return null;
         }

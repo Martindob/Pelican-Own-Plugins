@@ -48,8 +48,8 @@ class PlayerCounterController extends ClientApiController
         return response()->json($players);
     }
 
-    /** @return ?array{hostname: string, map: string, current_players: int, max_players: int, players: ?array<array{id: string, name: string}>} */
-    private function runQuery(Server $server): ?array
+    /** @return array{hostname: string, map: string, current_players: int, max_players: int, players: ?array<array{id: string, name: string}>} */
+    private function runQuery(Server $server): array
     {
         if (!GameQuery::canRunQuery($server->allocation)) {
             abort(Response::HTTP_NOT_ACCEPTABLE, 'Server has invalid allocation');
@@ -66,6 +66,7 @@ class PlayerCounterController extends ClientApiController
             abort(Response::HTTP_NOT_ACCEPTABLE, 'Server has no query');
         }
 
-        return $gameQuery->runQuery($server);
+        // Running, but not answering the query (still starting, query disabled, wrong port).
+        return $gameQuery->runQuery($server) ?? abort(Response::HTTP_SERVICE_UNAVAILABLE, 'Server did not answer the query');
     }
 }

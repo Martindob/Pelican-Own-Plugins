@@ -79,12 +79,19 @@ class MinecraftJavaQueryTypeSchema implements QueryTypeSchemaInterface
                 return false;
             }
 
+            $players = [];
+            foreach (is_array($data['players']['sample'] ?? null) ? $data['players']['sample'] : [] as $player) {
+                if (is_array($player) && is_string($player['name'] ?? null)) {
+                    $players[] = ['id' => (string) ($player['id'] ?? $player['name']), 'name' => $player['name']];
+                }
+            }
+
             return [
-                'hostname' => is_string($data['description']) ? $data['description'] : $data['description']['text'],
+                'hostname' => static::plainText($data['description'] ?? ''),
                 'map' => 'world', // No map from MinecraftPing
                 'current_players' => $data['players']['online'],
                 'max_players' => $data['players']['max'],
-                'players' => $data['players']['sample'] ?? [],
+                'players' => $players,
             ];
         } catch (Exception) {
             // Not reported, see tryQuery() above - same reasoning applies to the ping fallback.
@@ -95,5 +102,31 @@ class MinecraftJavaQueryTypeSchema implements QueryTypeSchemaInterface
         }
 
         return false;
+    }
+
+    /**
+     * The text of a server list MOTD: a plain string or a chat component ({"text": ..., "extra":
+     * [...]}, nested), without the legacy "§" colour/format codes.
+     */
+    public static function plainText(mixed $component, int $depth = 0): string
+    {
+        if ($depth > 8) {
+            return '';
+        }
+
+        if (is_string($component)) {
+            $text = $component;
+        } elseif (is_array($component)) {
+            $text = is_string($component['text'] ?? null) ? $component['text'] : '';
+            $parts = array_is_list($component) ? $component : (is_array($component['extra'] ?? null) ? $component['extra'] : []);
+
+            foreach ($parts as $part) {
+                $text .= static::plainText($part, $depth + 1);
+            }
+        } else {
+            return '';
+        }
+
+        return $depth === 0 ? trim((string) preg_replace('/\x{00A7}./u', '', $text)) : $text;
     }
 }

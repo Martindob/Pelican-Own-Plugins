@@ -53,5 +53,6 @@ return [
         'player_op' => 'Spieler zu den OPs hinzugefügt',
         'player_deop' => 'Spieler von den OPs entfernt',
         'player_op_failed' => 'Konnte die OPs nicht ändern',
+        'unsafe_player_name' => 'Dieser Spielername enthält Zeichen, die nicht sicher an die Konsole gesendet werden können - nutze direkt die Konsole.',
     ],
 ];

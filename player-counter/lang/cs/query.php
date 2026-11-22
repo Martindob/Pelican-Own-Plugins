@@ -53,5 +53,6 @@ return [
         'player_op' => 'Hráči byl udělen OP',
         'player_deop' => 'Hráči byl odebrán OP',
         'player_op_failed' => 'OP se nepodařilo změnit',
+        'unsafe_player_name' => 'Jméno hráče obsahuje znaky, které nelze bezpečně poslat do konzole - použij přímo konzoli.',
     ],
 ];

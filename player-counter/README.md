@@ -36,6 +36,13 @@ For Palworld servers you need to set `RESTAPIEnabled` to `true` and `RESTAPIPort
 - Configurable through the admin panel
 - Advanced integration for Minecraft servers: Displays user helmet avatar and allows to manage whitelist & op list.
 
+### Permissions and safety
+
+- **Kick, ban, whitelist and op** send console commands, so they are only shown to (and only run for) users with the server's **Console** permission (`control.console`), like the console itself.
+- The **whitelist and OP list** are read from the server's files, so those tabs are only filled for users with **file read** permission.
+- A player name is only put into a console command when it is a single plain word (letters, digits, `_`, `.`, `-`). The name comes from the game server's answer - i.e. from whoever joined - so a name with a space, `;` (a second command on Source engines), quotes or control characters is refused; use the console directly for such a player.
+- The client API (`/api/client/servers/{server}/query` and `/players`) answers **503** when the server is running but doesn't answer the query (still starting, query disabled, wrong port), instead of failing with a server error.
+
 ### Supported Games
 
 - Minecraft (Java/Bedrock), including Velocity/BungeeCord/Waterfall proxies

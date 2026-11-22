@@ -53,5 +53,6 @@ return [
         'player_op' => 'Player added to OPs',
         'player_deop' => 'Player removed from OPs',
         'player_op_failed' => 'Could not change OPs',
+        'unsafe_player_name' => 'This player name contains characters that can\'t be sent to the console safely - use the console directly.',
     ],
 ];

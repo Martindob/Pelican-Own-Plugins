@@ -2,11 +2,13 @@
 
 namespace Boy132\PlayerCounter\Filament\Server\Pages;
 
+use App\Enums\SubuserPermission;
 use App\Models\Server;
 use App\Repositories\Daemon\DaemonFileRepository;
 use App\Traits\Filament\BlockAccessInConflict;
 use Boy132\PlayerCounter\Filament\Server\Widgets\ServerPlayerWidget;
 use Boy132\PlayerCounter\Models\GameQuery;
+use Boy132\PlayerCounter\Support\PlayerCommand;
 use Carbon\CarbonInterval;
 use Exception;
 use Filament\Actions\Action;
@@ -24,6 +26,7 @@ use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Concerns\InteractsWithTable;
 use Filament\Tables\Contracts\HasTable;
 use Filament\Tables\Table;
+use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Livewire\Attributes\Url;
 
@@ -113,22 +116,10 @@ class PlayersPage extends Page implements HasTable
         $this->whitelist = [];
         $this->ops = [];
 
-        if ($this->isMinecraft) {
-            $fileRepository = (new DaemonFileRepository())->setServer($server);
-
-            try {
-                $whitelist = json_decode($fileRepository->getContent('whitelist.json'), true, 512, JSON_THROW_ON_ERROR);
-                $this->whitelist = array_unique(array_map(fn ($data) => $data['name'], $whitelist));
-            } catch (Exception $exception) {
-                report($exception);
-            }
-
-            try {
-                $ops = json_decode($fileRepository->getContent('ops.json'), true, 512, JSON_THROW_ON_ERROR);
-                $this->ops = array_unique(array_map(fn ($data) => $data['name'], $ops));
-            } catch (Exception $exception) {
-                report($exception);
-            }
+        // Read from the server's files, so only for users who may read them.
+        if ($this->isMinecraft && user()?->can(SubuserPermission::FileRead, $server)) {
+            $this->whitelist = $this->readNames($server, 'whitelist.json');
+            $this->ops = $this->readNames($server, 'ops.json');
         }
 
         $this->players = [];
@@ -140,6 +131,25 @@ class PlayersPage extends Page implements HasTable
                 $this->players = $data['players'] ?? [];
             }
         }
+    }
+
+    /** @return string[] the "name" of every entry of a Minecraft list file (whitelist.json, ops.json) */
+    private function readNames(Server $server, string $file): array
+    {
+        try {
+            $entries = json_decode((new DaemonFileRepository())->setServer($server)->getContent($file, 1024 * 1024), true, 512, JSON_THROW_ON_ERROR);
+        } catch (FileNotFoundException) {
+            // Not created until the server first starts.
+            return [];
+        } catch (Exception $exception) {
+            report($exception);
+
+            return [];
+        }
+
+        $names = is_array($entries) ? array_column(array_filter($entries, 'is_array'), 'name') : [];
+
+        return array_values(array_unique(array_filter($names, 'is_string')));
     }
 
     /**
@@ -197,124 +207,40 @@ class PlayersPage extends Page implements HasTable
             ->recordActions([
                 Action::make('exclude_kick')
                     ->visible(fn () => (!$this->activeTab || $this->activeTab === 'online') && !$this->isProxy)
+                    ->authorize(fn () => static::canSendCommands())
                     ->label(trans('player-counter::query.kick'))
                     ->icon('tabler-door-exit')
                     ->color('danger')
-                    ->action(function (array $record) {
-                        /** @var Server $server */
-                        $server = Filament::getTenant();
-
-                        try {
-                            $server->send('kick ' . $record['name']);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_kicked'))
-                                ->body($record['name'])
-                                ->success()
-                                ->send();
-
-                            $this->refreshPage();
-                        } catch (Exception $exception) {
-                            report($exception);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_kick_failed'))
-                                ->body($exception->getMessage())
-                                ->danger()
-                                ->send();
-                        }
-                    }),
+                    ->action(fn (array $record) => $this->runPlayerCommand('kick', $record['name'], 'player_kicked', 'player_kick_failed')),
                 Action::make('exclude_ban')
                     ->visible(fn () => (!$this->activeTab || $this->activeTab === 'online') && !$this->isProxy)
+                    ->authorize(fn () => static::canSendCommands())
                     ->label(trans('player-counter::query.ban'))
                     ->icon('tabler-hammer')
                     ->color('danger')
                     ->requiresConfirmation()
-                    ->action(function (array $record) {
-                        /** @var Server $server */
-                        $server = Filament::getTenant();
-
-                        try {
-                            $server->send('ban ' . $record['name']);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_banned'))
-                                ->body($record['name'])
-                                ->success()
-                                ->send();
-
-                            $this->refreshPage();
-                        } catch (Exception $exception) {
-                            report($exception);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_ban_failed'))
-                                ->body($exception->getMessage())
-                                ->danger()
-                                ->send();
-                        }
-                    }),
+                    ->action(fn (array $record) => $this->runPlayerCommand('ban', $record['name'], 'player_banned', 'player_ban_failed')),
                 Action::make('exclude_whitelist')
                     ->visible(fn () => $this->isMinecraft)
+                    ->authorize(fn () => static::canSendCommands())
                     ->label(fn (array $record) => in_array($record['name'], $this->whitelist) ? trans('player-counter::query.remove_from_whitelist') : trans('player-counter::query.add_to_whitelist'))
                     ->icon(fn (array $record) => in_array($record['name'], $this->whitelist) ? 'tabler-playlist-x' : 'tabler-playlist-add')
                     ->color(fn (array $record) => in_array($record['name'], $this->whitelist) ? 'danger' : 'success')
                     ->action(function (array $record) {
-                        /** @var Server $server */
-                        $server = Filament::getTenant();
+                        $action = in_array($record['name'], $this->whitelist) ? 'remove' : 'add';
 
-                        try {
-                            $action = in_array($record['name'], $this->whitelist) ? 'remove' : 'add';
-
-                            $server->send('whitelist ' . $action . ' ' . $record['name']);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_whitelist_' . $action))
-                                ->body($record['name'])
-                                ->success()
-                                ->send();
-
-                            $this->refreshPage();
-                        } catch (Exception $exception) {
-                            report($exception);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_whitelist_failed'))
-                                ->body($exception->getMessage())
-                                ->danger()
-                                ->send();
-                        }
+                        $this->runPlayerCommand("whitelist $action", $record['name'], 'player_whitelist_'.$action, 'player_whitelist_failed');
                     }),
                 Action::make('exclude_op')
                     ->visible(fn () => $this->isMinecraft)
+                    ->authorize(fn () => static::canSendCommands())
                     ->label(fn (array $record) => in_array($record['name'], $this->ops) ? trans('player-counter::query.remove_from_ops') : trans('player-counter::query.add_to_ops'))
                     ->icon(fn (array $record) => in_array($record['name'], $this->ops) ? 'tabler-shield-minus' : 'tabler-shield-plus')
                     ->color(fn (array $record) => in_array($record['name'], $this->ops) ? 'warning' : 'success')
                     ->action(function (array $record) {
-                        /** @var Server $server */
-                        $server = Filament::getTenant();
+                        $action = in_array($record['name'], $this->ops) ? 'deop' : 'op';
 
-                        try {
-                            $action = in_array($record['name'], $this->ops) ? 'deop' : 'op';
-
-                            $server->send($action  . ' ' . $record['name']);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_' . $action))
-                                ->body($record['name'])
-                                ->success()
-                                ->send();
-
-                            $this->refreshPage();
-                        } catch (Exception $exception) {
-                            report($exception);
-
-                            Notification::make()
-                                ->title(trans('player-counter::query.notifications.player_op_failed'))
-                                ->body($exception->getMessage())
-                                ->danger()
-                                ->send();
-                        }
+                        $this->runPlayerCommand($action, $record['name'], 'player_'.$action, 'player_op_failed');
                     }),
             ])
             ->emptyStateHeading(function () {
@@ -383,6 +309,50 @@ class PlayersPage extends Page implements HasTable
         return [
             ServerPlayerWidget::class,
         ];
+    }
+
+    /** Kick/ban/whitelist/op send console commands: only for users allowed to use the console. */
+    protected static function canSendCommands(): bool
+    {
+        return (bool) user()?->can(SubuserPermission::ControlConsole, Filament::getTenant());
+    }
+
+    private function runPlayerCommand(string $command, string $name, string $successKey, string $failKey): void
+    {
+        /** @var Server $server */
+        $server = Filament::getTenant();
+
+        $line = PlayerCommand::build($command, $name);
+
+        if (!static::canSendCommands() || $line === null) {
+            Notification::make()
+                ->title(trans('player-counter::query.notifications.'.$failKey))
+                ->body($line === null ? trans('player-counter::query.notifications.unsafe_player_name') : null)
+                ->danger()
+                ->send();
+
+            return;
+        }
+
+        try {
+            $server->send($line);
+
+            Notification::make()
+                ->title(trans('player-counter::query.notifications.'.$successKey))
+                ->body($name)
+                ->success()
+                ->send();
+
+            $this->refreshPage();
+        } catch (Exception $exception) {
+            report($exception);
+
+            Notification::make()
+                ->title(trans('player-counter::query.notifications.'.$failKey))
+                ->body($exception->getMessage())
+                ->danger()
+                ->send();
+        }
     }
 
     private function refreshPage(): void

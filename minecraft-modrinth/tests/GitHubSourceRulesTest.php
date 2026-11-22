@@ -464,6 +464,11 @@ check(R::replaceableCopies($cA, $platformPlugins, ['Ethoria Chat.jar'], [], []) 
 check(R::replaceableCopies($cA, $platformPlugins, ['a/EthoriaChat.jar', 'EthoriaChat/EthoriaChat-1.8.0.jar'], [], []) === [], 'jar in a sub folder is not a copy (never replaced)');
 check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat.jar', 'EthoriaChat-1.jar', 'EthoriaChat-2.jar', 'EthoriaChat-3.jar'], [], []) === null, 'more than '.R::MAX_TAKEOVER_COPIES.' copies not replaced');
 check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.0.jar', $cA['filename']], [$cA['filename']], []) === ['EthoriaChat-1.8.0.jar'], 'copy next to an installed jar');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.9.0.jar'], [], []) === null, 'a copy newer than the repository version (1.8.1) is never replaced with it');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-2.jar'], [], []) === null, 'a newer short version in the name counts too');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.1.jar'], [], []) === ['EthoriaChat-1.8.1.jar'], 'a copy of the same version is replaceable');
+check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.1-SNAPSHOT.jar'], [], []) === ['EthoriaChat-1.8.1-SNAPSHOT.jar'], 'a snapshot of the repository version is replaceable');
+check(!R::isNewerThanRepository('EthoriaChat.jar', $cA), 'a copy without a version in its name is not "newer"');
 
 // One jar that looks like two index entries: whose is it? Never replaced.
 $amb1 = $paper('chat-core', 'ChatPlus', '1.0.0');

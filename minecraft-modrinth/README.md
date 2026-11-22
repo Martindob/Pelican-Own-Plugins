@@ -31,7 +31,7 @@ console access doesn't see the pages at all.
 ## Settings
 
 - **Always Use Latest Version**: skip the Minecraft version compatibility check entirely when searching for and installing mods/plugins, always using the newest available version for the detected loader. Useful for updating mods/plugins ahead of upgrading a server to a newer Minecraft version.
-- **Enable Automatic Updates**: once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually - and plugins installed from the GitHub repository source (see below). A failed automatic update is logged (the same failure at most once a day); a successful one is not.
+- **Enable Automatic Updates**: once a day, automatically update every installed mod/plugin on every server to its latest compatible version, without needing to click update manually - and plugins installed from the GitHub repository source (see below). An automatic update only ever moves **forward and stays as stable**: a Modrinth release is only replaced by a newer release (never by a beta/alpha; a beta by a newer beta or release), never by an older version, and a mod/plugin whose installed version is no longer in the compatible list (e.g. the server was pinned to an older Minecraft version) is left alone - the page still offers it for a manual decision. "Compatible" means the server's own Minecraft version (`MINECRAFT_VERSION`/`MC_VERSION`, or the most recent releases when it is `latest`) and loader, unless *Always Use Latest Version* is on. A failed automatic update is logged (the same failure at most once a day); a successful one is not.
 - **Automatic Update Time**: what time of day that runs, in your own account's time zone (captured when you save the settings page), not the panel's. Handy for scheduling it a few minutes ahead of a server's own restart schedule. Only `HH:MM` is accepted; an unusable value in `.env` falls back to midnight instead of breaking the panel's schedule.
 
 ### Modrinth installs
@@ -337,6 +337,9 @@ manually**, as in 1.4.1.
   - never a jar that matches **more than one** index entry, never a jar the **Modrinth page
     manages** (listed in `plugins/.modrinth-metadata.json`; nothing is replaced while that file
     can't be read), and not more than 3 copies of one plugin at once;
+  - never a copy whose file name carries a **newer version** than the repository's
+    (`EthoriaChat-1.9.0.jar` while the index has 1.8.1, e.g. a hotfix uploaded by hand): it is
+    never replaced with the older repository jar, automatically or by a click;
   - **checked by the plugin name inside**: before deleting it, the panel reads the manual copy
     from the node and compares the `name` of its `plugin.yml` / `paper-plugin.yml` (Paper) or the
     `id` of its `velocity-plugin.json` (Velocity) with the repository jar. Wings can't read a
@@ -385,6 +388,15 @@ manually**, as in 1.4.1.
 
 ## Changes
 
+- **1.7.1** - Safer automatic updates. Modrinth: the daily update only installs a newer version
+  that is at least as stable as the installed one - a release is no longer replaced by a newer
+  beta/alpha, and a mod/plugin is no longer "updated" to an older version when the installed one
+  isn't in the server's compatible list (e.g. after pinning the server to an older Minecraft
+  version); such a mod/plugin is left alone and still offered on the page. The server's Minecraft
+  version is read like the egg reads it (the egg's default when the server has no value of its
+  own; `latest` in any case and with spaces). GitHub: a manual copy whose file name carries a
+  newer version than the repository's (a hotfix uploaded by hand) is never replaced with the
+  older repository jar.
 - **1.7.0** - The LuckPerms source (luckperms.net) is removed completely: no more LuckPerms page,
   no LuckPerms settings section, no LuckPerms step in the daily automatic update and no
   notifications about new LuckPerms builds; the Modrinth pages no longer check for a second

@@ -96,9 +96,11 @@ class MinecraftModrinthService
 
     protected function getConfiguredMinecraftVersion(Server $server): ?string
     {
-        $version = $server->variables()->where(fn ($builder) => $builder->where('env_variable', 'MINECRAFT_VERSION')->orWhere('env_variable', 'MC_VERSION'))->first()?->server_value;
+        $variable = $server->variables()->where(fn ($builder) => $builder->where('env_variable', 'MINECRAFT_VERSION')->orWhere('env_variable', 'MC_VERSION'))->first();
+        // The egg's default applies while the server has no value of its own, like the egg itself reads it.
+        $version = trim((string) ($variable?->server_value ?: $variable?->default_value));
 
-        return ($version && $version !== 'latest') ? $version : null;
+        return ($version !== '' && strtolower($version) !== 'latest') ? $version : null;
     }
 
     /**

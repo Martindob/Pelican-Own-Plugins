@@ -987,7 +987,7 @@ class GitHubPluginService
         $copies = GitHubSourceRules::replaceableCopies($plugin, $platformPlugins, $jarNames, $managed, $protected);
 
         if ($copies === null) {
-            throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "$listed on server #{$server->id} not replaced: managed by the Modrinth page, not a regular file, matching several plugins of the index or more than ".GitHubSourceRules::MAX_TAKEOVER_COPIES.' copies - remove it by hand');
+            throw new GitHubSourceException(GitHubSourceException::MANUAL_COPY, "$listed on server #{$server->id} not replaced: managed by the Modrinth page, not a regular file, newer than the repository version ({$plugin['version']}), matching several plugins of the index or more than ".GitHubSourceRules::MAX_TAKEOVER_COPIES.' copies - remove it by hand');
         }
 
         $result = [];

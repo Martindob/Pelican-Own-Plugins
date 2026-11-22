@@ -795,12 +795,28 @@ final class GitHubSourceRules
 
         foreach ($copies as $name) {
             if (!self::isValidJarFilename($name) || in_array($name, $protectedNames, true)
-                || self::pluginsMatchingJar($name, $platformPlugins) !== [$plugin['id']]) {
+                || self::pluginsMatchingJar($name, $platformPlugins) !== [$plugin['id']]
+                || self::isNewerThanRepository($name, $plugin)) {
                 return null;
             }
         }
 
         return $copies;
+    }
+
+    /**
+     * Whether a manual copy's file name carries a newer version than the repository's (e.g. a
+     * hotfix uploaded by hand): it is never replaced with the older repository jar.
+     *
+     * @param  array{version?: string}  $plugin
+     */
+    public static function isNewerThanRepository(string $jarName, array $plugin): bool
+    {
+        $version = self::versionFromJarName($jarName);
+
+        return $version !== null && preg_match('/^\d{1,9}(\.\d{1,9}){0,2}$/', $version)
+            && is_string($plugin['version'] ?? null) && self::isValidVersion($plugin['version'])
+            && self::compareVersions($version, $plugin['version']) > 0;
     }
 
     /** The version in a jar's file name ("EthoriaChat-1.8.0.jar" -> "1.8.0"), or null. */

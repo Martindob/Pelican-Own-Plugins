@@ -8,6 +8,7 @@ use Boy132\MinecraftModrinth\Facades\MinecraftModrinth;
 use Boy132\MinecraftModrinth\GitHub\CiStatus;
 use Boy132\MinecraftModrinth\GitHub\GitHubPluginService;
 use Boy132\MinecraftModrinth\GitHub\GitHubSourceException;
+use Boy132\MinecraftModrinth\Modrinth\ModrinthRules;
 use Exception;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
@@ -121,13 +122,12 @@ class AutoUpdateModsCommand extends Command
         $versionsByProject = MinecraftModrinth::getProjectVersionsBulk($projectIds, $server);
 
         foreach ($installedMods as $installedMod) {
-            $versions = $versionsByProject[$installedMod['project_id']] ?? [];
+            // Only a newer, at least as stable version - never a downgrade, never a beta over a release.
+            $latestVersion = ModrinthRules::autoUpdateTarget($installedMod['version_id'], $versionsByProject[$installedMod['project_id']] ?? []);
 
-            if (!MinecraftModrinth::isUpdateAvailable($installedMod, $versions)) {
+            if ($latestVersion === null) {
                 continue;
             }
-
-            $latestVersion = $versions[0];
             $primaryFile = MinecraftModrinth::getPrimaryFile($latestVersion['files'] ?? []);
 
             if (!$primaryFile) {

@@ -191,6 +191,40 @@ final class ModrinthRules
             && (!isset($parts['port']) || $parts['port'] === 443);
     }
 
+    /**
+     * The version an automatic update installs, or null to leave the installed one alone.
+     * $versions is Modrinth's list of versions compatible with the server (Minecraft version,
+     * loader), newest first. Only a version published after the installed one and at least as
+     * stable as it qualifies: a release is only ever replaced by a newer release (never a
+     * beta/alpha), and nothing is ever replaced by an older version. When the installed version
+     * isn't in the list - no longer compatible with the server, or removed from Modrinth -
+     * nothing is updated automatically; the page still offers it for a manual decision.
+     *
+     * @param  array<int, mixed>  $versions
+     * @return array<string, mixed>|null
+     */
+    public static function autoUpdateTarget(string $installedVersionId, array $versions): ?array
+    {
+        $stability = ['alpha' => 1, 'beta' => 2, 'release' => 3];
+
+        foreach ($versions as $index => $version) {
+            if (is_array($version) && ($version['id'] ?? null) === $installedVersionId) {
+                $required = $stability[$version['version_type'] ?? ''] ?? $stability['release'];
+
+                foreach (array_slice($versions, 0, $index) as $candidate) {
+                    if (is_array($candidate) && is_string($candidate['id'] ?? null)
+                        && ($stability[$candidate['version_type'] ?? ''] ?? 0) >= $required) {
+                        return $candidate;
+                    }
+                }
+
+                return null;
+            }
+        }
+
+        return null;
+    }
+
     public static function isValidSha512(mixed $hash): bool
     {
         return is_string($hash) && (bool) preg_match('/^[0-9a-fA-F]{128}$/', $hash);

@@ -470,6 +470,12 @@ check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.1.jar'], [],
 check(R::replaceableCopies($cA, $platformPlugins, ['EthoriaChat-1.8.1-SNAPSHOT.jar'], [], []) === ['EthoriaChat-1.8.1-SNAPSHOT.jar'], 'a snapshot of the repository version is replaceable');
 check(!R::isNewerThanRepository('EthoriaChat.jar', $cA), 'a copy without a version in its name is not "newer"');
 
+// Refusals the page explains to the user are not written to the error log; real failures are.
+check((new GitHubSourceException(GitHubSourceException::CI_NOT_GREEN, 'CI pending'))->isExpectedRefusal(), 'CI not green: shown on the page, not logged');
+check((new GitHubSourceException(GitHubSourceException::STATE_CHANGED, 'installed meanwhile'))->isExpectedRefusal(), 'page out of date: not logged');
+check(!(new GitHubSourceException(GitHubSourceException::CHECKSUM_MISMATCH, 'bad jar'))->isExpectedRefusal(), 'checksum mismatch is still logged');
+check(!(new GitHubSourceException(GitHubSourceException::MANUAL_COPY, 'copy'))->isExpectedRefusal(), 'a manual copy that can\'t be replaced is still logged');
+
 // One jar that looks like two index entries: whose is it? Never replaced.
 $amb1 = $paper('chat-core', 'ChatPlus', '1.0.0');
 $amb2 = R::validateIndexEntry($entry(['id' => 'chatplus', 'name' => 'Other', 'version' => '2.0.0', 'path' => 'minecraft/x/chatplus-2.0.0.jar']));

@@ -80,6 +80,15 @@ class GitHubSourceException extends RuntimeException
         return new self($reason, $exception->getMessage());
     }
 
+    /**
+     * A refusal the user is told about on the page and that needs no admin attention: the head
+     * commit's CI isn't green (yet), or the page was out of date. Not written to the error log.
+     */
+    public function isExpectedRefusal(): bool
+    {
+        return in_array($this->reason, [self::CI_NOT_GREEN, self::STATE_CHANGED], true);
+    }
+
     /** Translated, user-facing explanation (no internals, no URLs). */
     public function getUserMessage(): string
     {

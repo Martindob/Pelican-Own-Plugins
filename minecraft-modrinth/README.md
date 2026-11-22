@@ -388,6 +388,10 @@ manually**, as in 1.4.1.
 
 ## Changes
 
+- **1.7.2** - Refusals the GitHub Plugins page explains on its own (the newest commit's CI isn't
+  green yet, or the page was out of date) are no longer written to the panel's error log with a
+  stack trace. *Update all* stops at the first "CI not green" - typically a commit pushed after the
+  page was opened - with one message, instead of failing every plugin with the same error.
 - **1.7.1** - Safer automatic updates. Modrinth: the daily update only installs a newer version
   that is at least as stable as the installed one - a release is no longer replaced by a newer
   beta/alpha, and a mod/plugin is no longer "updated" to an older version when the installed one

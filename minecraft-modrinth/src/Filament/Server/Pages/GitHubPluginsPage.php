@@ -659,7 +659,7 @@ class GitHubPluginsPage extends Page implements HasTable
      * An update (and a replacement of a manual copy) also replaces manual copies of the plugin
      * while "Replace manual copies" is on; a plain install doesn't (the user saw no copy).
      *
-     * @return array{ok: bool, name: ?string, version: ?string, message: ?string, partial: bool, replaced: array<int, string>}
+     * @return array{ok: bool, reason?: string, name: ?string, version: ?string, message: ?string, partial: bool, replaced: array<int, string>}
      */
     protected function attemptInstall(string $id, bool $isUpdate, bool $replacesManual = false): array
     {
@@ -712,10 +712,13 @@ class GitHubPluginsPage extends Page implements HasTable
                 'replaced' => $replaced ?? [],
             ];
         } catch (GitHubSourceException $exception) {
-            static::service()->reportOncePerWindow("ui:{$server->id}:$id:{$exception->reason}", $exception);
+            if (!$exception->isExpectedRefusal()) {
+                static::service()->reportOncePerWindow("ui:{$server->id}:$id:{$exception->reason}", $exception);
+            }
 
             return [
                 'ok' => false,
+                'reason' => $exception->reason,
                 'name' => null,
                 'version' => null,
                 'message' => $exception->getUserMessage(),
@@ -759,6 +762,20 @@ class GitHubPluginsPage extends Page implements HasTable
 
             if ($result['ok']) {
                 $succeededCount++;
+            } elseif (($result['reason'] ?? null) === GitHubSourceException::CI_NOT_GREEN) {
+                // A new commit came in since the page was loaded and its CI isn't green yet: every
+                // other plugin would be refused the same way, so stop and say it once.
+                Notification::make()
+                    ->title($succeededCount > 0
+                        ? trans('minecraft-modrinth::strings.github.notifications.update_all_partial', ['succeeded' => $succeededCount, 'total' => count($candidates)])
+                        : trans('minecraft-modrinth::strings.github.errors.ci_not_green'))
+                    ->body(trans('minecraft-modrinth::strings.github.page.ci_not_green_description'))
+                    ->warning()
+                    ->send();
+
+                $this->forgetState();
+
+                return;
             } else {
                 $failures[] = "{$row['name']}: {$result['message']}";
             }
@@ -837,7 +854,9 @@ class GitHubPluginsPage extends Page implements HasTable
                 ->success()
                 ->send();
         } catch (GitHubSourceException $exception) {
-            static::service()->reportOncePerWindow("ui:{$server->id}:$id:uninstall:{$exception->reason}", $exception);
+            if (!$exception->isExpectedRefusal()) {
+                static::service()->reportOncePerWindow("ui:{$server->id}:$id:uninstall:{$exception->reason}", $exception);
+            }
 
             Notification::make()
                 ->title(trans('minecraft-modrinth::strings.notifications.uninstall_failed'))

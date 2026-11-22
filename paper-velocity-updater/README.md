@@ -215,6 +215,18 @@ CDN is, since that download already happened, on its own schedule, before the re
   server was already updated past it - nothing is staged and an orange warning appears under
   **Recent activity**. Either set the version variable to the installed version, or restore a world
   backup together with `<jarfile>.old` and delete `.paper-velocity-updater.json` from the server.
+  For Paper this also covers a jar the plugin didn't install itself (put there by the egg's
+  installer or by hand): the version Paper last started with, from its own
+  `.paper/version_history.json` (or `version_history.json` in older Paper builds), is never
+  downgraded either.
+- **A staged file is only swapped in when it's complete.** Its size is checked against what PaperMC
+  reports for the build, right after the download and again before the swap. A download that
+  breaks off is discarded and retried on the next check, and an older build that was already
+  staged stops being swappable the moment a newer one starts downloading over it.
+- **A restart while a download is running never swaps in a half-written jar.** Downloading and
+  swapping share one lock per server: a restart during a download starts on the current jar, and
+  the newly downloaded build is applied on the next restart. If the final rename fails, the
+  previous jar is put back, so the server is never left without one.
 - Before 1.3.4, the plugin read every startup variable as its egg **default** instead of the
   server's own value (Pelican's `Server::variables()` relation returns no per-server values when
   eager-loaded). On the official eggs that default is `latest`, so a version lock was ignored: a

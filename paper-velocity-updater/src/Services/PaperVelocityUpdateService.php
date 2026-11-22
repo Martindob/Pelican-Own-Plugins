@@ -218,7 +218,7 @@ class PaperVelocityUpdateService
             // to finish is more than enough; if it isn't, this swap is
             // simply skipped for now rather than risking a noticeable delay
             // on the power action - the next restart retries it.
-            Cache::lock("paper-velocity-updater:swap:{$server->id}", 30)
+            Cache::lock($this->serverLockKey($server), 30)
                 ->block(5, function () use ($server) {
                     $this->swap($server);
                 });
@@ -245,10 +245,11 @@ class PaperVelocityUpdateService
                 return;
             }
 
-            // Guards against two overlapping scheduled runs (e.g. a manual
-            // `artisan p:paper-velocity-updater:check` overlapping the
-            // scheduled one) double-downloading for the same server.
-            Cache::lock("paper-velocity-updater:stage:{$server->id}", $this->downloadTimeoutSeconds() + 60)
+            // The same lock as applyPendingUpdate(): Wings writes a download
+            // straight into the target file, so a swap running while this
+            // downloads would rename a half-written jar into place. It also
+            // stops two overlapping checks double-downloading for one server.
+            Cache::lock($this->serverLockKey($server), $this->downloadTimeoutSeconds() + 60)
                 ->block(5, function () use ($server) {
                     $target = $this->resolveTarget($server);
                     if ($target === null) {
@@ -256,7 +257,7 @@ class PaperVelocityUpdateService
                     }
 
                     $fileRepository = app(DaemonFileRepository::class)->setServer($server);
-                    $state = $this->readState($fileRepository, $server->id);
+                    $state = $this->readState($fileRepository);
 
                     if ($this->matchesTarget($state['pending'] ?? null, $target)) {
                         return;
@@ -281,7 +282,28 @@ class PaperVelocityUpdateService
                         return;
                     }
 
+                    // The state file only knows what this plugin installed; a
+                    // jar put there by the egg's installer (or by hand) is
+                    // only visible in what Paper itself records on startup.
+                    $running = $target['project'] === 'paper' ? $this->runningMinecraftVersion($fileRepository) : null;
+                    if ($running !== null && $this->compareVersions($target['project'], $target['version'], $running) < 0) {
+                        $this->logSkipOncePerDay($server, "Target is paper {$target['version']}, but the server last ran Minecraft $running - not downgrading automatically. Either set the version variable to $running, or restore a world backup that was made on {$target['version']} together with a {$target['version']} jar.", 'warning');
+
+                        return;
+                    }
+
                     $stagedAs = $target['jar'] . self::PENDING_SUFFIX;
+
+                    // Wings overwrites the staged file in place while
+                    // downloading, so an older build already staged there
+                    // stops being a complete, swappable file the moment this
+                    // starts - drop its marker first, so a download that then
+                    // fails halfway can never be swapped in under that
+                    // marker's name.
+                    if (isset($state['pending'])) {
+                        unset($state['pending']);
+                        $this->writeState($fileRepository, $state);
+                    }
 
                     $fileRepository->getHttpClient()
                         ->timeout(max((int) config('panel.guzzle.timeout'), $this->downloadTimeoutSeconds()))
@@ -293,6 +315,19 @@ class PaperVelocityUpdateService
                         ])
                         ->throw();
 
+                    // Wings can't check the sha256, but the size PaperMC
+                    // reports is enough to catch a truncated or partial file.
+                    $stagedSize = $this->fileSize($fileRepository, $stagedAs);
+                    if ($target['size'] !== null && $stagedSize !== $target['size']) {
+                        try {
+                            $fileRepository->deleteFiles('/', [$stagedAs]);
+                        } catch (Exception) {
+                            // Nothing marks it as staged, so it's never swapped in either way.
+                        }
+
+                        throw new Exception("Downloaded $stagedAs is ".($stagedSize ?? 'missing').' bytes instead of the '.$target['size'].' PaperMC reports - discarded, retrying on the next check.');
+                    }
+
                     $state['pending'] = [
                         'project' => $target['project'],
                         'version' => $target['version'],
@@ -300,6 +335,7 @@ class PaperVelocityUpdateService
                         'jar' => $target['jar'],
                         'staged_jar' => $stagedAs,
                         'sha256' => $target['sha256'],
+                        'size' => $target['size'],
                         'staged_at' => now()->toIso8601String(),
                     ];
 
@@ -335,10 +371,16 @@ class PaperVelocityUpdateService
     private function swap(Server $server): void
     {
         $fileRepository = app(DaemonFileRepository::class)->setServer($server);
-        $state = $this->readState($fileRepository, $server->id);
+        $state = $this->readState($fileRepository);
 
         $pending = $state['pending'] ?? null;
         if (!is_array($pending) || !isset($pending['staged_jar'], $pending['jar'], $pending['project'])) {
+            return;
+        }
+
+        // The state file sits in the server's own folder, where anyone with
+        // file access can edit it: only ever rename "<jar>.pending" to "<jar>".
+        if (!is_string($pending['jar']) || !$this->isPlainJarName($pending['jar']) || $pending['staged_jar'] !== $pending['jar'] . self::PENDING_SUFFIX) {
             return;
         }
 
@@ -360,22 +402,42 @@ class PaperVelocityUpdateService
             return;
         }
 
-        if (!$this->fileExists($fileRepository, $pending['staged_jar'])) {
-            // Staged file is gone (manually deleted, or never actually
-            // finished downloading) - drop the stale marker instead of
+        $stagedSize = $this->fileSize($fileRepository, $pending['staged_jar']);
+        $expectedSize = $pending['size'] ?? null;
+        if ($stagedSize === null || (is_int($expectedSize) && $stagedSize !== $expectedSize)) {
+            // Staged file is gone (manually deleted) or isn't the complete
+            // build it claims to be - drop the stale marker instead of
             // retrying this forever, and let the next scheduled check
             // re-stage it properly.
             unset($state['pending']);
             $this->writeState($fileRepository, $state);
 
+            if ($stagedSize !== null) {
+                $this->logActivity('warning', "Server #{$server->id} ({$server->name}): staged {$pending['staged_jar']} is $stagedSize bytes instead of $expectedSize - not swapping it in; it will be downloaded again.");
+            }
+
             return;
         }
 
-        $this->backupExistingJar($server, $fileRepository, $pending['jar']);
+        $backedUp = $this->backupExistingJar($server, $fileRepository, $pending['jar']);
 
-        $fileRepository->renameFiles('/', [
-            ['from' => $pending['staged_jar'], 'to' => $pending['jar']],
-        ]);
+        try {
+            $fileRepository->renameFiles('/', [
+                ['from' => $pending['staged_jar'], 'to' => $pending['jar']],
+            ]);
+        } catch (Exception $exception) {
+            // The live jar was already moved aside: put it back, or the
+            // server would be started with no jar at all.
+            if ($backedUp) {
+                try {
+                    $fileRepository->renameFiles('/', [['from' => "{$pending['jar']}.old", 'to' => $pending['jar']]]);
+                } catch (Exception) {
+                    // Reported below; the .old file is still there to restore by hand.
+                }
+            }
+
+            throw $exception;
+        }
 
         $state['installed'] = [
             'project' => $pending['project'],
@@ -440,7 +502,7 @@ class PaperVelocityUpdateService
         // only thing standing between an unexpected value here and a
         // file operation - reject anything that isn't a plain filename
         // ending in .jar before it's used for anything.
-        if ($jarFile !== basename($jarFile) || !str_ends_with(strtolower($jarFile), '.jar')) {
+        if (!$this->isPlainJarName($jarFile)) {
             $this->logSkipOncePerDay($server, "SERVER_JARFILE (\"$jarFile\") isn't a plain .jar filename - refusing to touch it.");
 
             return null;
@@ -523,7 +585,47 @@ class PaperVelocityUpdateService
             'build' => $build['id'],
             'url' => $download['url'],
             'sha256' => $download['checksums']['sha256'] ?? null,
+            'size' => is_int($download['size'] ?? null) && $download['size'] > 0 ? $download['size'] : null,
         ];
+    }
+
+    private function isPlainJarName(string $name): bool
+    {
+        return $name === basename($name)
+            && !str_starts_with($name, '.')
+            && !str_contains($name, '\\')
+            && str_ends_with(strtolower($name), '.jar');
+    }
+
+    private function serverLockKey(Server $server): string
+    {
+        return "paper-velocity-updater:server:{$server->id}";
+    }
+
+    /**
+     * The Minecraft version Paper last started with, from the version
+     * history it writes on every start (.paper/version_history.json since
+     * Paper moved it there, version_history.json in the server root before):
+     * "currentVersion": "26.3-257-main@abc1234 (MC: 26.3)". Null when there is
+     * none yet or it can't be read - this is an extra safety net, not a
+     * requirement.
+     */
+    private function runningMinecraftVersion(DaemonFileRepository $fileRepository): ?string
+    {
+        foreach (['.paper/version_history.json', 'version_history.json'] as $path) {
+            try {
+                $content = $fileRepository->getContent($path, 64 * 1024);
+            } catch (Exception) {
+                continue;
+            }
+
+            $current = json_decode($content, true)['currentVersion'] ?? null;
+            if (is_string($current) && preg_match('/\(MC: ([0-9A-Za-z.\-]+)\)/', $current, $match)) {
+                return $match[1];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -546,7 +648,8 @@ class PaperVelocityUpdateService
      * normal case for the first update) before renaming the current jar into
      * its place.
      */
-    private function backupExistingJar(Server $server, DaemonFileRepository $fileRepository, string $jarFile): void
+    /** Whether the live jar was actually moved to "<jarfile>.old". */
+    private function backupExistingJar(Server $server, DaemonFileRepository $fileRepository, string $jarFile): bool
     {
         try {
             try {
@@ -558,8 +661,12 @@ class PaperVelocityUpdateService
             $fileRepository->renameFiles('/', [
                 ['from' => $jarFile, 'to' => "$jarFile.old"],
             ]);
+
+            return true;
         } catch (Exception $exception) {
             $this->reportOncePerWindow("server:{$server->id}:backup-jar", $exception);
+
+            return false;
         }
     }
 
@@ -650,8 +757,23 @@ class PaperVelocityUpdateService
             return is_int($installed['build'] ?? null) && $target['build'] < $installed['build'];
         }
 
+        return $this->compareVersions($target['project'], $target['version'], $installed['version']) < 0;
+    }
+
+    /**
+     * Negative when $a is older than $b, positive when newer, 0 when the same.
+     * Uses PaperMC's own newest-first version list (the order "latest" is
+     * resolved by too), falling back to version_compare() for versions it no
+     * longer lists.
+     */
+    private function compareVersions(string $project, string $a, string $b): int
+    {
+        if ($a === $b) {
+            return 0;
+        }
+
         $order = [];
-        foreach ($this->fetchVersionGroups($target['project']) as $group) {
+        foreach ($this->fetchVersionGroups($project) as $group) {
             foreach (is_array($group) ? $group : [] as $version) {
                 if (is_string($version) && !isset($order[$version])) {
                     $order[$version] = count($order);
@@ -659,11 +781,11 @@ class PaperVelocityUpdateService
             }
         }
 
-        if (isset($order[$target['version']], $order[$installed['version']])) {
-            return $order[$target['version']] > $order[$installed['version']];
+        if (isset($order[$a], $order[$b])) {
+            return $order[$b] <=> $order[$a];
         }
 
-        return version_compare($target['version'], $installed['version'], '<');
+        return version_compare($a, $b);
     }
 
     /** Whether the egg defines this variable at all, regardless of its value. */
@@ -871,18 +993,17 @@ class PaperVelocityUpdateService
     /**
      * @return array{installed?: array{project?: string, version?: string, build?: int, jar?: string, sha256?: ?string, updated_at?: string}, pending?: array{project?: string, version?: string, build?: int, jar?: string, staged_jar?: string, sha256?: ?string, staged_at?: string}}
      */
-    private function readState(DaemonFileRepository $fileRepository, int $serverId): array
+    private function readState(DaemonFileRepository $fileRepository): array
     {
         try {
             $content = $fileRepository->getContent(self::STATE_FILE);
         } catch (FileNotFoundException) {
             // No marker yet - first check for this server.
             return [];
-        } catch (Exception $exception) {
-            $this->reportOncePerWindow("server:$serverId:read-state", $exception);
-
-            return [];
         }
+        // Any other failure (daemon unreachable, ...) propagates on purpose:
+        // carrying on with an empty state would overwrite the record of
+        // what's installed, which the downgrade protection relies on.
 
         $decoded = json_decode($content, true);
         if (!is_array($decoded)) {
@@ -912,24 +1033,25 @@ class PaperVelocityUpdateService
         $fileRepository->putContent(self::STATE_FILE, json_encode($state, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT));
     }
 
-    private function fileExists(DaemonFileRepository $fileRepository, string $fileName): bool
+    /** Size in bytes of a regular file in the server's root folder, or null if there is none. */
+    private function fileSize(DaemonFileRepository $fileRepository, string $fileName): ?int
     {
         try {
             $files = $fileRepository->getDirectory('/');
         } catch (RequestException $exception) {
             if ($exception->response->status() === 404) {
-                return false;
+                return null;
             }
 
             throw $exception;
         }
 
         foreach ($files as $file) {
-            if (is_array($file) && ($file['name'] ?? null) === $fileName) {
-                return true;
+            if (is_array($file) && ($file['name'] ?? null) === $fileName && ($file['file'] ?? true) && is_int($file['size'] ?? null)) {
+                return $file['size'];
             }
         }
 
-        return false;
+        return null;
     }
 }

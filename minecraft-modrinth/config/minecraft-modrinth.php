@@ -25,6 +25,14 @@ return [
         // Replace a jar of a repository plugin that was put into plugins/ by hand with the
         // repository version (install/update/"Update all"/automatic update). Off: 1.4.1 behaviour.
         'replace_manual' => (bool) env('MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL', true),
+        // Automatic updates only use commits at least this many hours old (0 = off): the newest older commit with
+        // green CI is used instead of a fresh head. Manual installs are not delayed (the page warns).
+        'quarantine_hours' => env('MINECRAFT_MODRINTH_GITHUB_QUARANTINE_HOURS', 2),
+        // GitHub logins / commit e-mail addresses (comma separated) whose commits automatic updates may deploy - author
+        // and committer of every commit since the last deployed one (an e-mail only counts for a commit GitHub doesn't
+        // link to an account). Default: the Ethoria contributors and Claude (owner, 23. 11. 2026). Empty: no check.
+        // Invalid: automatic updates install nothing.
+        'allowed_authors' => (string) env('MINECRAFT_MODRINTH_GITHUB_ALLOWED_AUTHORS', 'Martindob,arzinnn,zTeeCY,claude,noreply@anthropic.com'),
         // The same GitHub failure is only logged once per this many minutes.
         'report_throttle_minutes' => (int) env('MINECRAFT_MODRINTH_GITHUB_REPORT_THROTTLE_MINUTES', 60),
     ],

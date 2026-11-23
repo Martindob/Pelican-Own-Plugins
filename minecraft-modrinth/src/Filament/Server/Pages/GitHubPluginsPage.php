@@ -994,6 +994,21 @@ class GitHubPluginsPage extends Page implements HasTable
 
                         return $this->dismissedError !== null;
                     }),
+                // The newest commit is still in the quarantine of automatic updates: installing by hand now skips
+                // that delay (allowed - the admin decides - but said plainly).
+                Callout::make(trans('minecraft-modrinth::strings.github.page.quarantine_heading'))
+                    ->description(fn () => trans('minecraft-modrinth::strings.github.page.quarantine', [
+                        'hours' => static::service()->quarantineHours(),
+                        'minutes' => intdiv(static::service()->headAgeSeconds($this->getSnapshot()['sha'] ?? '') ?? 0, 60),
+                    ]))
+                    ->warning()
+                    ->icon('tabler-hourglass')
+                    ->visible(function () {
+                        $sha = $this->getSnapshot()['sha'] ?? null;
+                        $age = $sha !== null ? static::service()->headAgeSeconds($sha) : null;
+
+                        return $age !== null && $age < static::service()->quarantineHours() * 3600;
+                    }),
                 Callout::make(trans('minecraft-modrinth::strings.github.page.ci_not_green'))
                     ->description(trans('minecraft-modrinth::strings.github.page.ci_not_green_description'))
                     ->warning()

@@ -568,6 +568,22 @@ check(!R::sameDescriptor(['ethoriachat'], ['ethoriabags']) && !R::sameDescriptor
 check(R::sameDescriptor(R::jarDescriptorNames($paperPluginJar, 'paper') ?? [], R::jarDescriptorNames($paperJar, 'paper') ?? []), 'paper-plugin.yml and plugin.yml of the same plugin');
 check(!R::sameDescriptor(R::jarDescriptorNames($otherJar, 'paper') ?? [], R::jarDescriptorNames($paperJar, 'paper') ?? []), 'another plugin by its plugin.yml');
 
+// 1.9.0: what a jar declares (name and version) against its index entry
+$d = R::jarDescriptor($paperJar, 'paper');
+check($d !== null && $d['names'] === ['ethoriachat'] && $d['versions'] === ['1.8.1'], 'descriptor: paper name and version');
+check(R::descriptorMismatch($d, ['name' => 'EthoriaChat', 'version' => '1.8.1']) === null, 'descriptor matches its entry');
+check(str_contains((string) R::descriptorMismatch($d, ['name' => 'EthoriaChat', 'version' => '1.8.2']), 'version'), 'descriptor: other version refused');
+check(str_contains((string) R::descriptorMismatch($d, ['name' => 'EthoriaBags', 'version' => '1.8.1']), 'ethoriachat'), 'descriptor: other plugin refused');
+$dv = R::jarDescriptor($velocityJar, 'velocity');
+check($dv !== null && in_array('ethoriaclickproxy', $dv['labels'], true) && $dv['versions'] === ['1.2.0'], 'descriptor: velocity id, name and version');
+check(R::descriptorMismatch($dv, ['name' => 'EthoriaClickProxy', 'version' => '1.2.0']) === null, 'velocity descriptor matches its display name');
+check(R::jarDescriptor($emptyJar, 'paper') === null, 'descriptor: none');
+$noVersion = $makeJar(['plugin.yml' => "name: EthoriaChat\n"]);
+check(str_contains((string) R::descriptorMismatch(R::jarDescriptor($noVersion, 'paper') ?? ['names' => [], 'labels' => ['ethoriachat'], 'versions' => []], ['name' => 'EthoriaChat', 'version' => '1.0.0']), 'no version'), 'descriptor without version refused');
+$twoVersions = $makeJar(['plugin.yml' => "name: EthoriaChat\nversion: 1.0.0\n", 'paper-plugin.yml' => "name: EthoriaChat\nversion: '1.0.1'\n"]);
+check(R::descriptorMismatch(R::jarDescriptor($twoVersions, 'paper') ?? [], ['name' => 'EthoriaChat', 'version' => '1.0.1']) !== null, 'descriptors with two versions refused');
+check(R::pluginYmlValue("name: X\nversion: '1.2.3' # c\n", 'version') === '1.2.3', 'plugin.yml version');
+
 foreach ($tmpJars as $path) {
     @unlink($path);
 }
@@ -670,6 +686,165 @@ check(R::migrateInstalledIds([$cur], [$vp])['renamed'] === [], 'already current:
 check(R::storedIdRenames(['ethoriavote-paper', 'other'], [$vp]) === ['ethoriavote-paper' => 'ethoriavote'], 'stored offers: old id mapped');
 check(R::storedIdRenames(['ethoriavote'], [$vp]) === [] && R::storedIdRenames([], [$vp]) === [], 'stored offers: nothing to map');
 check(R::hasPreviousIds([$vp]) && !R::hasPreviousIds([$entry()]) && !R::hasPreviousIds([]), 'has previous ids');
+
+// ------------------------------------------------------------------
+// 1.9.0: supply chain hardening
+// ------------------------------------------------------------------
+
+// Only GitHub Actions runs of exactly this repository count.
+$repoRun = fn (string $repo, string $conclusion = 'success') => $wf('build.yml', 'completed', $conclusion, ['repository' => ['full_name' => $repo]]);
+check(R::evaluateWorkflowRuns([$repoRun('Martindob/Ethoria.cz')], $sha, 'main', 'build.yml', 'Martindob/Ethoria.cz') === CiStatus::Green, 'run of the repository counts');
+check(R::evaluateWorkflowRuns([$repoRun('martindob/ethoria.cz')], $sha, 'main', 'build.yml', 'Martindob/Ethoria.cz') === CiStatus::Green, 'repository compared case-insensitively');
+check(R::evaluateWorkflowRuns([$repoRun('evil/Ethoria.cz')], $sha, 'main', 'build.yml', 'Martindob/Ethoria.cz') === CiStatus::Unverified, 'run of another repository ignored');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success')], $sha, 'main', 'build.yml', 'Martindob/Ethoria.cz') === CiStatus::Unverified, 'run without repository ignored when one is required');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['path' => 'dynamic/dependabot/dependabot-updates'])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'a dynamic (non-file) run is never the required workflow');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['event' => 'pull_request_target'])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'pull_request_target never counts');
+check(R::evaluateWorkflowRuns([$wf('build.yml', 'completed', 'success', ['event' => 'workflow_run'])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'workflow_run never counts');
+// A second workflow that calls itself "Build" (another file) can't stand in for build.yml.
+check(R::evaluateWorkflowRuns([$wf('fake.yml', 'completed', 'success', ['name' => 'Build'])], $sha, 'main', 'build.yml') === CiStatus::Unverified, 'same workflow name, other file: not the required workflow');
+
+$created = $wf('build.yml', 'completed', 'success', ['created_at' => '2026-11-23T01:00:00Z', 'workflow_id' => 7, 'run_number' => 5]);
+check(R::requiredRunCreatedAt([$created], $sha, 'main', 'build.yml') === strtotime('2026-11-23T01:00:00Z'), 'creation time of the required run');
+check(R::requiredRunCreatedAt([$wf('lint.yml', 'completed', 'success', ['created_at' => '2026-11-23T01:00:00Z'])], $sha, 'main', 'build.yml') === null, 'no required run, no time');
+check(R::requiredRunCreatedAt([$wf('build.yml', 'in_progress', null, ['created_at' => '2026-11-23T01:00:00Z'])], $sha, 'main', 'build.yml') === null, 'running required run, no time');
+check(R::requiredRunCreatedAt([$created, ['run_number' => 6, 'created_at' => '2026-11-23T05:00:00Z'] + $created], $sha, 'main', 'build.yml') === strtotime('2026-11-23T05:00:00Z'), 'newest run of the workflow decides');
+
+// Redirects: exactly GitHub's content hosts.
+check(R::isAllowedRedirectHost('codeload.github.com') && R::isAllowedRedirectHost('RAW.githubusercontent.com'), 'listed content hosts');
+check(!R::isAllowedRedirectHost('user-images.githubusercontent.com') && !R::isAllowedRedirectHost('evil.githubusercontent.com'), 'other githubusercontent hosts refused (1.9.0)');
+
+// Git blob SHA and the commit's tree.
+check(R::gitBlobSha('jar') === '19ecfe54a4d780537e1ad1d22d2768701a968157', 'git blob sha (git hash-object)');
+$listing = R::parseDirectoryListing([
+    ['name' => 'X-1.0.0.jar', 'type' => 'file', 'sha' => R::gitBlobSha('jar'), 'size' => 3],
+    ['name' => 'sub', 'type' => 'dir', 'sha' => str_repeat('c', 40), 'size' => 0],
+]);
+check($listing === ['X-1.0.0.jar' => ['sha' => R::gitBlobSha('jar'), 'size' => 3]], 'directory listing: files only');
+check(R::parseDirectoryListing(['name' => 'x']) === null && R::parseDirectoryListing([['name' => 'a', 'type' => 'file', 'sha' => 'zz', 'size' => 1]]) === null && R::parseDirectoryListing('x') === null, 'directory listing: invalid answers');
+check(R::treeMismatch('jar', 'X-1.0.0.jar', $listing) === null, 'tree: matching file');
+check(R::treeMismatch('jaR', 'X-1.0.0.jar', $listing) !== null, 'tree: other content, same size');
+check(R::treeMismatch('jars', 'X-1.0.0.jar', $listing) !== null, 'tree: other size');
+check(R::treeMismatch('jar', 'Y-1.0.0.jar', $listing) !== null, 'tree: file not in the tree');
+
+// Logins, allowlist, quarantine setting.
+check(R::isValidLogin('Martindob') && R::isValidLogin('a-b') && R::isValidLogin('github-actions[bot]'), 'logins');
+check(!R::isValidLogin('-a') && !R::isValidLogin('a--b') && !R::isValidLogin('a b') && !R::isValidLogin(str_repeat('a', 40)) && !R::isValidLogin(''), 'invalid logins');
+check(R::parseAllowlist('') === [] && R::parseAllowlist(" Martindob, arzinnn\nzTeeCY;martindob ") === ['martindob', 'arzinnn', 'zteecy'], 'allowlist parsed, lower case, unique');
+check(R::parseAllowlist('ok, not ok!') === null && R::parseAllowlist(implode(',', array_map(fn ($i) => "u$i", range(1, 51)))) === null && R::parseAllowlist(null) === null, 'invalid allowlist');
+check(R::normalizeQuarantineHours('2') === 2 && R::normalizeQuarantineHours(0) === 0 && R::normalizeQuarantineHours('168') === 168, 'quarantine hours');
+check(R::normalizeQuarantineHours('169') === null && R::normalizeQuarantineHours('-1') === null && R::normalizeQuarantineHours('1.5') === null && R::normalizeQuarantineHours(null) === null, 'invalid quarantine hours');
+
+// Commit lists.
+$apiCommit = fn (string $sha, string $date, ?string $author = 'Martindob', ?string $committer = 'Martindob') => [
+    'sha' => $sha,
+    'commit' => ['author' => ['date' => $date], 'committer' => ['date' => $date]],
+    'author' => $author === null ? null : ['login' => $author],
+    'committer' => $committer === null ? null : ['login' => $committer],
+];
+$parsed = R::parseCommitList([$apiCommit(str_repeat('1', 40), '2026-11-23T01:00:00Z', null, 'web-flow')]);
+check($parsed === [['sha' => str_repeat('1', 40), 'time' => strtotime('2026-11-23T01:00:00Z'), 'author' => null, 'committer' => 'web-flow', 'author_email' => null, 'committer_email' => null]], 'commit list parsed');
+$withEmail = $apiCommit(str_repeat('2', 40), '2026-11-23T01:00:00Z', null, null);
+$withEmail['commit']['author']['email'] = 'NoReply@Anthropic.com';
+$withEmail['commit']['committer']['email'] = 'noreply@github.com';
+$parsed = R::parseCommitList([$withEmail])[0];
+check($parsed['author_email'] === 'noreply@anthropic.com' && $parsed['committer_email'] === 'noreply@github.com', 'commit e-mails parsed, lower case');
+$backdated = $apiCommit(str_repeat('1', 40), '2020-01-01T00:00:00Z');
+$backdated['commit']['committer']['date'] = '2026-11-23T02:00:00Z';
+check(R::parseCommitList([$backdated])[0]['time'] === strtotime('2026-11-23T02:00:00Z'), 'commit time: later of author and committer date');
+check(R::parseCommitList([['sha' => 'x']]) === null && R::parseCommitList('x') === null, 'invalid commit list');
+
+$commit = fn (string $sha, int $time, ?string $author = 'martindob', ?string $committer = 'martindob') => ['sha' => $sha, 'time' => $time, 'author' => $author, 'committer' => $committer];
+check(R::commitAuthorProblem($commit($sha, 0), ['martindob']) === null, 'allowed author');
+check(R::commitAuthorProblem($commit($sha, 0, 'Martindob', 'web-flow'), ['martindob']) === null && R::commitAuthorProblem($commit($sha, 0, 'martindob', 'github-actions[bot]'), ['martindob']) === null, 'GitHub as committer');
+check(R::commitAuthorProblem($commit($sha, 0, 'mallory'), ['martindob']) !== null, 'other author refused');
+check(R::commitAuthorProblem($commit($sha, 0, null), ['martindob']) !== null, 'author without account refused');
+check(R::commitAuthorProblem($commit($sha, 0, 'martindob', 'mallory'), ['martindob']) !== null, 'other committer refused');
+
+// Owner's default (23. 11. 2026): contributors by login, Claude by login or - when GitHub links no account - by e-mail.
+$default = R::parseAllowlist('Martindob,arzinnn,zTeeCY,claude,noreply@anthropic.com');
+check($default === ['martindob', 'arzinnn', 'zteecy', 'claude', 'noreply@anthropic.com'], 'default allowlist parsed (logins and e-mail)');
+$claudeCommit = ['sha' => $sha, 'time' => 0, 'author' => null, 'committer' => null, 'author_email' => 'noreply@anthropic.com', 'committer_email' => 'noreply@anthropic.com'];
+check(R::commitAuthorProblem($claudeCommit, $default) === null, 'Claude commit without GitHub account: allowed by e-mail');
+check(R::commitAuthorProblem(['author' => 'claude', 'committer' => 'claude'] + $claudeCommit, $default) === null, 'Claude commit with login claude: allowed');
+check(R::commitAuthorProblem(['committer' => 'zTeeCY', 'committer_email' => null] + $claudeCommit, $default) === null, 'Claude commit committed by a contributor: allowed');
+check(R::commitAuthorProblem(['author' => 'mallory'] + $claudeCommit, $default) !== null, 'resolved login decides, not the e-mail');
+check(R::commitAuthorProblem(['author_email' => 'x@example.com'] + $claudeCommit, $default) !== null, 'unknown e-mail without account refused');
+check(R::commitAuthorProblem(['author' => 'arzinnn', 'committer' => null, 'committer_email' => 'noreply@github.com'] + $claudeCommit, $default) === null, 'rebase by GitHub (GitHub <noreply@github.com>) of an allowed author');
+check(R::commitAuthorProblem(['author' => 'mallory', 'committer' => 'web-flow'] + $claudeCommit, $default) !== null, 'GitHub as committer only counts with an allowed author');
+check(R::parseAllowlist('a@b') === null && R::isValidEmail('noreply@anthropic.com') && !R::isValidEmail('a b@c.d'), 'e-mail entries');
+
+// The jars of a commit's tree: one request per commit.
+$tree = ['sha' => $sha, 'truncated' => false, 'tree' => [
+    ['path' => 'minecraft', 'type' => 'tree', 'sha' => str_repeat('d', 40)],
+    ['path' => 'minecraft/A/releases/A-1.0.0.jar', 'type' => 'blob', 'sha' => R::gitBlobSha('jar'), 'size' => 3],
+    ['path' => 'minecraft/A/src/Main.java', 'type' => 'blob', 'sha' => str_repeat('e', 40), 'size' => 10],
+    ['path' => 'minecraft/B/paper/releases/B-2.0.0.jar', 'type' => 'blob', 'sha' => str_repeat('f', 40), 'size' => 5],
+]];
+$jars = R::parseTreeJars($tree);
+check($jars !== null && array_keys($jars) === ['minecraft/A/releases/A-1.0.0.jar', 'minecraft/B/paper/releases/B-2.0.0.jar'], 'tree: only jars kept');
+check(R::treeDirectory($jars ?? [], 'minecraft/A/releases') === ['A-1.0.0.jar' => ['sha' => R::gitBlobSha('jar'), 'size' => 3]], 'tree: one directory');
+check(R::treeMismatch('jar', 'A-1.0.0.jar', R::treeDirectory($jars ?? [], 'minecraft/A/releases')) === null, 'tree: jar matches its blob');
+check(R::parseTreeJars(['truncated' => true] + $tree) === null && R::parseTreeJars(['tree' => []]) === null, 'truncated / incomplete tree: not used');
+
+// Choosing the commit of the nightly update (owner, 23. 11. 2026): newest commit older than the quarantine with green
+// CI on exactly that SHA - walking back from a head that is too young.
+$now = strtotime('2026-11-24T03:55:00Z');
+$h = 3600;
+$c = fn (int $n) => str_repeat(dechex($n), 40);
+$history = [
+    $commit($c(1), $now - 1 * $h),            // head, 1 h old
+    $commit($c(2), $now - 90 * 60),           // 1.5 h
+    $commit($c(3), $now - 3 * $h),            // 3 h, CI red
+    $commit($c(4), $now - 4 * $h),            // 4 h, no CI of its own (pushed together with c3)
+    $commit($c(5), $now - 5 * $h),            // 5 h, green
+    $commit($c(6), $now - 9 * $h),            // 9 h, green
+];
+$ci = [
+    $c(1) => ['ci' => CiStatus::Green, 'tested_at' => $now - 1 * $h],
+    $c(2) => ['ci' => CiStatus::Green, 'tested_at' => $now - 80 * 60],
+    $c(3) => ['ci' => CiStatus::Failed, 'tested_at' => null],
+    $c(4) => ['ci' => CiStatus::Unverified, 'tested_at' => null],
+    $c(5) => ['ci' => CiStatus::Green, 'tested_at' => $now - 5 * $h],
+    $c(6) => ['ci' => CiStatus::Green, 'tested_at' => $now - 9 * $h],
+];
+$asked = [];
+$ciOf = function (string $s) use ($ci, &$asked) {
+    $asked[] = $s;
+
+    return $ci[$s];
+};
+$pick = R::selectAutoUpdateCommit($history, $ciOf, $now, 2 * $h);
+check($pick['sha'] === $c(5) && $pick['held_back'] === 2 && $pick['not_green'] === 2 && $pick['refused'] === [], 'head too young: newest older green commit (red and unverified ones skipped)');
+check($asked === [$c(3), $c(4), $c(5)], 'CI only asked for commits old enough');
+check(R::selectAutoUpdateCommit($history, $ciOf, $now, 0)['sha'] === $c(1), 'quarantine off: head');
+check(R::selectAutoUpdateCommit($history, $ciOf, $now, 30 * 60)['sha'] === $c(1), 'short quarantine: head old enough');
+check(R::selectAutoUpdateCommit($history, $ciOf, $now, 10 * $h)['sha'] === null, 'nothing old enough: no commit');
+// A back-dated commit: the commit date says 9 h, but GitHub created its CI run 30 minutes ago.
+$sneaky = [$commit($c(7), $now - 9 * $h)];
+$pick = R::selectAutoUpdateCommit($sneaky, fn () => ['ci' => CiStatus::Green, 'tested_at' => $now - 30 * 60], $now, 2 * $h);
+check($pick['sha'] === null && $pick['held_back'] === 1, 'back-dated commit: CI run creation time counts');
+// ... or this panel saw it as the head 30 minutes ago.
+$pick = R::selectAutoUpdateCommit($sneaky, fn () => ['ci' => CiStatus::Green, 'tested_at' => $now - 9 * $h], $now, 2 * $h, [$c(7) => $now - 30 * 60]);
+check($pick['sha'] === null, 'back-dated commit: first sighting counts');
+check(R::selectAutoUpdateCommit($history, fn () => ['ci' => CiStatus::Green, 'tested_at' => null], $now, 2 * $h)['sha'] === null, 'green without a required run time: not used');
+check(R::selectAutoUpdateCommit($history, $ciOf, $now, 2 * $h, [], [], null, 2)['sha'] === null, 'at most N CI requests');
+
+// Author allowlist over every commit since the last deployed one.
+$authored = [
+    $commit($c(1), $now - 5 * $h),
+    $commit($c(2), $now - 6 * $h, 'mallory'),
+    $commit($c(3), $now - 7 * $h),
+    $commit($c(4), $now - 8 * $h),
+];
+$green = fn () => ['ci' => CiStatus::Green, 'tested_at' => $now - 10 * $h];
+$pick = R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], ['martindob'], $c(4));
+check($pick['sha'] === $c(3) && count($pick['refused']) === 2 && !$pick['range_check'], 'commit of another author in between: the newest commit below it');
+check(R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], ['martindob', 'mallory'], $c(4))['sha'] === $c(1), 'all authors allowed: head');
+check(R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], [], $c(4))['sha'] === $c(1), 'allowlist off: head');
+$pick = R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], ['martindob'], str_repeat('9', 40));
+check($pick['sha'] === $c(1) && $pick['range_check'], 'last deployed commit not in the listed history: caller checks the range');
+check(R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], ['martindob'])['sha'] === $c(1), 'first run (nothing deployed yet): only the commit itself');
+check(R::selectAutoUpdateCommit($authored, $green, $now, 2 * $h, [], ['martindob'], $c(1))['sha'] === $c(1), 'last deployed commit itself: nothing new to check');
 
 echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
 exit(Result::$failures === 0 ? 0 : 1);

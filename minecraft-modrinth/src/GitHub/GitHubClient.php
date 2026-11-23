@@ -12,9 +12,10 @@ use Illuminate\Support\Facades\Http;
 /**
  * Minimal read-only GitHub REST client for one repository.
  *
- * - Only ever talks to https://api.github.com with the token. Redirects are followed by hand:
- *   another api.github.com URL keeps the token, a GitHub content host (raw/objects
- *   .githubusercontent.com) is fetched without it, and anything else is refused.
+ * - Only ever talks to https://api.github.com with the token, always with TLS verification. Redirects are
+ *   followed by hand: another api.github.com URL keeps the token, one of GitHub's content hosts
+ *   (GitHubSourceRules::REDIRECT_HOSTS) is fetched without it, and anything else is refused.
+ * - Every answer is size-limited (JSON 8 MB, files by the caller) and times out (3 s connect, 15 s / 120 s).
  * - Never throws an HTTP client exception (those carry the request, including the
  *   Authorization header): every failure becomes a GitHubSourceException.
  * - The token is only held by this object and is never part of a message, cache key or URL.
@@ -30,6 +31,15 @@ class GitHubClient
     protected const TIMEOUT = 15;
 
     protected const MAX_REDIRECTS = 3;
+
+    /**
+     * Below this many remaining API requests (X-RateLimit-Remaining) the client stops until GitHub's reset: several
+     * servers, the hourly check and page views share one token - an automatic update must never use it up.
+     */
+    public const MIN_REMAINING_REQUESTS = 50;
+
+    /** Largest JSON answer read from the API (workflow runs, commit lists, comparisons, directory listings). */
+    protected const MAX_JSON_BYTES = 8 * 1024 * 1024;
 
     public function __construct(
         protected readonly string $repository,
@@ -69,7 +79,7 @@ class GitHubClient
                 'exclude_pull_requests' => 'true',
                 'per_page' => 100,
                 'page' => $page,
-            ]);
+            ], self::TIMEOUT, self::MAX_JSON_BYTES);
 
             $data = $response->json();
             if (!is_array($data) || !isset($data['workflow_runs']) || !is_array($data['workflow_runs'])) {
@@ -84,6 +94,118 @@ class GitHubClient
         }
 
         return $runs;
+    }
+
+    /**
+     * The newest commits of the branch history from $sha down (GET /commits?sha=...), newest first.
+     *
+     * @return array<int, array{sha: string, time: int, author: ?string, committer: ?string}>
+     */
+    public function listCommits(string $sha, int $count = 100): array
+    {
+        if (!GitHubSourceRules::isValidSha($sha)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Refusing to list commits of an invalid SHA');
+        }
+
+        $commits = GitHubSourceRules::parseCommitList($this->get('/commits', 'application/vnd.github+json', [
+            'sha' => $sha,
+            'per_page' => max(1, min(100, $count)),
+        ], self::TIMEOUT, self::MAX_JSON_BYTES)->json());
+
+        if ($commits === null || ($commits !== [] && $commits[0]['sha'] !== $sha)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Unexpected commit list response');
+        }
+
+        return $commits;
+    }
+
+    /**
+     * How $head relates to $base (GET /compare/base...head): "ahead" (head descends from base), "identical", "behind"
+     * or "diverged" (history rewritten), the number of commits base..head and up to 250 of them.
+     *
+     * @return array{status: string, total: int, commits: array<int, array{sha: string, time: int, author: ?string, committer: ?string}>}
+     */
+    public function compare(string $base, string $head): array
+    {
+        if (!GitHubSourceRules::isValidSha($base) || !GitHubSourceRules::isValidSha($head)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Refusing to compare invalid SHAs');
+        }
+
+        $data = $this->get("/compare/$base...$head", 'application/vnd.github+json', ['per_page' => 100], self::TIMEOUT, self::MAX_JSON_BYTES)->json();
+        $commits = is_array($data) ? GitHubSourceRules::parseCommitList($data['commits'] ?? null) : null;
+
+        if (!is_array($data) || $commits === null || !in_array($data['status'] ?? null, ['ahead', 'identical', 'behind', 'diverged'], true)
+            || !is_int($data['total_commits'] ?? null)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Unexpected comparison response');
+        }
+
+        return ['status' => $data['status'], 'total' => $data['total_commits'], 'commits' => $commits];
+    }
+
+    /**
+     * The files of a directory at a commit (GET /contents/<dir>?ref=<sha>): name => git blob SHA and size, as
+     * recorded in the commit's tree.
+     *
+     * @return array<string, array{sha: string, size: int}>
+     */
+    public function getDirectoryListing(string $directory, string $sha): array
+    {
+        if (!GitHubSourceRules::isSafeRelativePath($directory) || !GitHubSourceRules::isValidSha($sha)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_INDEX, 'Refusing to list an unsafe path');
+        }
+
+        $listing = GitHubSourceRules::parseDirectoryListing($this->get('/contents/'.$this->encodePath($directory), 'application/vnd.github+json', ['ref' => $sha], self::TIMEOUT, self::MAX_JSON_BYTES)->json());
+
+        if ($listing === null) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, "Unexpected directory listing of $directory");
+        }
+
+        return $listing;
+    }
+
+    /**
+     * Every jar of the commit's tree with its git blob SHA and size (ONE request: GET /git/trees/<sha>?recursive=1),
+     * or null when GitHub truncated the tree (too large).
+     *
+     * @return array<string, array{sha: string, size: int}>|null
+     */
+    public function getTreeJars(string $sha): ?array
+    {
+        if (!GitHubSourceRules::isValidSha($sha)) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Refusing to read the tree of an invalid SHA');
+        }
+
+        $data = $this->get("/git/trees/$sha", 'application/vnd.github+json', ['recursive' => '1'], self::TIMEOUT, self::MAX_JSON_BYTES)->json();
+
+        if (is_array($data) && ($data['truncated'] ?? null) === true) {
+            return null;
+        }
+
+        $jars = GitHubSourceRules::parseTreeJars($data);
+
+        if ($jars === null) {
+            throw new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, 'Unexpected tree response');
+        }
+
+        return $jars;
+    }
+
+    /**
+     * The OAuth scopes of the token when it is a classic token (GitHub sends them in X-OAuth-Scopes), or null for a
+     * fine-grained token / no token. A classic token reaches every repository of its owner - with "repo" even with
+     * write access - so the settings warn about it.
+     *
+     * @return array<int, string>|null
+     */
+    public function classicTokenScopes(): ?array
+    {
+        $response = $this->get('', 'application/vnd.github+json', [], self::TIMEOUT, self::MAX_JSON_BYTES);
+
+        if (!$response->hasHeader('X-OAuth-Scopes')) {
+            return null;
+        }
+
+        return array_values(array_filter(array_map('trim', explode(',', (string) $response->header('X-OAuth-Scopes'))), fn (string $scope) => $scope !== ''));
     }
 
     /** Raw content of a file at a commit, refusing anything larger than $maxBytes. */
@@ -143,6 +265,12 @@ class GitHubClient
 
         $this->throwForStatus($response);
 
+        if ($maxBytes !== null && strlen($response->body()) > $maxBytes) {
+            throw new GitHubSourceException(GitHubSourceException::TOO_LARGE, 'GitHub response is larger than allowed');
+        }
+
+        $this->respectRemainingBudget($response);
+
         return $response;
     }
 
@@ -188,6 +316,9 @@ class GitHubClient
         $options = [
             // Followed by hand in get(), see resolveRedirect().
             'allow_redirects' => false,
+            // Always verify GitHub's TLS certificate (Laravel's default - stated here so no global HTTP client
+            // setting can switch it off for this source).
+            'verify' => true,
         ];
 
         if ($maxBytes !== null) {
@@ -258,6 +389,22 @@ class GitHubClient
             $status >= 500 => new GitHubSourceException(GitHubSourceException::SERVER_ERROR, "GitHub returned $status"),
             default => new GitHubSourceException(GitHubSourceException::INVALID_RESPONSE, "GitHub returned unexpected status $status"),
         };
+    }
+
+    /**
+     * Nearly out of API requests: this answer is still used, every further request waits for GitHub's reset (the
+     * same cooldown as a 403/429), so the token keeps a reserve for the other servers, the hourly check and the page.
+     */
+    protected function respectRemainingBudget(Response $response): void
+    {
+        $remaining = trim((string) $response->header('x-ratelimit-remaining'));
+
+        if ($remaining === '' || !ctype_digit($remaining) || (int) $remaining >= self::MIN_REMAINING_REQUESTS) {
+            return;
+        }
+
+        $seconds = GitHubSourceRules::retryAfterSeconds(['x-ratelimit-reset' => (string) $response->header('x-ratelimit-reset')], time());
+        Cache::put($this->cooldownKey(), time() + $seconds, now()->addSeconds($seconds));
     }
 
     protected function assertNotCoolingDown(): void

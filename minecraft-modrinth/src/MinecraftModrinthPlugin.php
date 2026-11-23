@@ -54,6 +54,8 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'github_require_green_ci' => (bool) config('minecraft-modrinth.github.require_green_ci', true),
             'github_required_workflow' => (string) config('minecraft-modrinth.github.required_workflow', ''),
             'github_replace_manual' => (bool) config('minecraft-modrinth.github.replace_manual', true),
+            'github_quarantine_hours' => (string) (GitHubSourceRules::normalizeQuarantineHours(config('minecraft-modrinth.github.quarantine_hours', 2)) ?? 2),
+            'github_allowed_authors' => (string) config('minecraft-modrinth.github.allowed_authors', 'Martindob,arzinnn,zTeeCY,claude,noreply@anthropic.com'),
         ];
     }
 
@@ -144,6 +146,18 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                         ->helperText(trans('minecraft-modrinth::strings.github.settings.replace_manual_hint'))
                         ->inline(false)
                         ->default(fn () => config('minecraft-modrinth.github.replace_manual', true)),
+                    TextInput::make('github_quarantine_hours')
+                        ->label(trans('minecraft-modrinth::strings.github.settings.quarantine_hours'))
+                        ->helperText(trans('minecraft-modrinth::strings.github.settings.quarantine_hours_hint'))
+                        ->placeholder('2')
+                        ->maxLength(3)
+                        ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::normalizeQuarantineHours($value) !== null, 'quarantine_hours_invalid')),
+                    TextInput::make('github_allowed_authors')
+                        ->label(trans('minecraft-modrinth::strings.github.settings.allowed_authors'))
+                        ->helperText(trans('minecraft-modrinth::strings.github.settings.allowed_authors_hint'))
+                        ->placeholder('Martindob, arzinnn, zTeeCY, claude, noreply@anthropic.com')
+                        ->maxLength(2000)
+                        ->rule(fn () => $this->validationRule(fn (string $value) => GitHubSourceRules::parseAllowlist($value) !== null, 'allowed_authors_invalid')),
                     Actions::make([
                         Action::make('github_test_connection')
                             ->label(trans('minecraft-modrinth::strings.github.settings.test_connection'))
@@ -228,13 +242,18 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
         $indexPath = trim((string) ($data['github_index_path'] ?? '')) ?: 'minecraft/releases.json';
         $token = trim((string) ($data['github_token'] ?? ''));
         $requiredWorkflow = trim((string) ($data['github_required_workflow'] ?? ''));
+        $quarantineInput = trim((string) ($data['github_quarantine_hours'] ?? ''));
+        $quarantine = GitHubSourceRules::normalizeQuarantineHours($quarantineInput === '' ? '2' : $quarantineInput);
+        $allowlist = GitHubSourceRules::parseAllowlist((string) ($data['github_allowed_authors'] ?? ''));
 
         // Re-checked here as well: the form rules are the first line, not the only one.
         $valid = ($repository === '' ? !$enabled : GitHubSourceRules::isValidRepository($repository))
             && GitHubSourceRules::isValidBranch($branch)
             && GitHubSourceRules::isValidIndexPath($indexPath)
             && ($token === '' || GitHubSourceRules::isPlausibleToken($token))
-            && ($requiredWorkflow === '' || GitHubSourceRules::isValidWorkflowFile($requiredWorkflow));
+            && ($requiredWorkflow === '' || GitHubSourceRules::isValidWorkflowFile($requiredWorkflow))
+            && $quarantine !== null
+            && $allowlist !== null;
 
         if (!$valid) {
             Notification::make()
@@ -253,6 +272,8 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
             'MINECRAFT_MODRINTH_GITHUB_REQUIRE_GREEN_CI' => (bool) ($data['github_require_green_ci'] ?? true),
             'MINECRAFT_MODRINTH_GITHUB_REQUIRED_WORKFLOW' => $requiredWorkflow,
             'MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL' => (bool) ($data['github_replace_manual'] ?? true),
+            'MINECRAFT_MODRINTH_GITHUB_QUARANTINE_HOURS' => $quarantine,
+            'MINECRAFT_MODRINTH_GITHUB_ALLOWED_AUTHORS' => implode(',', $allowlist ?? []),
         ];
 
         if (!empty($data['github_token_clear'])) {
@@ -274,6 +295,7 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
         try {
             $service->forgetCachedState();
             $snapshot = $service->getSnapshot();
+            $warnings = $service->securityWarnings();
 
             Notification::make()
                 ->title(trans('minecraft-modrinth::strings.github.settings.test_ok'))
@@ -282,8 +304,9 @@ class MinecraftModrinthPlugin implements HasPluginSettings, Plugin
                     'ci' => $snapshot['ci']->getLabel(),
                     'count' => count($snapshot['plugins']),
                     'problems' => count($snapshot['problems']),
-                ]))
-                ->success()
+                ]).($warnings === [] ? '' : '<br>'.implode('<br>', array_map('e', $warnings))))
+                ->status($warnings === [] ? 'success' : 'warning')
+                ->persistent($warnings !== [])
                 ->send();
         } catch (GitHubSourceException $exception) {
             Notification::make()

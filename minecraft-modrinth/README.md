@@ -133,7 +133,9 @@ Individual invalid entries are skipped and logged.
    Personal access tokens → Fine-grained tokens*):
    - *Repository access*: **Only select repositories** → just the one repository.
    - *Repository permissions*: **Contents: Read-only** and **Actions: Read-only** (Metadata:
-     Read-only is added automatically). Nothing else.
+     Read-only is added automatically). Nothing else - no write permission of any kind.
+   - Not a classic token (`ghp_...`): it reaches every repository of its owner, with `repo` even
+     with write access. *Test connection* warns when the saved token is a classic one.
    - Pick an expiry you'll remember to renew; an expired token shows up as "GitHub rejected the
      token" on the page and in the log.
    A public repository works without a token (with GitHub's much lower anonymous rate limit).
@@ -146,6 +148,14 @@ Individual invalid entries are skipped and logged.
      `build.yml`) that must have a successful run on exactly that commit (push or manual run on the
      branch, or the pull request CI of that commit) for CI to count as green. Without it, a quick workflow (e.g. a linter) that finishes before the
      build has even started could make CI green too early. **For Ethoria set `build.yml`.**
+     **Automatic updates need it (since 1.9.0)**: without a required workflow they install nothing
+     (logged; *Test connection* warns).
+   - **Quarantine of automatic updates** (hours, default 2, 0 = off, at most 168,
+     `MINECRAFT_MODRINTH_GITHUB_QUARANTINE_HOURS`): see [Automatic updates: which commit](#automatic-updates-which-commit).
+   - **Allowed commit authors** (GitHub logins or commit e-mail addresses separated by commas,
+     `MINECRAFT_MODRINTH_GITHUB_ALLOWED_AUTHORS`, default
+     `Martindob,arzinnn,zTeeCY,claude,noreply@anthropic.com` - the Ethoria contributors and
+     Claude): see the same section. Empty: no check.
    - **Replace manual copies** (on by default, `MINECRAFT_MODRINTH_GITHUB_REPLACE_MANUAL`): a
      jar of a repository plugin that was put into `plugins/` by hand is replaced with the
      repository version (see [Manual copies](#manual-copies-replaced-with-the-github-version)).
@@ -173,9 +183,21 @@ Individual invalid entries are skipped and logged.
   per 30 seconds per server and 10 times a minute for the whole panel, so the token's rate limit
   can't be used up by clicking. Installing asks GitHub again under the same limit, otherwise it
   uses the cached state (the CI rule still applies to exactly the commit that is installed).
-- **The panel downloads the jar itself** (GitHub contents API), verifies its sha256 and size
-  against the index, and only then writes it to the server through the Wings file API. Wings
-  never gets a GitHub URL or the token.
+- **The panel downloads the jar itself** (GitHub contents API, at exactly the commit's SHA - never
+  by branch name) and checks it three ways before anything is written (since 1.9.0; before only
+  the first): (1) sha256 and size from the index of that commit, (2) size and **git blob SHA** of
+  the file in that commit's tree (`git/trees/<commit>?recursive=1` - one request per commit for all
+  its jars, a second, independent answer from GitHub; a tree GitHub truncates falls back to
+  listing the jar's directory), (3) the plugin **name and version declared inside the jar**
+  (`plugin.yml` / `paper-plugin.yml` / `velocity-plugin.json`) are the ones of the index entry, so
+  an index can't pass off another plugin or an old jar as a new version. Any mismatch: nothing is
+  installed, the old jar stays. Only then it is written to the server through the Wings file API.
+  Wings never gets a GitHub URL or the token.
+- **Never a downgrade** (since 1.9.0): installing over an installed plugin (*Update*, *Update all*,
+  the automatic update) needs a **higher** version than the installed one - an index that points
+  back to an older (perhaps vulnerable) version, or another jar with the same version, is refused.
+  Going back stays a deliberate admin decision: remove the plugin, then install the repository's
+  version.
 - The jar is written under a temporary name and renamed into `plugins/`; an existing file is never
   overwritten in place (if the indexed name is already taken by the plugin's own current jar, a
   name with a hash suffix is used). On update the new jar is written first, then the metadata
@@ -215,8 +237,9 @@ Individual invalid entries are skipped and logged.
   with what failed and why) instead of one per plugin. Subject to the same green-CI gate and rate
   limit as a single update - and the same permissions (see below).
 - **Automatic updates** (daily, at the configured time) only update plugins that are already
-  installed, only to a higher version, and only from a commit with green CI - regardless of the
-  "Require green CI" setting - and, with *Replace manual copies* on, replace manual copies of
+  installed, only to a higher version, and only from a commit with green CI of the *Required
+  workflow* - regardless of the "Require green CI" setting; which commit that is, see
+  [Automatic updates: which commit](#automatic-updates-which-commit) - and, with *Replace manual copies* on, replace manual copies of
   repository plugins (not of plugins hidden on that server). Nothing new is ever installed
   automatically. Servers in a conflict
   state (suspended, installing, being transferred or restored, node in maintenance) and servers
@@ -225,6 +248,62 @@ Individual invalid entries are skipped and logged.
   updating *file.create* and *file.delete*, removing *file.delete*; hiding an offer ("Doesn't
   belong on this server") and "Offer again" require *file.create*; replacing a manual copy
   ("Replace with GitHub version") *file.create* and *file.delete*.
+
+### Automatic updates: which commit
+
+Since 1.9.0 the daily automatic update does not simply take the newest commit of the branch. It
+takes the **newest commit** (walking back from the head, at most 30 commits, CI of at most 5 of
+them asked) that
+
+1. is **older than the quarantine** (default 2 h): the latest of the commit's date, the time this
+   panel first saw it as the head and the time GitHub created its successful *Required workflow*
+   run must lie that far back. A commit date can be set by whoever commits; the run's creation time
+   is set by GitHub, so a back-dated commit doesn't get through earlier;
+2. has **green CI on exactly that SHA**, with a successful run of the *Required workflow* (GitHub
+   Actions runs of this repository only - commit statuses and check runs of other apps never
+   count; another workflow that merely calls itself "Build" isn't `build.yml`);
+3. passes the **author allowlist** (when set) for **every commit since the last automatically
+   deployed one**: the author must be allowed - by its GitHub login when GitHub links the commit's
+   e-mail to an account, otherwise by the author e-mail (Claude's commits,
+   `Claude <noreply@anthropic.com>`, count as `claude` or by that e-mail); the committer must be
+   allowed the same way or be GitHub itself (`web-flow` / `GitHub <noreply@github.com>` for
+   rebase merges, `github-actions[bot]`) - GitHub as committer only counts because the author is
+   allowed. **Author and committer are git metadata that whoever commits can write**: the
+   allowlist is an extra tripwire against commits of anybody else; the real protection is who may
+   push to the branch (collaborators, 2FA, ruleset) and the official CI on exactly the SHA.
+
+A commit pushed shortly before the nightly run (or a red one) therefore doesn't stop the run: the
+newest older commit that qualifies is used, its index and jars are read **at exactly that SHA**,
+and the newer commits are taken by a later run once they qualify. Plugins are still only ever
+updated to a higher version than installed. The panel log names the commit used, its author and
+how many newer commits were held back
+(`minecraft-modrinth: GitHub: automatic update uses commit <sha> (author <login>, build.yml green); 2 newer commit(s) up to head <sha> held back ...`),
+and every installed jar gets a log line and an entry in the server's **activity log** with
+repository, commit, author and sha256.
+
+If the chosen commit does not descend from the last automatically deployed one (the branch was
+force-pushed), nothing is updated automatically and an error is logged until an admin has checked
+the repository. If no commit qualifies, nothing is updated (one log line). GitHub unreachable:
+nothing is updated (fail closed).
+
+**GitHub API budget.** Several servers, the hourly check and the page share one token (5 000
+requests an hour for a token). What one run costs:
+
+| What | Requests |
+|---|---|
+| hourly offer check | head commit 1, its CI 1 (cached 1-10 min), index 1 (cached 1 h per commit) |
+| page view | the same, cached (refresh at most every 30 s per server, 10 a minute in total) |
+| daily automatic update | head 1, commit history **1** (30 commits), CI of at most **5** candidates, a comparison with the last deployed commit only when it isn't among those 30 (1), the index 1, the commit's tree **1** (`git/trees/<sha>?recursive=1` - every jar's blob SHA at once) and one download per **distinct** jar that is updated (shared by all servers of the run) |
+
+The chosen commit is shared by all servers of a run and cached for 10 minutes; commit contents
+(index, tree) for an hour. When GitHub answers that fewer than 50 requests are left
+(`X-RateLimit-Remaining`), or with 403/429 and `Retry-After`, the panel stops asking GitHub until
+the reset: the automatic update stops for the rest of the run with **one** log line and every
+server keeps its current jars (fail closed).
+
+**Installing or updating by hand** is not delayed: it uses the newest commit (with green CI when
+*Require green CI* is on). While that commit is younger than the quarantine, the GitHub Plugins
+page shows a warning.
 
 ### Changing an id (previous_ids)
 
@@ -369,8 +448,11 @@ manually**, as in 1.4.1.
   only ever contains the ciphertext (`MINECRAFT_MODRINTH_GITHUB_TOKEN_ENCRYPTED`). The settings
   form never shows it (leave the field empty to keep it, or use *Delete the saved token*). If
   `APP_KEY` changes, save the token again.
-- The token is only sent to `https://api.github.com`. Redirects to GitHub's content hosts
-  (`*.githubusercontent.com`) are followed without it; redirects anywhere else are refused.
+- The token is only sent to `https://api.github.com`, always with TLS certificate verification.
+  Redirects to GitHub's content hosts (exactly `raw.githubusercontent.com`,
+  `objects.githubusercontent.com`, `codeload.github.com` - since 1.9.0 no other
+  `*.githubusercontent.com` host) are followed without it, https only; redirects anywhere else
+  are refused. JSON answers are limited to 8 MB.
 - The token is never logged: failures are reported as short messages without request details, at
   most once per hour per problem.
 - Everything from the repository is validated: repository/branch/index path in the settings, the
@@ -382,6 +464,15 @@ manually**, as in 1.4.1.
   text as HTML).
 - A fine-grained token limited to one repository with read-only Contents/Actions can't change
   anything on GitHub.
+- What protects what (1.9.0): a changed download (network, content host) can't match the index
+  sha256 **and** the commit's git blob SHA; an index entry can't install another plugin or an old
+  jar under a new version (descriptor check) nor an older version over a newer one (no downgrade);
+  a fake "green" from another app or workflow doesn't count (GitHub Actions runs of the required
+  workflow on exactly the SHA); a bad commit on the branch has the quarantine to be noticed before
+  the automatic update takes it; a rewritten branch stops automatic updates. What it can't protect
+  against: somebody who may push to the branch and gets a malicious but green commit through the
+  repository's own CI - that is up to the repository (ruleset, reviews, 2FA, CI that checks that
+  the jars match the source).
 
 ### Limitations
 
@@ -392,6 +483,28 @@ manually**, as in 1.4.1.
 - The panel keeps a jar in memory while installing it, hence the 50 MB limit.
 
 ## Changes
+
+- **1.9.0** - Supply chain hardening of the GitHub source. **Automatic updates** take the newest
+  commit that is older than the new **quarantine** (default 2 h, 0 = off; counted from the latest
+  of commit date, first sighting by the panel and GitHub's CI run), has green CI of the *Required
+  workflow* on exactly that SHA and passes the **author allowlist** (default: the Ethoria
+  contributors and Claude, by login or - without a GitHub account - by e-mail) for every commit
+  since the last automatic deploy - walking back from a head that is too young instead of skipping
+  the night (one request for 30 commits, CI of at most 5, one tree request per commit, decision
+  shared by all servers; under 50 remaining API requests or on a rate limit it stops with one log
+  line and keeps the jars); they need a *Required workflow* (without one they install nothing) and stop when the
+  branch was force-pushed. Every downloaded jar is checked against the index sha256/size, the
+  **git blob SHA of the file in that commit's tree** (one tree request per commit) and the **plugin name and version inside the
+  jar**. **Never a downgrade**: an older (or same-version, other) jar is never installed over an
+  installed plugin. CI counts only GitHub Actions runs of exactly the configured repository.
+  Redirects only to exactly `raw.githubusercontent.com`, `objects.githubusercontent.com`,
+  `codeload.github.com`; TLS verification stated explicitly; JSON answers limited to 8 MB.
+  Every install is logged with commit, author and sha256 (panel log and the server's activity
+  log). *Test connection* warns about a classic token and a missing required workflow; the page
+  warns while the newest commit is in the quarantine. The index format is unchanged (`sha256`
+  and `size` were already required). Update the settings after updating: check *Required workflow*
+  (`build.yml` for Ethoria), the quarantine and the author allowlist (prefilled with the Ethoria
+  contributors and Claude).
 
 - **1.8.0** - CI of a pull request merged by fast-forward counts: besides a push, a manual run
   (`workflow_dispatch`) on the branch and the pull request CI of exactly the same commit make it

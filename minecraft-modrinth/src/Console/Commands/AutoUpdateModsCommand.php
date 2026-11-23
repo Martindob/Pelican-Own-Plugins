@@ -79,11 +79,14 @@ class AutoUpdateModsCommand extends Command
     }
 
     /**
-     * The GitHub repository state to update from, fetched once for every server - or null when
-     * the source is off, unreachable, or its head commit hasn't passed CI. Automatic updates
-     * always require green CI, whatever the manual "require green CI" setting says.
+     * The GitHub repository state to update from, fetched once for every server - or null when the source is off,
+     * unreachable, or no commit qualifies. Not simply the head: the newest commit of the branch that is older than
+     * the quarantine, has green CI of the required workflow on exactly that SHA and passes the author allowlist
+     * (GitHubPluginService::autoUpdateSnapshot()) - so a commit pushed shortly before the nightly run doesn't stop
+     * it, the run takes the newest older commit instead. Automatic updates always require green CI, whatever the
+     * manual "require green CI" setting says. GitHub unreachable: nothing is updated (fail closed).
      *
-     * @return array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}>, problems: array<int, string>}|null
+     * @return array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}>, problems: array<int, string>, author?: ?string}|null
      */
     protected function getGitHubSnapshot(GitHubPluginService $github): ?array
     {
@@ -93,21 +96,32 @@ class AutoUpdateModsCommand extends Command
 
         try {
             $github->forgetCachedState();
-            $snapshot = $github->getSnapshot();
+            $choice = $github->autoUpdateSnapshot();
         } catch (GitHubSourceException $exception) {
-            // Already reported (throttled) by the service.
+            $github->reportOncePerWindow('auto:'.$exception->reason, $exception);
             $this->warn('GitHub source unavailable: '.$exception->getMessage());
 
             return null;
         }
 
-        if ($snapshot['ci'] !== CiStatus::Green) {
-            $this->line("GitHub source: CI of {$snapshot['sha']} is {$snapshot['ci']->value}, not updating from it.");
+        if ($choice === null) {
+            $this->line('GitHub source: no commit qualifies for an automatic update (see the panel log), not updating.');
 
             return null;
         }
 
-        return $snapshot;
+        $snapshot = $choice['snapshot'];
+        if ($snapshot['ci'] !== CiStatus::Green) {
+            return null;
+        }
+
+        $this->line("GitHub source: updating from commit {$snapshot['sha']}".($choice['author'] !== null ? " by {$choice['author']}" : '')
+            .($snapshot['sha'] !== $choice['head'] ? " ({$choice['held_back']} newer commit(s) up to {$choice['head']} held back)" : '').'.');
+
+        // The commit servers are updated from now: what comes in after it is checked against the allowlist next time.
+        $github->rememberDeployed($snapshot['sha']);
+
+        return $snapshot + ['author' => $choice['author']];
     }
 
     protected function updateServer(Server $server, ModrinthProjectType $modrinthProjectType): void

@@ -403,9 +403,34 @@ namespace {
             return $this->platform;
         }
 
+        /** @var array<string, array{sha: string, size: int}> the commit's tree as GitHub lists it */
+        public array $tree = [];
+
+        /** A download failure to simulate (reason), e.g. GitHub's rate limit. */
+        public ?string $downloadFails = null;
+
+        public int $downloads = 0;
+
         public function downloadVerifiedJar(array $plugin, string $sha): string
         {
+            $this->downloads++;
+
+            if ($this->downloadFails !== null) {
+                throw new GitHubSourceException($this->downloadFails, 'simulated');
+            }
+
             return $this->jars[$plugin['sha256']];
+        }
+
+        /** The real checks of a downloaded jar (1.9.0), with the commit's tree from $tree. */
+        public function verify(array $plugin, string $sha, string $content): void
+        {
+            $this->verifyDownloadedJar($plugin, $sha, $content);
+        }
+
+        protected function directoryListing(string $directory, string $sha): array
+        {
+            return $this->tree;
         }
     }
 
@@ -501,6 +526,18 @@ namespace {
         return $names;
     }
 
+    /** @return array<int, array<string, mixed>> activity log entries of deleted files (installs are logged too) */
+    function deletions(): array
+    {
+        return array_values(array_filter(Activity::$logged, fn (array $entry) => $entry['event'] === 'server:file.delete'));
+    }
+
+    /** @return array<int, string> panel log lines about deleted manual copies */
+    function deletionLines(): array
+    {
+        return array_values(array_filter(Log::$lines, fn (string $line) => str_contains($line, 'deleted the manual copy')));
+    }
+
     function putFile(string $name, string $content, array $extra = []): void
     {
         DaemonFiles::$fs["plugins/$name"] = ['content' => $content, 'modified' => '2026-10-20T08:00:00+00:00'] + $extra;
@@ -573,10 +610,10 @@ namespace {
 
     $meta = metadata();
     check(count($meta['installed']) === 1 && !isset($meta['pending_delete']), 'afterwards: one entry, nothing pending');
-    check(count(Activity::$logged) === 1 && Activity::$logged[0]['event'] === 'server:file.delete'
-        && Activity::$logged[0]['properties']['files'] === ['EthoriaChat-1.8.0.jar'] && Activity::$logged[0]['properties']['directory'] === 'plugins'
-        && str_contains((string) Activity::$logged[0]['properties']['replaced_by'], 'EthoriaChat 1.8.1') && Activity::$logged[0]['subjects'] === [$server], 'activity log entry with the deleted file');
-    check(count(Log::$lines) === 1 && str_contains(Log::$lines[0], 'plugins/EthoriaChat-1.8.0.jar') && str_contains(Log::$lines[0], '#1'), 'panel log line with the deleted file');
+    check(count(deletions()) === 1 && deletions()[0]['event'] === 'server:file.delete'
+        && deletions()[0]['properties']['files'] === ['EthoriaChat-1.8.0.jar'] && deletions()[0]['properties']['directory'] === 'plugins'
+        && str_contains((string) deletions()[0]['properties']['replaced_by'], 'EthoriaChat 1.8.1') && deletions()[0]['subjects'] === [$server], 'activity log entry with the deleted file');
+    check(count(deletionLines()) === 1 && str_contains(deletionLines()[0], 'plugins/EthoriaChat-1.8.0.jar') && str_contains(deletionLines()[0], '#1'), 'panel log line with the deleted file');
 
     // ------------------------------------------------------------------
     // 2. The manual copy has exactly the indexed name: the new jar gets an alternative name
@@ -677,12 +714,12 @@ namespace {
     check(throwsReason(fn () => $service->installOrUpdate($server, $chat, $snapshot, true, false, true), GitHubSourceException::OLD_JAR_PENDING), 'copy not deletable: reported as pending');
     $meta = metadata();
     check(($meta['installed'][0]['filename'] ?? null) === 'EthoriaChat-1.8.1.jar' && ($meta['pending_delete'][0]['filename'] ?? null) === 'EthoriaChat-1.8.0.jar', 'new jar recorded, copy pending');
-    check(Activity::$logged === [], 'nothing logged as deleted yet');
+    check(deletions() === [], 'nothing logged as deleted yet');
     check($service->manualReplacements($server, [$chat], $service->readMetadata($server), DaemonFiles::listDirectory($server, 'plugins') ?? [], []) === [], 'installed now: not offered again');
     DaemonFiles::$failDelete = [];
     $service->cleanupServer($server);
     check(jarsOnServer() === ['EthoriaChat-1.8.1.jar'] && !isset(metadata()['pending_delete']), 'cleanup deletes the pending copy');
-    check(count(Activity::$logged) === 1 && Activity::$logged[0]['properties']['files'] === ['EthoriaChat-1.8.0.jar'], 'cleanup logs the deleted copy');
+    check(count(deletions()) === 1 && deletions()[0]['properties']['files'] === ['EthoriaChat-1.8.0.jar'], 'cleanup logs the deleted copy');
 
     // ------------------------------------------------------------------
     // 7. The metadata can't be written: the new jar is removed, the copy stays
@@ -692,7 +729,7 @@ namespace {
     DaemonFiles::$failWrite = ['plugins/.github-plugins.json'];
     check(throwsReason(fn () => $service->installOrUpdate($server, $chat, $snapshot, true, false, true), GitHubSourceException::METADATA), 'metadata write failure reported');
     check(jarsOnServer() === ['EthoriaChat-1.8.0.jar'] && metadata() === [], 'metadata write failure: new jar removed, copy kept, nothing recorded');
-    check(Activity::$logged === [], 'metadata write failure: nothing logged');
+    check(deletions() === [], 'metadata write failure: nothing logged');
 
     // ------------------------------------------------------------------
     // 8. Update of an installed plugin also replaces a manual copy next to it
@@ -707,7 +744,7 @@ namespace {
     check(throwsReason(fn () => $service->installOrUpdate($server, $chat, $snapshot, true, true, false), GitHubSourceException::FILE_CONFLICT), 'update without replacing: copy is a conflict');
     $service->installOrUpdate($server, $chat, $snapshot, true, true, true, $replaced);
     check(jarsOnServer() === ['EthoriaChat-1.8.1.jar'] && $replaced === ['EthoriaChat.jar'], 'update: old jar and manual copy both gone');
-    check(count(Activity::$logged) === 1 && Activity::$logged[0]['properties']['files'] === ['EthoriaChat.jar'], 'update: only the manual copy is logged');
+    check(count(deletions()) === 1 && deletions()[0]['properties']['files'] === ['EthoriaChat.jar'], 'update: only the manual copy is logged');
 
     // ------------------------------------------------------------------
     // 9. Daily automatic update: replaces copies of plugins that aren't hidden
@@ -873,6 +910,67 @@ namespace {
     putMetadata([['id' => 'ethoriavote-paper', 'platform' => 'paper', 'filename' => 'ethoriavote-paper-1.0.0.jar', 'size' => 1] + $installedOld()]);
     check($service->autoUpdateServer($server, $snapshot) === ['ethoriavote'] && jarsOnServer() === ['EthoriaVote-1.0.1.jar'], 'paper server: its entry updated');
     check(metadata()['installed'][0]['platform'] === 'paper' && metadata()['installed'][0]['id'] === 'ethoriavote' && metadata()['installed'][0]['sha256'] === $votePaper['sha256'], 'paper server: paper jar, current id');
+
+    // ------------------------------------------------------------------
+    // 1.9.0: every install is logged with its commit, never a downgrade, a jar is checked three ways
+    // ------------------------------------------------------------------
+    [$service, $chat, , $snapshot] = $setup();
+    $snapshot['author'] = 'Martindob';
+    $service->installOrUpdate($server, $chat, $snapshot, true, false);
+    $writes = array_values(array_filter(Activity::$logged, fn (array $entry) => $entry['event'] === 'server:file.write'));
+    check(count($writes) === 1 && $writes[0]['properties']['file'] === 'plugins/EthoriaChat-1.8.1.jar'
+        && str_contains((string) $writes[0]['properties']['github'], substr($snapshot['sha'], 0, 12)) && str_contains((string) $writes[0]['properties']['github'], 'Martindob'), 'install: activity log entry with commit and author');
+    check(count(array_filter(Log::$lines, fn (string $line) => str_contains($line, $snapshot['sha']) && str_contains($line, 'EthoriaChat 1.8.1 (new)') && str_contains($line, $chat['sha256']))) === 1, 'install: panel log line with commit and sha256');
+
+    // An index that points back to an older version: refused, nothing written.
+    [$service, $chat, , $snapshot] = $setup();
+    $older = indexEntry($service, 'chat', 'EthoriaChat', '1.8.0', $oldChat);
+    putFile('EthoriaChat-1.8.1.jar', $newChat);
+    putMetadata([['id' => 'chat', 'name' => 'EthoriaChat', 'platform' => 'paper', 'version' => '1.8.1', 'sha256' => $chat['sha256'], 'size' => strlen($newChat), 'filename' => 'EthoriaChat-1.8.1.jar', 'repository' => 'Martindob/Ethoria.cz', 'commit' => str_repeat('b', 40), 'installed_at' => '2026-10-01T00:00:00+00:00']]);
+    $before = DaemonFiles::$fs;
+    check(throwsReason(fn () => $service->installOrUpdate($server, $older, ['plugins' => [$older]] + $snapshot, true, true), GitHubSourceException::DOWNGRADE) && DaemonFiles::$fs === $before, 'downgrade: refused, nothing changed');
+    check(throwsReason(fn () => $service->installOrUpdate($server, $older, ['plugins' => [$older]] + $snapshot, true, null, true), GitHubSourceException::DOWNGRADE) && DaemonFiles::$fs === $before, 'downgrade without expectation: refused');
+    $rebuilt = indexEntry($service, 'chat', 'EthoriaChat', '1.8.1', paperJar('EthoriaChat', '1.8.1').'x');
+    check(throwsReason(fn () => $service->installOrUpdate($server, $rebuilt, ['plugins' => [$rebuilt]] + $snapshot, true, true), GitHubSourceException::DOWNGRADE), 'same version, another jar: refused');
+    check($service->autoUpdateServer($server, ['plugins' => [$older]] + $snapshot) === [] && DaemonFiles::$fs === $before, 'auto update: older index version left alone');
+
+    // GitHub's rate limit during the automatic update: stop for the whole run, one log line, jars kept.
+    [$service, $chat, $bags, $snapshot] = $setup();
+    $chat9 = indexEntry($service, 'chat', 'EthoriaChat', '1.9.0', paperJar('EthoriaChat', '1.9.0'));
+    $bags9 = indexEntry($service, 'bags', 'EthoriaBags', '1.9.2', paperJar('EthoriaBags', '1.9.2'));
+    putFile('EthoriaChat-1.8.1.jar', $newChat);
+    putFile('EthoriaBags-1.9.1.jar', $bagsJar);
+    $installedChat = ['id' => 'chat', 'name' => 'EthoriaChat', 'platform' => 'paper', 'version' => '1.8.1', 'sha256' => $chat['sha256'], 'size' => strlen($newChat), 'filename' => 'EthoriaChat-1.8.1.jar', 'repository' => 'Martindob/Ethoria.cz', 'commit' => str_repeat('b', 40), 'installed_at' => '2026-10-01T00:00:00+00:00'];
+    putMetadata([$installedChat, ['id' => 'bags', 'name' => 'EthoriaBags', 'version' => '1.9.1', 'sha256' => $bags['sha256'], 'size' => strlen($bagsJar), 'filename' => 'EthoriaBags-1.9.1.jar'] + $installedChat]);
+    $service->downloadFails = GitHubSourceException::RATE_LIMITED;
+    $before = DaemonFiles::$fs;
+    check($service->autoUpdateServer($server, ['plugins' => [$chat9, $bags9]] + $snapshot) === [] && $service->downloads === 1, 'rate limit: stops after the first refusal');
+    check($service->autoUpdateServer(new Server(2, 'uuid-2'), ['plugins' => [$chat9, $bags9]] + $snapshot) === [] && $service->downloads === 1, 'rate limit: next server of the run asks GitHub nothing');
+    check(DaemonFiles::$fs === $before && count(TestState::$reports) === 1, 'rate limit: jars kept, one log line');
+
+    // The downloaded jar: index sha256/size, the commit's tree (git blob SHA) and the plugin inside.
+    [$service, $chat] = $setup();
+    $sha = str_repeat('a', 40);
+    $service->tree = ['EthoriaChat-1.8.1.jar' => ['sha' => R::gitBlobSha($newChat), 'size' => strlen($newChat)]];
+    $ok = true;
+    try {
+        $service->verify($chat, $sha, $newChat);
+    } catch (GitHubSourceException) {
+        $ok = false;
+    }
+    check($ok, 'verify: jar matching index, tree and descriptor passes');
+    check(throwsReason(fn () => $service->verify($chat, $sha, $oldChat), GitHubSourceException::CHECKSUM_MISMATCH), 'verify: other content than the index sha256');
+    $service->tree = ['EthoriaChat-1.8.1.jar' => ['sha' => sha1('other'), 'size' => strlen($newChat)]];
+    check(throwsReason(fn () => $service->verify($chat, $sha, $newChat), GitHubSourceException::CHECKSUM_MISMATCH, $message) && str_contains((string) $message, 'git blob'), 'verify: tree blob SHA differs');
+    $service->tree = [];
+    check(throwsReason(fn () => $service->verify($chat, $sha, $newChat), GitHubSourceException::CHECKSUM_MISMATCH, $message) && str_contains((string) $message, 'not in the commit'), 'verify: file missing in the tree');
+    // An old jar listed under a new version (index and tree consistent, but the jar says 1.8.0).
+    $relabelled = indexEntry($service, 'chat', 'EthoriaChat', '1.8.1', $oldChat);
+    $service->tree = ['EthoriaChat-1.8.1.jar' => ['sha' => R::gitBlobSha($oldChat), 'size' => strlen($oldChat)]];
+    check(throwsReason(fn () => $service->verify($relabelled, $sha, $oldChat), GitHubSourceException::CHECKSUM_MISMATCH, $message) && str_contains((string) $message, 'version'), 'verify: jar declares another version');
+    $impostor = indexEntry($service, 'chat', 'EthoriaChat', '1.9.1', $bagsJar);
+    $service->tree = ['EthoriaChat-1.9.1.jar' => ['sha' => R::gitBlobSha($bagsJar), 'size' => strlen($bagsJar)]];
+    check(throwsReason(fn () => $service->verify(['path' => 'minecraft/EthoriaChat/releases/EthoriaChat-1.9.1.jar', 'filename' => 'EthoriaChat-1.9.1.jar'] + $impostor, $sha, $bagsJar), GitHubSourceException::CHECKSUM_MISMATCH, $message) && str_contains((string) $message, 'ethoriabags'), 'verify: jar of another plugin');
 
     echo (Result::$failures === 0 ? 'OK' : 'FAILED').' ('.Result::$checks.' checks, '.Result::$failures." failed)\n";
     exit(Result::$failures === 0 ? 0 : 1);

@@ -61,6 +61,15 @@ class GitHubSourceException extends RuntimeException
     /** A manual copy of the plugin is in plugins/ and can't be replaced automatically. */
     public const MANUAL_COPY = 'manual_copy';
 
+    /** The repository's version is not newer than the installed one: never installed over it. */
+    public const DOWNGRADE = 'downgrade';
+
+    /** Automatic update: a commit's author/committer is not in the allowlist. */
+    public const AUTHOR_NOT_ALLOWED = 'author_not_allowed';
+
+    /** Automatic update: the branch no longer descends from the last deployed commit (force push). */
+    public const HISTORY_REWRITTEN = 'history_rewritten';
+
     public function __construct(public readonly string $reason, string $message, public readonly ?int $retryAfter = null)
     {
         parent::__construct(GitHubSourceRules::redact($message));

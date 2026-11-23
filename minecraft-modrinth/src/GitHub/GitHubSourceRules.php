@@ -37,6 +37,21 @@ final class GitHubSourceRules
     /** plugin.yml / paper-plugin.yml / velocity-plugin.json are a few KB at most. */
     public const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 
+    /**
+     * The only hosts a GitHub API response may redirect a download to (never sent the token). Since 1.9.0 an exact
+     * list instead of any *.githubusercontent.com host.
+     */
+    public const REDIRECT_HOSTS = ['raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com'];
+
+    /** Committers that are GitHub itself (web UI, API merges/rebases, GitHub Actions' token): never a person. */
+    public const GITHUB_COMMITTERS = ['web-flow', 'github-actions[bot]'];
+
+    /** Longest quarantine of automatic updates (hours). */
+    public const MAX_QUARANTINE_HOURS = 168;
+
+    /** Most allowed logins in the author allowlist. */
+    public const MAX_ALLOWED_AUTHORS = 50;
+
     /** A plugin id in the index and in the metadata file (also every entry of "previous_ids"). */
     public const ID_PATTERN = '/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/';
 
@@ -468,13 +483,17 @@ final class GitHubSourceRules
      * unverified, while it runs pending - so a quick, unrelated workflow finishing first can't
      * turn CI green before the build itself has finished.
      *
+     * With $repository (owner/name), a run only counts when it belongs to exactly that repository (the runs API
+     * only lists the repository's own runs - this is a second line).
+     *
+     * Only GitHub Actions workflow runs are read at all: commit statuses and check runs of other apps (which anyone
+     * with a token for such an app could set) never make a commit green.
+     *
      * @param  array<int, mixed>  $runs
      */
-    public static function evaluateWorkflowRuns(array $runs, string $sha, ?string $branch = null, ?string $requiredWorkflow = null): CiStatus
+    public static function evaluateWorkflowRuns(array $runs, string $sha, ?string $branch = null, ?string $requiredWorkflow = null, ?string $repository = null): CiStatus
     {
-        $relevant = self::newestPerWorkflow(array_values(array_filter($runs, fn ($run) => is_array($run)
-            && ($run['head_sha'] ?? null) === $sha
-            && self::runCountsForBranch($run, $branch))));
+        $relevant = self::relevantRuns($runs, $sha, $branch, $repository);
 
         if (empty($relevant)) {
             return CiStatus::Unverified;
@@ -514,6 +533,42 @@ final class GitHubSourceRules
         }
 
         return $succeeded ? CiStatus::Green : CiStatus::Unverified;
+    }
+
+    /**
+     * The runs of exactly $sha that count (see evaluateWorkflowRuns()), newest per workflow.
+     *
+     * @param  array<int, mixed>  $runs
+     * @return array<int, array<mixed>>
+     */
+    protected static function relevantRuns(array $runs, string $sha, ?string $branch, ?string $repository): array
+    {
+        return self::newestPerWorkflow(array_values(array_filter($runs, fn ($run) => is_array($run)
+            && ($run['head_sha'] ?? null) === $sha
+            && ($repository === null || (is_array($run['repository'] ?? null) && is_string($run['repository']['full_name'] ?? null)
+                && strcasecmp($run['repository']['full_name'], $repository) === 0))
+            && self::runCountsForBranch($run, $branch))));
+    }
+
+    /**
+     * When GitHub created the successful run of $requiredWorkflow that makes $sha green (unix time), or null.
+     * GitHub sets this itself (unlike a commit's date, which whoever commits can choose), so it is the earliest
+     * moment the commit provably existed on GitHub - the quarantine of automatic updates counts from it.
+     *
+     * @param  array<int, mixed>  $runs
+     */
+    public static function requiredRunCreatedAt(array $runs, string $sha, ?string $branch, string $requiredWorkflow, ?string $repository = null): ?int
+    {
+        foreach (self::relevantRuns($runs, $sha, $branch, $repository) as $run) {
+            if (self::workflowFileOfRun($run) === strtolower($requiredWorkflow)
+                && ($run['status'] ?? null) === 'completed' && ($run['conclusion'] ?? null) === 'success') {
+                $time = is_string($run['created_at'] ?? null) ? strtotime($run['created_at']) : false;
+
+                return $time !== false ? $time : null;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -890,12 +945,18 @@ final class GitHubSourceRules
      */
     public static function pluginYmlName(string $yaml): ?string
     {
+        return self::pluginYmlValue($yaml, 'name');
+    }
+
+    /** A top-level scalar of a plugin.yml / paper-plugin.yml ("key: value", optionally quoted), or null. */
+    public static function pluginYmlValue(string $yaml, string $key): ?string
+    {
         if (strlen($yaml) > self::MAX_DESCRIPTOR_BYTES) {
             return null;
         }
 
         foreach (preg_split('/\r\n|\r|\n/', $yaml) ?: [] as $line) {
-            if (!preg_match('/^name:[ \t]*(.*?)[ \t]*$/', $line, $match)) {
+            if (!preg_match('/^'.preg_quote($key, '/').':[ \t]*(.*?)[ \t]*$/', $line, $match)) {
                 continue;
             }
 
@@ -1120,12 +1181,439 @@ final class GitHubSourceRules
     /** Hosts a GitHub API response may redirect a download to (never sent the token). */
     public static function isAllowedRedirectHost(string $host): bool
     {
-        $host = strtolower($host);
+        return in_array(strtolower($host), self::REDIRECT_HOSTS, true);
+    }
 
-        return $host === 'raw.githubusercontent.com'
-            || $host === 'objects.githubusercontent.com'
-            || $host === 'codeload.github.com'
-            || (bool) preg_match('/^[a-z0-9-]+\.githubusercontent\.com$/', $host);
+    // ------------------------------------------------------------------
+    // Integrity of a downloaded jar (1.9.0)
+    // ------------------------------------------------------------------
+
+    /** Git's object id of a file ("blob <size>\0<content>", SHA-1) - what GitHub's tree lists for it. */
+    public static function gitBlobSha(string $content): string
+    {
+        return sha1('blob '.strlen($content)."\0".$content);
+    }
+
+    /**
+     * The files of a directory listing of the contents API (GET /contents/<dir>?ref=<commit>): name => git blob SHA
+     * and size. Null when the response isn't such a listing.
+     *
+     * @return array<string, array{sha: string, size: int}>|null
+     */
+    public static function parseDirectoryListing(mixed $data): ?array
+    {
+        if (!is_array($data) || !array_is_list($data) || count($data) > 1000) {
+            return null;
+        }
+
+        $files = [];
+
+        foreach ($data as $item) {
+            if (!is_array($item) || !is_string($item['name'] ?? null) || !is_string($item['type'] ?? null)) {
+                return null;
+            }
+
+            if ($item['type'] !== 'file') {
+                continue;
+            }
+
+            if (!is_string($item['sha'] ?? null) || !self::isValidSha($item['sha']) || !is_int($item['size'] ?? null)) {
+                return null;
+            }
+
+            $files[$item['name']] = ['sha' => $item['sha'], 'size' => $item['size']];
+        }
+
+        return $files;
+    }
+
+    /**
+     * The jars of a commit's whole tree (GET /git/trees/<commit>?recursive=1 - ONE request per commit, however many
+     * jars are checked): path => git blob SHA and size, only "*.jar" blobs. Null when the answer isn't such a tree or
+     * GitHub truncated it (too large - the caller falls back to listing single directories).
+     *
+     * @return array<string, array{sha: string, size: int}>|null
+     */
+    public static function parseTreeJars(mixed $data): ?array
+    {
+        if (!is_array($data) || ($data['truncated'] ?? true) !== false || !is_array($data['tree'] ?? null) || !array_is_list($data['tree'])) {
+            return null;
+        }
+
+        $jars = [];
+
+        foreach ($data['tree'] as $item) {
+            if (!is_array($item) || !is_string($item['path'] ?? null) || ($item['type'] ?? null) !== 'blob'
+                || !str_ends_with(strtolower($item['path']), '.jar')) {
+                continue;
+            }
+
+            if (!is_string($item['sha'] ?? null) || !self::isValidSha($item['sha']) || !is_int($item['size'] ?? null)) {
+                return null;
+            }
+
+            $jars[$item['path']] = ['sha' => $item['sha'], 'size' => $item['size']];
+        }
+
+        return $jars;
+    }
+
+    /**
+     * The files of one directory from parseTreeJars() (name => blob SHA and size), as treeMismatch() takes them.
+     *
+     * @param  array<string, array{sha: string, size: int}>  $jars
+     * @return array<string, array{sha: string, size: int}>
+     */
+    public static function treeDirectory(array $jars, string $directory): array
+    {
+        $files = [];
+
+        foreach ($jars as $path => $file) {
+            if (dirname($path) === $directory) {
+                $files[basename($path)] = $file;
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * Why $content is not the file $filename of the commit's tree (its git blob SHA and size from $listing), or null
+     * when it is.
+     *
+     * @param  array<string, array{sha: string, size: int}>  $listing
+     */
+    public static function treeMismatch(string $content, string $filename, array $listing): ?string
+    {
+        $file = $listing[$filename] ?? null;
+
+        if ($file === null) {
+            return "$filename is not in the commit's tree";
+        }
+
+        if ($file['size'] !== strlen($content)) {
+            return "$filename has {$file['size']} bytes in the commit's tree, the download ".strlen($content);
+        }
+
+        return hash_equals($file['sha'], self::gitBlobSha($content)) ? null : "$filename does not match its git blob SHA in the commit's tree";
+    }
+
+    /**
+     * What a jar declares about itself: the names it is loaded under ("names", lower case - see jarDescriptorNames()),
+     * every name it shows ("labels": also a Velocity plugin's "name") and every version it declares. Null (with
+     * $problem) when it can't be read or declares nothing.
+     *
+     * @return array{names: array<int, string>, labels: array<int, string>, versions: array<int, string>}|null
+     */
+    public static function jarDescriptor(string $path, string $platform, ?string &$problem = null): ?array
+    {
+        $names = self::jarDescriptorNames($path, $platform, $problem);
+
+        if ($names === null) {
+            return null;
+        }
+
+        $labels = $names;
+        $versions = [];
+        $zip = new ZipArchive();
+
+        if ($zip->open($path, ZipArchive::RDONLY) !== true) {
+            $problem = 'not a valid jar (zip) file';
+
+            return null;
+        }
+
+        try {
+            if ($platform === 'velocity') {
+                $json = self::readZipEntry($zip, 'velocity-plugin.json');
+                $data = $json !== null ? json_decode($json, true) : null;
+
+                if (is_array($data) && is_string($data['name'] ?? null)) {
+                    $labels[] = strtolower($data['name']);
+                }
+                if (is_array($data) && is_string($data['version'] ?? null)) {
+                    $versions[] = $data['version'];
+                }
+            } else {
+                foreach (['paper-plugin.yml', 'plugin.yml'] as $descriptor) {
+                    $yaml = self::readZipEntry($zip, $descriptor);
+                    $version = $yaml !== null ? self::pluginYmlValue($yaml, 'version') : null;
+
+                    if ($version !== null) {
+                        $versions[] = $version;
+                    }
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+
+        return ['names' => $names, 'labels' => array_values(array_unique($labels)), 'versions' => array_values(array_unique($versions))];
+    }
+
+    /**
+     * Why a downloaded jar is not the plugin and version its index entry says (another plugin, another version - e.g.
+     * an old jar put back under a new version number), or null when it is.
+     *
+     * @param  array{names: array<int, string>, labels: array<int, string>, versions: array<int, string>}  $descriptor
+     * @param  array{name: string, version: string}  $plugin
+     */
+    public static function descriptorMismatch(array $descriptor, array $plugin): ?string
+    {
+        if (!in_array(strtolower($plugin['name']), $descriptor['labels'], true)) {
+            return 'the jar declares '.implode('/', $descriptor['labels']).", not {$plugin['name']}";
+        }
+
+        if ($descriptor['versions'] === []) {
+            return 'the jar declares no version';
+        }
+
+        foreach ($descriptor['versions'] as $version) {
+            if ($version !== $plugin['version']) {
+                return 'the jar declares version '.self::describeValue($version).", not {$plugin['version']}";
+            }
+        }
+
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Automatic updates: quarantine and author allowlist (1.9.0)
+    // ------------------------------------------------------------------
+
+    /** A GitHub login ("Martindob", "dependabot[bot]"). */
+    public static function isValidLogin(string $login): bool
+    {
+        return (bool) preg_match('/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}(\[bot\])?$/', $login);
+    }
+
+    /** An e-mail address as a commit carries it (only for the allowlist - no full RFC check). */
+    public static function isValidEmail(string $email): bool
+    {
+        return strlen($email) <= 254 && (bool) preg_match('/^[^\s@,;<>"]+@[^\s@,;<>"]+\.[^\s@,;<>"]+$/', $email);
+    }
+
+    /**
+     * The author allowlist from the settings (GitHub logins or commit e-mail addresses, separated by commas, spaces or
+     * new lines), lower case; an empty list switches the check off. Null when an entry is neither or there are too
+     * many. An e-mail address is only used for a commit whose e-mail GitHub doesn't link to an account (no login).
+     *
+     * @return array<int, string>|null
+     */
+    public static function parseAllowlist(mixed $value): ?array
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $logins = [];
+
+        foreach (preg_split('/[\s,;]+/', trim($value)) ?: [] as $login) {
+            if ($login === '') {
+                continue;
+            }
+
+            if (!self::isValidLogin($login) && !self::isValidEmail($login)) {
+                return null;
+            }
+
+            $logins[] = strtolower($login);
+        }
+
+        $logins = array_values(array_unique($logins));
+
+        return count($logins) <= self::MAX_ALLOWED_AUTHORS ? $logins : null;
+    }
+
+    /** Quarantine of automatic updates in hours (0 = off) from the settings, or null when it isn't one. */
+    public static function normalizeQuarantineHours(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            $hours = $value;
+        } elseif (is_string($value) && preg_match('/^\d{1,3}$/', trim($value))) {
+            $hours = (int) trim($value);
+        } else {
+            return null;
+        }
+
+        return $hours >= 0 && $hours <= self::MAX_QUARANTINE_HOURS ? $hours : null;
+    }
+
+    /**
+     * Commits from the commits API (GET /commits?sha=..., or "commits" of GET /compare/...): SHA, the later of the
+     * author and committer date, and the GitHub logins of author and committer (null when the e-mail address of the
+     * commit isn't linked to an account). Null when the response isn't such a list.
+     *
+     * @return array<int, array{sha: string, time: int, author: ?string, committer: ?string, author_email: ?string, committer_email: ?string}>|null
+     */
+    public static function parseCommitList(mixed $data): ?array
+    {
+        if (!is_array($data) || !array_is_list($data)) {
+            return null;
+        }
+
+        $commits = [];
+
+        foreach ($data as $item) {
+            if (!is_array($item) || !is_string($item['sha'] ?? null) || !self::isValidSha($item['sha']) || !is_array($item['commit'] ?? null)) {
+                return null;
+            }
+
+            $time = 0;
+            foreach (['author', 'committer'] as $role) {
+                $date = $item['commit'][$role]['date'] ?? null;
+                $parsed = is_string($date) ? strtotime($date) : false;
+                $time = max($time, $parsed === false ? 0 : $parsed);
+            }
+
+            $login = fn (string $role) => is_array($item[$role] ?? null) && is_string($item[$role]['login'] ?? null) && self::isValidLogin($item[$role]['login'])
+                ? $item[$role]['login']
+                : null;
+
+            $email = fn (string $role) => is_string($item['commit'][$role]['email'] ?? null) && self::isValidEmail($item['commit'][$role]['email'])
+                ? strtolower($item['commit'][$role]['email'])
+                : null;
+
+            $commits[] = [
+                'sha' => $item['sha'], 'time' => $time,
+                'author' => $login('author'), 'committer' => $login('committer'),
+                'author_email' => $email('author'), 'committer_email' => $email('committer'),
+            ];
+        }
+
+        return $commits;
+    }
+
+    /**
+     * Why a commit may not be deployed automatically under the author allowlist, or null.
+     *
+     * - The AUTHOR must be allowed: by its GitHub login when GitHub links the commit's e-mail to an account,
+     *   otherwise by the commit's author e-mail (e.g. "noreply@anthropic.com" for commits made by Claude).
+     * - The COMMITTER must be allowed the same way - or be GitHub itself (web-flow / "GitHub <noreply@github.com>"
+     *   for merges and rebases made by GitHub, github-actions[bot]), which only counts because the author is allowed.
+     *
+     * Author and committer are git metadata that whoever commits can write: this is an extra tripwire against commits
+     * of anybody else, not proof of who wrote them. The protection is who may push to the branch (collaborators, 2FA,
+     * ruleset) and official CI on exactly the SHA.
+     *
+     * @param  array{sha: string, author: ?string, committer: ?string, author_email?: ?string, committer_email?: ?string}  $commit
+     * @param  array<int, string>  $allowlist  lower case logins and e-mail addresses
+     */
+    public static function commitAuthorProblem(array $commit, array $allowlist): ?string
+    {
+        $short = substr($commit['sha'], 0, 7);
+        $allowed = fn (?string $login, ?string $email) => $login !== null
+            ? in_array(strtolower($login), $allowlist, true)
+            : $email !== null && in_array(strtolower($email), $allowlist, true);
+        $describe = fn (?string $login, ?string $email) => $login ?? ($email !== null ? "<$email> (no GitHub account)" : '(no GitHub account, no e-mail)');
+
+        $author = $commit['author'];
+        $authorEmail = $commit['author_email'] ?? null;
+        if (!$allowed($author, $authorEmail)) {
+            return "commit $short: author {$describe($author, $authorEmail)} is not in the allowlist";
+        }
+
+        $committer = $commit['committer'];
+        $committerEmail = $commit['committer_email'] ?? null;
+        $isGitHub = ($committer !== null && in_array(strtolower($committer), self::GITHUB_COMMITTERS, true))
+            || ($committer === null && $committerEmail === 'noreply@github.com');
+        if (!$isGitHub && !$allowed($committer, $committerEmail)) {
+            return "commit $short: committer {$describe($committer, $committerEmail)} is not in the allowlist";
+        }
+
+        return null;
+    }
+
+    /**
+     * The commit an automatic update installs from: the NEWEST commit of the branch (walking back from its head) that
+     * - is older than the quarantine: the later of its own date, the time this panel first saw it as the head and the
+     *   time GitHub created its successful required CI run lies at least $quarantineSeconds back (0 = off),
+     * - has green CI on exactly that SHA ($ciOf, at most $maxCiChecks commits are asked - each is a GitHub request),
+     * - and passes the author allowlist for every commit since the last deployed one (empty allowlist = off).
+     *
+     * Commits are checked newest first; one that fails a rule is skipped and the walk goes on, so a fresh commit (or
+     * a red one) never stops the nightly update - an older qualifying commit is used instead. Never "downgrades"
+     * anything on its own: the caller still only installs a plugin version higher than the installed one.
+     *
+     * When the last deployed commit isn't among $commits, the allowlist can only be checked for the chosen commit
+     * itself here: "range_check" tells the caller to check the commits in between (GET /compare).
+     *
+     * @param  array<int, array{sha: string, time: int, author: ?string, committer: ?string}>  $commits  newest first
+     * @param  callable(string): array{ci: CiStatus, tested_at: ?int}  $ciOf
+     * @param  array<string, int>  $firstSeen  sha => when this panel first saw it as the head
+     * @param  array<int, string>  $allowlist  lower case logins, empty = off
+     * @return array{sha: ?string, held_back: int, not_green: int, refused: array<int, string>, range_check: bool}
+     */
+    public static function selectAutoUpdateCommit(array $commits, callable $ciOf, int $now, int $quarantineSeconds, array $firstSeen = [], array $allowlist = [], ?string $lastDeployed = null, int $maxCiChecks = 15): array
+    {
+        $result = ['sha' => null, 'held_back' => 0, 'not_green' => 0, 'refused' => [], 'range_check' => false];
+
+        $deployedAt = null;
+        foreach ($commits as $position => $commit) {
+            if ($commit['sha'] === $lastDeployed) {
+                $deployedAt = $position;
+
+                break;
+            }
+        }
+
+        $checks = 0;
+
+        foreach ($commits as $position => $commit) {
+            $seen = max($commit['time'], $firstSeen[$commit['sha']] ?? 0);
+
+            if ($quarantineSeconds > 0 && $now - $seen < $quarantineSeconds) {
+                $result['held_back']++;
+
+                continue;
+            }
+
+            if ($allowlist !== []) {
+                // Everything that becomes new on the servers: the commits from this one down to the last deployed one
+                // (exclusive). At or below the last deployed commit nothing new comes in.
+                $range = match (true) {
+                    $deployedAt === null => [$commit],
+                    $position < $deployedAt => array_slice($commits, $position, $deployedAt - $position),
+                    default => [],
+                };
+
+                $problem = null;
+                foreach ($range as $item) {
+                    $problem ??= self::commitAuthorProblem($item, $allowlist);
+                }
+
+                if ($problem !== null) {
+                    $result['refused'][] = $problem;
+
+                    continue;
+                }
+            }
+
+            if (++$checks > $maxCiChecks) {
+                break;
+            }
+
+            $ci = $ciOf($commit['sha']);
+
+            if ($ci['ci'] !== CiStatus::Green || $ci['tested_at'] === null) {
+                $result['not_green']++;
+
+                continue;
+            }
+
+            if ($quarantineSeconds > 0 && $now - $ci['tested_at'] < $quarantineSeconds) {
+                $result['held_back']++;
+
+                continue;
+            }
+
+            $result['sha'] = $commit['sha'];
+            $result['range_check'] = $allowlist !== [] && $lastDeployed !== null && $deployedAt === null;
+
+            return $result;
+        }
+
+        return $result;
     }
 
     // ------------------------------------------------------------------

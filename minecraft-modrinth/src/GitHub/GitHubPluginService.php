@@ -26,7 +26,7 @@ use Throwable;
  * the same plugin that was put into plugins/ by hand is replaced as well (see installLocked()).
  *
  * @phpstan-type IndexPlugin array{id: string, name: string, platform: string, version: string, path: string, filename: string, sha256: string, size: int, frozen: bool, previous_ids: array<int, string>}
- * @phpstan-type Snapshot array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, IndexPlugin>, problems: array<int, string>}
+ * @phpstan-type Snapshot array{repository: string, branch: string, sha: string, ci: CiStatus, plugins: array<int, IndexPlugin>, problems: array<int, string>, author?: ?string}
  * @phpstan-type InstalledPlugin array{id: string, name: string, platform: string, version: string, sha256: string, size: int, filename: string, repository: string, commit: string, installed_at: string, updated_at?: string}
  * @phpstan-type PendingDelete array{filename: string, size: int, replaced_by?: string}
  * @phpstan-type Metadata array{installed: array<int, InstalledPlugin>, pending_delete: array<int, PendingDelete>}
@@ -57,6 +57,24 @@ class GitHubPluginService
 
     /** How long what was read from a manual copy (and a refused replacement) is remembered. */
     protected const MANUAL_COPY_CACHE_HOURS = 24;
+
+    /** Head commits whose first sighting is remembered (quarantine of automatic updates). */
+    protected const MAX_FIRST_SEEN = 200;
+
+    /** Commits of the branch history the automatic update looks at (ONE GitHub request, never one per commit). */
+    protected const AUTO_UPDATE_HISTORY = 30;
+
+    /** Most commits whose CI the automatic update asks GitHub about per run (one request each, cached). */
+    protected const AUTO_UPDATE_CI_CHECKS = 5;
+
+    /** How long the chosen commit of an automatic update is shared (several runs / servers ask the same). */
+    protected const AUTO_UPDATE_CHOICE_MINUTES = 10;
+
+    /** A GitHub rate limit was hit during this automatic update: nothing more is asked of GitHub in this run. */
+    protected bool $rateLimited = false;
+
+    /** @var array<string, array<string, array{sha: string, size: int}>|null> jars of a commit's tree in this run, by commit (null: truncated) */
+    protected array $treeCache = [];
 
     /** @var array<string, string> Verified jar contents of this run, by sha256 (one download for many servers). */
     protected array $jarCache = [];
@@ -111,6 +129,26 @@ class GitHubPluginService
         return (bool) config('minecraft-modrinth.github.replace_manual', true);
     }
 
+    /**
+     * Automatic updates only use commits at least this many hours old (0 = off, default 2): time to notice a bad
+     * commit on the branch before servers take it (manual installs are not delayed, the page warns).
+     */
+    public function quarantineHours(): int
+    {
+        return GitHubSourceRules::normalizeQuarantineHours(config('minecraft-modrinth.github.quarantine_hours', 2)) ?? 2;
+    }
+
+    /**
+     * GitHub logins whose commits automatic updates may deploy (empty = no check), or null when the setting is
+     * unusable - then automatic updates install nothing (fail closed).
+     *
+     * @return array<int, string>|null
+     */
+    public function allowedAuthors(): ?array
+    {
+        return GitHubSourceRules::parseAllowlist((string) config('minecraft-modrinth.github.allowed_authors', 'Martindob,arzinnn,zTeeCY,claude,noreply@anthropic.com'));
+    }
+
     public function hasToken(): bool
     {
         return trim((string) config('minecraft-modrinth.github.token_encrypted')) !== '';
@@ -155,6 +193,36 @@ class GitHubPluginService
         return $token !== '' ? $token : null;
     }
 
+    /**
+     * What "Test connection" should warn about in the security setup: a classic token (it reaches every repository of
+     * its owner, with "repo" even with write access - a fine-grained read-only token for this one repository is the
+     * recommended one), automatic updates without a required workflow (they install nothing then).
+     *
+     * @return array<int, string> translated warnings
+     *
+     * @throws GitHubSourceException
+     */
+    public function securityWarnings(): array
+    {
+        $warnings = [];
+        $token = $this->token();
+
+        $scopes = $token !== null ? $this->client()->classicTokenScopes() : null;
+        if ($scopes !== null || ($token !== null && str_starts_with($token, 'ghp_'))) {
+            $warnings[] = trans('minecraft-modrinth::strings.github.settings.warning_classic_token', ['scopes' => $scopes === null || $scopes === [] ? '-' : implode(', ', $scopes)]);
+        }
+
+        if ($this->requiredWorkflow() === null) {
+            $warnings[] = trans('minecraft-modrinth::strings.github.settings.warning_no_workflow');
+        }
+
+        if ($this->allowedAuthors() === null) {
+            $warnings[] = trans('minecraft-modrinth::strings.github.settings.allowed_authors_invalid');
+        }
+
+        return $warnings;
+    }
+
     protected function client(): GitHubClient
     {
         if (!$this->isConfigured()) {
@@ -184,23 +252,68 @@ class GitHubPluginService
 
         $sha = $this->client()->getBranchHeadSha($this->branch());
         Cache::put($key, $sha, now()->addMinutes(self::HEAD_CACHE_MINUTES));
+        $this->rememberFirstSeen($sha);
 
         return $sha;
     }
 
-    public function getCiStatus(string $sha): CiStatus
+    /**
+     * When this panel first saw each recent head commit of the branch (sha => unix time). The quarantine of automatic
+     * updates counts from the latest of this, the commit's date and its CI run - a lost cache only makes it longer.
+     *
+     * @return array<string, int>
+     */
+    public function firstSeen(): array
     {
-        $key = $this->cacheKey('ci', $this->branch(), $sha, (string) $this->requiredWorkflow());
+        $seen = Cache::get($this->cacheKey('first-seen', $this->branch()));
 
-        $cached = Cache::get($key);
-        if (is_string($cached) && ($status = CiStatus::tryFrom($cached))) {
-            return $status;
+        return is_array($seen) ? array_filter($seen, fn ($time, $sha) => is_int($time) && is_string($sha) && GitHubSourceRules::isValidSha($sha), ARRAY_FILTER_USE_BOTH) : [];
+    }
+
+    protected function rememberFirstSeen(string $sha): void
+    {
+        $seen = $this->firstSeen();
+
+        if (isset($seen[$sha])) {
+            return;
         }
 
-        $status = GitHubSourceRules::evaluateWorkflowRuns($this->client()->getWorkflowRuns($sha, $this->branch()), $sha, $this->branch(), $this->requiredWorkflow());
-        Cache::put($key, $status->value, now()->addMinutes($status->cacheMinutes()));
+        $seen[$sha] = time();
+        // Bounded: only the newest heads matter for a quarantine of at most a week.
+        $seen = array_slice($seen, -self::MAX_FIRST_SEEN, null, true);
+        Cache::put($this->cacheKey('first-seen', $this->branch()), $seen, now()->addDays(30));
+    }
 
-        return $status;
+    public function getCiStatus(string $sha): CiStatus
+    {
+        return $this->getCiDetails($sha)['ci'];
+    }
+
+    /**
+     * CI state of exactly $sha (only GitHub Actions runs of this repository - see GitHubSourceRules::
+     * evaluateWorkflowRuns()) and when GitHub created the successful run of the required workflow.
+     *
+     * @return array{ci: CiStatus, tested_at: ?int}
+     */
+    public function getCiDetails(string $sha): array
+    {
+        $key = $this->cacheKey('ci-v2', $this->branch(), $sha, (string) $this->requiredWorkflow());
+
+        $cached = Cache::get($key);
+        if (is_array($cached) && is_string($cached['ci'] ?? null) && ($status = CiStatus::tryFrom($cached['ci']))
+            && (is_int($cached['tested_at'] ?? null) || ($cached['tested_at'] ?? false) === null)) {
+            return ['ci' => $status, 'tested_at' => $cached['tested_at']];
+        }
+
+        $runs = $this->client()->getWorkflowRuns($sha, $this->branch());
+        $status = GitHubSourceRules::evaluateWorkflowRuns($runs, $sha, $this->branch(), $this->requiredWorkflow(), $this->repository());
+        $testedAt = $this->requiredWorkflow() !== null && $status === CiStatus::Green
+            ? GitHubSourceRules::requiredRunCreatedAt($runs, $sha, $this->branch(), $this->requiredWorkflow(), $this->repository())
+            : null;
+
+        Cache::put($key, ['ci' => $status->value, 'tested_at' => $testedAt], now()->addMinutes($status->cacheMinutes()));
+
+        return ['ci' => $status, 'tested_at' => $testedAt];
     }
 
     /**
@@ -246,9 +359,7 @@ class GitHubPluginService
     public function getSnapshot(): array
     {
         try {
-            $sha = $this->getHeadSha();
-            $ci = $this->getCiStatus($sha);
-            $index = $this->getIndex($sha);
+            return $this->snapshotAt($this->getHeadSha());
         } catch (GitHubSourceException $exception) {
             if ($exception->reason !== GitHubSourceException::NOT_CONFIGURED) {
                 $this->reportOncePerWindow('snapshot:'.$exception->reason, $exception);
@@ -256,6 +367,19 @@ class GitHubPluginService
 
             throw $exception;
         }
+    }
+
+    /**
+     * The same as getSnapshot() for exactly the commit $sha of the branch (its CI and its index).
+     *
+     * @return Snapshot
+     *
+     * @throws GitHubSourceException
+     */
+    protected function snapshotAt(string $sha): array
+    {
+        $ci = $this->getCiStatus($sha);
+        $index = $this->getIndex($sha);
 
         return [
             'repository' => $this->repository(),
@@ -267,6 +391,149 @@ class GitHubPluginService
         ];
     }
 
+    /**
+     * The repository state the daily automatic update installs from: the newest commit of the branch that is older
+     * than the quarantine, has green CI of the required workflow on exactly that SHA and passes the author allowlist
+     * for every commit since the last automatically deployed one (GitHubSourceRules::selectAutoUpdateCommit()). Newer
+     * commits are held back, not skipped forever: the next run takes them once they qualify. Null (logged) when no
+     * commit qualifies or the settings don't allow automatic updates (no required workflow, unusable allowlist,
+     * rewritten history) - nothing is installed then.
+     *
+     * @return array{snapshot: Snapshot, head: string, held_back: int, author: ?string}|null
+     *
+     * @throws GitHubSourceException GitHub unreachable / invalid answers
+     */
+    public function autoUpdateSnapshot(): ?array
+    {
+        $workflow = $this->requiredWorkflow();
+        if ($workflow === null) {
+            $this->reportOncePerWindow('auto:no-workflow', new GitHubSourceException(GitHubSourceException::NOT_CONFIGURED, 'Automatic updates from GitHub need a "Required workflow" (e.g. build.yml) in the plugin settings - nothing is updated without it'));
+
+            return null;
+        }
+
+        $allowlist = $this->allowedAuthors();
+        if ($allowlist === null) {
+            $this->reportOncePerWindow('auto:allowlist', new GitHubSourceException(GitHubSourceException::NOT_CONFIGURED, 'The author allowlist in the plugin settings is invalid - automatic updates from GitHub install nothing until it is fixed'));
+
+            return null;
+        }
+
+        $head = $this->getHeadSha();
+        $lastDeployed = $this->lastDeployed();
+
+        // The same decision for every server and for a run repeated shortly after (fewer GitHub requests).
+        $choiceKey = $this->cacheKey('auto-choice', $this->branch(), $head, (string) $lastDeployed, $workflow, (string) $this->quarantineHours(), implode(',', $allowlist));
+        $cached = Cache::get($choiceKey);
+        if (is_array($cached) && is_string($cached['sha'] ?? null) && GitHubSourceRules::isValidSha($cached['sha'])) {
+            $snapshot = $this->snapshotAt($cached['sha']);
+
+            return $snapshot['ci'] === CiStatus::Green
+                ? ['snapshot' => $snapshot, 'head' => $head, 'held_back' => (int) ($cached['held_back'] ?? 0), 'author' => is_string($cached['author'] ?? null) ? $cached['author'] : null]
+                : null;
+        }
+
+        $commits = $this->client()->listCommits($head, self::AUTO_UPDATE_HISTORY);
+
+        $choice = GitHubSourceRules::selectAutoUpdateCommit(
+            $commits,
+            fn (string $sha) => $this->getCiDetails($sha),
+            time(),
+            $this->quarantineHours() * 3600,
+            $this->firstSeen(),
+            $allowlist,
+            $lastDeployed,
+            self::AUTO_UPDATE_CI_CHECKS,
+        );
+
+        foreach (array_slice($choice['refused'], 0, 5) as $problem) {
+            $this->reportOncePerWindow('auto:refused:'.$problem, new GitHubSourceException(GitHubSourceException::AUTHOR_NOT_ALLOWED, "Automatic update: $problem - not deployed automatically"));
+        }
+
+        if ($choice['sha'] === null) {
+            Log::info('minecraft-modrinth: GitHub: automatic update: no commit of '.$this->branch()." qualifies (head {$this->shortSha($head)}: {$choice['held_back']} younger than the quarantine of {$this->quarantineHours()} h, {$choice['not_green']} without green $workflow".($choice['refused'] !== [] ? ', '.count($choice['refused']).' refused by the author allowlist' : '').') - nothing updated');
+
+            return null;
+        }
+
+        $sha = $choice['sha'];
+
+        // History since the last automatically deployed commit: never deploy over a rewritten branch (force push), and
+        // with the allowlist check every commit in between when they weren't all in the listed history.
+        if ($lastDeployed !== null && $lastDeployed !== $sha && !in_array($lastDeployed, array_column($commits, 'sha'), true)) {
+            $comparison = $this->client()->compare($lastDeployed, $sha);
+
+            if ($comparison['status'] === 'diverged') {
+                $this->reportOncePerWindow('auto:diverged:'.$sha, new GitHubSourceException(GitHubSourceException::HISTORY_REWRITTEN, "Automatic update: {$this->shortSha($sha)} does not descend from the last deployed commit {$this->shortSha($lastDeployed)} - the branch history was rewritten (force push?). Nothing is updated automatically; check the repository, then install by hand"));
+
+                return null;
+            }
+
+            if ($choice['range_check'] && $comparison['status'] === 'ahead') {
+                $problem = $comparison['total'] > count($comparison['commits'])
+                    ? "{$comparison['total']} commits since {$this->shortSha($lastDeployed)} - too many to check against the author allowlist"
+                    : null;
+                foreach ($comparison['commits'] as $commit) {
+                    $problem ??= GitHubSourceRules::commitAuthorProblem($commit, $allowlist);
+                }
+
+                if ($problem !== null) {
+                    $this->reportOncePerWindow('auto:refused:'.$problem, new GitHubSourceException(GitHubSourceException::AUTHOR_NOT_ALLOWED, "Automatic update: $problem - not deployed automatically"));
+
+                    return null;
+                }
+            }
+        }
+
+        $snapshot = $this->snapshotAt($sha);
+
+        if ($snapshot['ci'] !== CiStatus::Green) {
+            return null;
+        }
+
+        $author = null;
+        foreach ($commits as $commit) {
+            if ($commit['sha'] === $sha) {
+                $author = $commit['author'] ?? $commit['author_email'];
+            }
+        }
+
+        Cache::put($choiceKey, ['sha' => $sha, 'held_back' => $choice['held_back'], 'author' => $author], now()->addMinutes(self::AUTO_UPDATE_CHOICE_MINUTES));
+
+        Log::info("minecraft-modrinth: GitHub: automatic update uses commit $sha (author ".($author ?? 'unknown').", $workflow green)"
+            .($sha !== $head ? "; {$choice['held_back']} newer commit(s) up to head {$this->shortSha($head)} held back by the quarantine of {$this->quarantineHours()} h or CI" : ''));
+
+        return ['snapshot' => $snapshot, 'head' => $head, 'held_back' => $choice['held_back'], 'author' => $author];
+    }
+
+    /** The commit the last automatic update installed from (to check what came in since), or null. */
+    public function lastDeployed(): ?string
+    {
+        $sha = Cache::get($this->cacheKey('last-deployed', $this->branch()));
+
+        return is_string($sha) && GitHubSourceRules::isValidSha($sha) ? $sha : null;
+    }
+
+    public function rememberDeployed(string $sha): void
+    {
+        if (GitHubSourceRules::isValidSha($sha)) {
+            Cache::put($this->cacheKey('last-deployed', $this->branch()), $sha, now()->addDays(365));
+        }
+    }
+
+    /** Seconds since this panel first saw $sha as the head of the branch, or null when it doesn't know. */
+    public function headAgeSeconds(string $sha): ?int
+    {
+        $seen = $this->firstSeen()[$sha] ?? null;
+
+        return $seen === null ? null : max(0, time() - $seen);
+    }
+
+    protected function shortSha(string $sha): string
+    {
+        return substr($sha, 0, 7);
+    }
+
     /** Forget the cached head commit and CI state so the next read asks GitHub again. */
     public function forgetCachedState(): void
     {
@@ -276,7 +543,7 @@ class GitHubPluginService
         Cache::forget($key);
 
         if (is_string($sha)) {
-            Cache::forget($this->cacheKey('ci', $this->branch(), $sha, (string) $this->requiredWorkflow()));
+            Cache::forget($this->cacheKey('ci-v2', $this->branch(), $sha, (string) $this->requiredWorkflow()));
         }
     }
 
@@ -522,6 +789,14 @@ class GitHubPluginService
             throw new GitHubSourceException(GitHubSourceException::STATE_CHANGED, "{$plugin['id']} is no longer installed on server #{$server->id}");
         }
 
+        // Never over a newer (or another jar of the same) version: an index that points back to an older, perhaps
+        // vulnerable version can't take a server there - not automatically, not by "Update" / "Update all". Going back
+        // stays a deliberate admin decision (remove the plugin, then install the repository's version).
+        if ($previous !== null && (!GitHubSourceRules::isValidVersion($previous['version'])
+            || !GitHubSourceRules::isNewerVersion($plugin['version'], $previous['version']))) {
+            throw new GitHubSourceException(GitHubSourceException::DOWNGRADE, "{$plugin['id']} {$plugin['version']} at {$snapshot['sha']} is not newer than the installed {$previous['version']} on server #{$server->id} - not installed over it");
+        }
+
         // Download and verify before touching the server at all.
         $content = $this->downloadVerifiedJar($plugin, $snapshot['sha']);
 
@@ -594,6 +869,8 @@ class GitHubPluginService
                 throw $exception;
             }
         }
+
+        $this->logInstalled($server, $entry, $previous, $snapshot);
 
         if ($toDelete === []) {
             return $entry;
@@ -793,9 +1070,7 @@ class GitHubPluginService
 
         $content = $this->client()->getRawFile($plugin['path'], $sha, min($plugin['size'], GitHubSourceRules::MAX_JAR_BYTES), self::DOWNLOAD_TIMEOUT);
 
-        if (!GitHubSourceRules::verifyJar($content, $plugin['size'], $plugin['sha256'])) {
-            throw new GitHubSourceException(GitHubSourceException::CHECKSUM_MISMATCH, "{$plugin['path']} at $sha does not match the size/sha256 in the index");
-        }
+        $this->verifyDownloadedJar($plugin, $sha, $content);
 
         // An auto-update run installs the same jar on several servers: keep what we downloaded,
         // but bounded, since this lives in PHP memory.
@@ -807,6 +1082,67 @@ class GitHubPluginService
         }
 
         return $content;
+    }
+
+    /**
+     * Every check a downloaded jar has to pass before it may be written to any server (throws otherwise):
+     *
+     * 1. size and sha256 from the index of exactly that commit,
+     * 2. size and git blob SHA of the file in exactly that commit's tree (GitHub's directory listing - a second,
+     *    independent answer: a download that was swapped or damaged on the way can't match both),
+     * 3. the plugin name and version declared inside the jar (plugin.yml / paper-plugin.yml / velocity-plugin.json)
+     *    are the ones in the index entry - an index can't pass off another plugin or an old jar as a new version.
+     *
+     * @param  IndexPlugin  $plugin
+     *
+     * @throws GitHubSourceException
+     */
+    protected function verifyDownloadedJar(array $plugin, string $sha, string $content): void
+    {
+        if (!GitHubSourceRules::verifyJar($content, $plugin['size'], $plugin['sha256'])) {
+            throw new GitHubSourceException(GitHubSourceException::CHECKSUM_MISMATCH, "{$plugin['path']} at $sha does not match the size/sha256 in the index");
+        }
+
+        $listing = $this->directoryListing(dirname($plugin['path']), $sha);
+
+        if (($problem = GitHubSourceRules::treeMismatch($content, $plugin['filename'], $listing)) !== null) {
+            throw new GitHubSourceException(GitHubSourceException::CHECKSUM_MISMATCH, "{$plugin['path']} at $sha: $problem");
+        }
+
+        $problem = null;
+        $descriptor = $this->descriptorOfContent($content, $plugin['platform'], $problem);
+
+        if ($descriptor === null || ($problem = GitHubSourceRules::descriptorMismatch($descriptor, $plugin)) !== null) {
+            throw new GitHubSourceException(GitHubSourceException::CHECKSUM_MISMATCH, "{$plugin['path']} at $sha: $problem");
+        }
+    }
+
+    /**
+     * The files of a directory in exactly the tree of commit $sha (name => git blob SHA, size), once per run.
+     *
+     * @return array<string, array{sha: string, size: int}>
+     *
+     * @throws GitHubSourceException
+     */
+    protected function directoryListing(string $directory, string $sha): array
+    {
+        if (!array_key_exists($sha, $this->treeCache)) {
+            // ONE request per commit for every jar of it (a commit's tree never changes - cached for an hour).
+            $key = $this->cacheKey('tree-jars', $sha);
+            $cached = Cache::get($key);
+            $jars = is_array($cached) ? $cached : $this->client()->getTreeJars($sha);
+
+            if ($jars !== null && !is_array($cached)) {
+                Cache::put($key, $jars, now()->addMinutes(self::INDEX_CACHE_MINUTES));
+            }
+
+            $this->treeCache[$sha] = $jars;
+        }
+
+        // GitHub truncated a very large tree: that one directory is listed on its own instead.
+        return $this->treeCache[$sha] !== null
+            ? GitHubSourceRules::treeDirectory($this->treeCache[$sha], $directory)
+            : $this->client()->getDirectoryListing($directory, $sha);
     }
 
     /**
@@ -1086,6 +1422,28 @@ class GitHubPluginService
     }
 
     /**
+     * @return array{names: array<int, string>, labels: array<int, string>, versions: array<int, string>}|null
+     */
+    protected function descriptorOfContent(string $content, string $platform, ?string &$problem = null): ?array
+    {
+        $temporary = tempnam(sys_get_temp_dir(), 'minecraft-modrinth-github-');
+
+        try {
+            if ($temporary === false || file_put_contents($temporary, $content) !== strlen($content)) {
+                $problem = 'could not write a temporary file';
+
+                return null;
+            }
+
+            return GitHubSourceRules::jarDescriptor($temporary, $platform, $problem);
+        } finally {
+            if (is_string($temporary)) {
+                @unlink($temporary);
+            }
+        }
+    }
+
+    /**
      * @return array<int, string>|null
      */
     protected function descriptorNamesOfContent(string $content, string $platform, ?string &$problem = null): ?array
@@ -1136,6 +1494,34 @@ class GitHubPluginService
     protected function rememberRefusal(Server $server, array $plugin, array $file, string $reason): void
     {
         Cache::put($this->refusalKey($server, $plugin, $file), $reason, now()->addHours(self::MANUAL_COPY_CACHE_HOURS));
+    }
+
+    /**
+     * A jar from the repository was written and recorded: one line in the panel log and an entry in the server's
+     * activity log, both with the commit (and its author, when known) - so a bad deploy can be traced to the commit
+     * that brought it. Never throws.
+     *
+     * @param  InstalledPlugin  $entry
+     * @param  InstalledPlugin|null  $previous
+     * @param  Snapshot  $snapshot
+     */
+    protected function logInstalled(Server $server, array $entry, ?array $previous, array $snapshot): void
+    {
+        $author = is_string($snapshot['author'] ?? null) ? $snapshot['author'] : null;
+        $change = $previous !== null ? "{$previous['version']} -> {$entry['version']}" : "{$entry['version']} (new)";
+
+        Log::info("minecraft-modrinth: GitHub: server #{$server->id}: {$entry['name']} $change as plugins/{$entry['filename']} from {$snapshot['repository']}@{$snapshot['sha']}"
+            .($author !== null ? " (author $author)" : '').", sha256 {$entry['sha256']}");
+
+        try {
+            Activity::event('server:file.write')
+                ->subject($server)
+                ->property('file', self::FOLDER.'/'.$entry['filename'])
+                ->property('github', "{$entry['name']} $change, {$snapshot['repository']}@".substr($snapshot['sha'], 0, 12).($author !== null ? ", $author" : ''))
+                ->log();
+        } catch (Throwable $exception) {
+            $this->report($exception);
+        }
     }
 
     /**
@@ -1290,7 +1676,7 @@ class GitHubPluginService
     public function autoUpdateServer(Server $server, array $snapshot): array
     {
         $platform = $this->platformForServer($server);
-        if ($platform === null || $snapshot['ci'] !== CiStatus::Green) {
+        if ($platform === null || $snapshot['ci'] !== CiStatus::Green || $this->rateLimited) {
             return [];
         }
 
@@ -1326,6 +1712,14 @@ class GitHubPluginService
                 $this->installOrUpdate($server, $plugin, $snapshot, true, true);
                 $updated[] = $plugin['id'];
             } catch (GitHubSourceException $exception) {
+                if ($exception->reason === GitHubSourceException::RATE_LIMITED) {
+                    // Stop asking GitHub for the rest of this run (every server keeps its jars): one log line.
+                    $this->rateLimited = true;
+                    $this->reportOncePerWindow('auto:rate-limited', new GitHubSourceException(GitHubSourceException::RATE_LIMITED, 'Automatic update stopped: GitHub API rate limit (or its reserve) reached - the remaining servers keep their current jars until the next run'));
+
+                    break;
+                }
+
                 if ($exception->reason === GitHubSourceException::OLD_JAR_PENDING) {
                     // Updated; only the old jar is left for later.
                     $updated[] = $plugin['id'];
@@ -1335,7 +1729,9 @@ class GitHubPluginService
             }
         }
 
-        array_push($updated, ...$this->autoReplaceManualCopies($server, $snapshot, $platform));
+        if (!$this->rateLimited) {
+            array_push($updated, ...$this->autoReplaceManualCopies($server, $snapshot, $platform));
+        }
 
         if (!empty($updated)) {
             // The cached offer count still includes these updates: drop it, the next offer check

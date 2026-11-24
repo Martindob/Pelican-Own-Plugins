@@ -1892,6 +1892,13 @@ class GitHubPluginService
 
     protected function report(Throwable $exception): void
     {
+        // A missing setting is not a fault of the panel: one warning line, no stack trace (since 1.9.1).
+        if ($exception instanceof GitHubSourceException && $exception->reason === GitHubSourceException::NOT_CONFIGURED) {
+            Log::warning('[minecraft-modrinth] '.$exception->getMessage());
+
+            return;
+        }
+
         // Only our own exceptions are reported, and those never carry the token (see
         // GitHubSourceException). Anything else is reduced to its class name.
         report($exception instanceof GitHubSourceException

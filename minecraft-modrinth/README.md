@@ -484,6 +484,10 @@ manually**, as in 1.4.1.
 
 ## Changes
 
+- **1.9.1** - Automatic updates without a *Required workflow* (since 1.9.0 they install nothing then)
+  log **one warning line** instead of an error with a stack trace (at most once per
+  `report_throttle_minutes`). Set *Required workflow* (e.g. `build.yml`) in the plugin settings
+  to turn the GitHub source's automatic updates on. Nothing else changes.
 - **1.9.0** - Supply chain hardening of the GitHub source. **Automatic updates** take the newest
   commit that is older than the new **quarantine** (default 2 h, 0 = off; counted from the latest
   of commit date, first sighting by the panel and GitHub's CI run), has green CI of the *Required
